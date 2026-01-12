@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -28,8 +29,20 @@ var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
 }
 
+// WebSocket upgrader for WireGuard tunnel
+var wsUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
 // Valid workload name pattern (alphanumeric, dash, underscore only)
 var validNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// WGPacket represents a WireGuard UDP packet sent through the WebSocket tunnel
+type WGPacket struct {
+	FromID string `json:"from"` // Sender's HWID
+	ToID   string `json:"to"`   // Target peer's HWID
+	Data   []byte `json:"data"` // Raw UDP payload (WireGuard encrypted)
+}
 
 // =============================================================================
 // Types
@@ -103,7 +116,21 @@ type Agent struct {
 	cfMu     sync.Mutex
 	cfStopCh chan struct{}
 
+	// WebSocket WireGuard tunnel (for tunnel-only mode)
+	wgRelays     map[string]*udpRelay // peerID -> local UDP relay
+	wgRelaysMu   sync.RWMutex
+	wgLocalConn  *net.UDPConn // Local UDP socket to inject packets into WireGuard
+	wgRelayBase  int          // Base port for UDP relays (51821, 51822, etc.)
+
 	stopCh chan struct{}
+}
+
+// udpRelay captures UDP packets destined for a peer and forwards via WebSocket
+type udpRelay struct {
+	peerID   string
+	conn     *net.UDPConn
+	localPort int
+	stopCh   chan struct{}
 }
 
 func New() (*Agent, error) {
@@ -128,7 +155,9 @@ func New() (*Agent, error) {
 			Tokens:    make(map[string]*Token),
 			CFToken:   getEnv("JETTY_CF_TOKEN", ""), // Bootstrap tunnel token
 		},
-		stopCh: make(chan struct{}),
+		wgRelays:    make(map[string]*udpRelay),
+		wgRelayBase: 51821, // Start relay ports from 51821
+		stopCh:      make(chan struct{}),
 	}
 
 	os.MkdirAll(a.composeDir, 0755)
@@ -144,6 +173,13 @@ func (a *Agent) Start() error {
 	// In tunnel-only mode, WG is still used for local mesh IP routing but not for inter-node traffic
 	if err := a.initWireGuard(); err != nil {
 		return fmt.Errorf("wireguard: %w", err)
+	}
+
+	// In tunnel-only mode, start the local UDP socket for packet injection
+	if a.tunnelDomain != "" {
+		if err := a.initWGTunnel(); err != nil {
+			return fmt.Errorf("wg tunnel: %w", err)
+		}
 	}
 
 	// Load state
@@ -175,7 +211,7 @@ func (a *Agent) Start() error {
 
 	mode := "wireguard"
 	if a.tunnelDomain != "" {
-		mode = "tunnel-only (" + a.tunnelDomain + ")"
+		mode = "tunnel-only (" + a.tunnelDomain + ") [WebSocket UDP tunnel]"
 	}
 	log.Printf("Jetty started: %s (%s) @ %s [mode: %s]", a.hostname, a.hwid[:12], a.meshIP, mode)
 	return nil
@@ -184,6 +220,10 @@ func (a *Agent) Start() error {
 func (a *Agent) Stop() {
 	close(a.stopCh)
 	a.stopCloudflared()
+	a.stopUDPRelays()
+	if a.wgLocalConn != nil {
+		a.wgLocalConn.Close()
+	}
 	a.saveState()
 	exec.Command("ip", "link", "del", "jetty0").Run()
 }
@@ -279,7 +319,15 @@ func (a *Agent) addWGPeer(p *Peer) {
 		"allowed-ips", allowedIPs,
 		"persistent-keepalive", "25"}
 
-	if p.Endpoint != "" {
+	// In tunnel-only mode, use local UDP relay instead of real endpoint
+	if a.tunnelDomain != "" {
+		relayEndpoint, err := a.getRelayEndpoint(p.ID)
+		if err != nil {
+			log.Printf("Failed to create relay for peer %s: %v", p.Name, err)
+		} else {
+			args = append(args, "endpoint", relayEndpoint)
+		}
+	} else if p.Endpoint != "" {
 		args = append(args, "endpoint", p.Endpoint)
 	}
 
@@ -486,6 +534,8 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 	r.HandleFunc("/api/heartbeat", a.apiHeartbeat).Methods("POST")
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)
+	r.HandleFunc("/api/ws/wg", a.wsWireGuard)             // WebSocket endpoint for WG packets
+	r.HandleFunc("/api/wg/packet", a.apiWGPacket).Methods("POST") // HTTP fallback for WG packets
 
 	addr := fmt.Sprintf(":%d", a.apiPort)
 	log.Printf("API on %s", addr)
@@ -1928,6 +1978,226 @@ func (a *Agent) isTunnelRunning() bool {
 	a.cfMu.Lock()
 	defer a.cfMu.Unlock()
 	return a.cfCmd != nil && a.cfCmd.Process != nil
+}
+
+// =============================================================================
+// WebSocket WireGuard Tunnel
+// =============================================================================
+
+// initWGTunnel initializes the WebSocket tunnel for WireGuard packets.
+// This creates a local UDP socket that can inject packets into the WireGuard interface.
+func (a *Agent) initWGTunnel() error {
+	// Create local UDP socket for injecting packets into WireGuard
+	// We'll send packets TO WireGuard's listen port from various source ports
+	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return err
+	}
+	a.wgLocalConn = conn
+
+	log.Printf("WG tunnel initialized (injection socket: %s)", conn.LocalAddr())
+	return nil
+}
+
+// wsWireGuard handles WebSocket connections for WireGuard packet relay.
+// Packets received here are injected into the local WireGuard interface.
+func (a *Agent) wsWireGuard(w http.ResponseWriter, r *http.Request) {
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	log.Printf("WG WebSocket connection from %s", r.RemoteAddr)
+
+	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WG WebSocket error: %v", err)
+			}
+			return
+		}
+
+		var pkt WGPacket
+		if err := json.Unmarshal(data, &pkt); err != nil {
+			continue
+		}
+
+		// Check if this packet is for us
+		if pkt.ToID == a.hwid {
+			a.injectWGPacket(pkt.FromID, pkt.Data)
+		}
+		// In tunnel mode, we don't forward - let the sender retry through the tunnel
+	}
+}
+
+// apiWGPacket handles HTTP POST for WireGuard packets (fallback when WebSocket isn't available).
+func (a *Agent) apiWGPacket(w http.ResponseWriter, r *http.Request) {
+	var pkt WGPacket
+	if err := json.NewDecoder(r.Body).Decode(&pkt); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	// Check if this packet is for us
+	if pkt.ToID == a.hwid {
+		a.injectWGPacket(pkt.FromID, pkt.Data)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Not for us - forward through tunnel
+	if a.tunnelDomain != "" {
+		go a.forwardWGPacket(&pkt)
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// injectWGPacket injects a received WireGuard packet into the local interface.
+// The packet is sent to WireGuard's listen port as if it came from the peer.
+func (a *Agent) injectWGPacket(fromID string, data []byte) {
+	if a.wgLocalConn == nil {
+		return
+	}
+
+	// Send to WireGuard's listen port
+	wgAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", a.wgPort))
+	if err != nil {
+		return
+	}
+
+	_, err = a.wgLocalConn.WriteToUDP(data, wgAddr)
+	if err != nil {
+		log.Printf("Failed to inject WG packet from %s: %v", fromID[:12], err)
+	}
+}
+
+// createUDPRelay creates a UDP relay for a peer in tunnel-only mode.
+// WireGuard sends packets to this relay, which forwards them via WebSocket.
+func (a *Agent) createUDPRelay(peerID string) (*udpRelay, error) {
+	a.wgRelaysMu.Lock()
+	defer a.wgRelaysMu.Unlock()
+
+	// Check if relay already exists
+	if relay, exists := a.wgRelays[peerID]; exists {
+		return relay, nil
+	}
+
+	// Find next available port
+	port := a.wgRelayBase + len(a.wgRelays)
+
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	relay := &udpRelay{
+		peerID:    peerID,
+		conn:      conn,
+		localPort: port,
+		stopCh:    make(chan struct{}),
+	}
+
+	a.wgRelays[peerID] = relay
+
+	// Start relay goroutine
+	go a.runUDPRelay(relay)
+
+	log.Printf("Created UDP relay for peer %s on port %d", peerID[:12], port)
+	return relay, nil
+}
+
+// runUDPRelay reads packets from the local UDP relay and forwards them via the tunnel.
+func (a *Agent) runUDPRelay(relay *udpRelay) {
+	buf := make([]byte, 65535)
+
+	for {
+		select {
+		case <-relay.stopCh:
+			return
+		case <-a.stopCh:
+			return
+		default:
+		}
+
+		relay.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, _, err := relay.conn.ReadFromUDP(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			continue
+		}
+
+		// Create packet and send through tunnel
+		pkt := &WGPacket{
+			FromID: a.hwid,
+			ToID:   relay.peerID,
+			Data:   make([]byte, n),
+		}
+		copy(pkt.Data, buf[:n])
+
+		go a.sendWGPacket(pkt)
+	}
+}
+
+// sendWGPacket sends a WireGuard packet through the Cloudflare tunnel.
+func (a *Agent) sendWGPacket(pkt *WGPacket) {
+	if a.tunnelDomain == "" {
+		return
+	}
+
+	data, err := json.Marshal(pkt)
+	if err != nil {
+		return
+	}
+
+	// Try HTTP POST (more reliable through CF tunnel than WebSocket)
+	url := fmt.Sprintf("https://%s/api/wg/packet", a.tunnelDomain)
+	resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+	if err != nil {
+		// Log occasionally, not every packet
+		return
+	}
+	resp.Body.Close()
+}
+
+// forwardWGPacket forwards a packet through the tunnel (when we receive a packet not meant for us).
+func (a *Agent) forwardWGPacket(pkt *WGPacket) {
+	a.sendWGPacket(pkt)
+}
+
+// stopUDPRelays stops all UDP relays.
+func (a *Agent) stopUDPRelays() {
+	a.wgRelaysMu.Lock()
+	defer a.wgRelaysMu.Unlock()
+
+	for _, relay := range a.wgRelays {
+		close(relay.stopCh)
+		relay.conn.Close()
+	}
+	a.wgRelays = make(map[string]*udpRelay)
+}
+
+// getRelayEndpoint returns the local relay endpoint for a peer in tunnel-only mode.
+func (a *Agent) getRelayEndpoint(peerID string) (string, error) {
+	relay, err := a.createUDPRelay(peerID)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("127.0.0.1:%d", relay.localPort), nil
 }
 
 // =============================================================================

@@ -374,21 +374,50 @@ The `/etc/hosts` file shows which workloads are local vs remote:
 # JETTY END
 ```
 
-### Limitations of Tunnel-Only Mode
+### WebSocket UDP Tunnel (Full Mesh Connectivity)
 
-1. **No direct mesh IP routing across nodes** - Containers can't directly reach remote mesh IPs
-2. **HTTP-only cross-node communication** - UDP/TCP applications need HTTP wrapper
-3. **Higher latency** - All traffic routes through Cloudflare
-4. **Tunnel dependency** - If Cloudflare is down, cross-node communication fails
+Tunnel-only mode now includes **WebSocket UDP tunneling** that provides full WireGuard mesh connectivity without port forwarding:
 
-### Future: WebSocket UDP Tunnel
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    WEBSOCKET UDP TUNNEL ARCHITECTURE                        │
+│                                                                             │
+│   Node A                          Cloudflare                        Node B  │
+│                                    Tunnel                                   │
+│   ┌─────────┐                                                  ┌─────────┐ │
+│   │WireGuard│──UDP──►┌──────────┐                ┌──────────┐──►│WireGuard│ │
+│   │ jetty0  │        │UDP Relay │──HTTP/WS──────►│/api/wg/  │   │ jetty0  │ │
+│   └─────────┘        │:51821    │   POST         │packet    │   └─────────┘ │
+│                      └──────────┘                └──────────┘               │
+│                                                                             │
+│   • WireGuard sends to local relay (127.0.0.1:51821)                        │
+│   • Relay encapsulates packet in JSON, sends via HTTP POST                  │
+│   • Cloudflare routes to a node                                             │
+│   • Receiving node checks target ID                                         │
+│   • If match: injects into local WireGuard                                  │
+│   • Full mesh IP connectivity - containers can reach remote workloads!      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-For full mesh IP connectivity without port forwarding, we're exploring:
-- WebSocket-based UDP encapsulation
-- WireGuard packets wrapped in WebSocket frames
-- Transparent to applications
+**How it works:**
+1. For each peer, Jetty creates a local UDP relay (127.0.0.1:51821, 51822, etc.)
+2. WireGuard is configured to send packets to these local relays
+3. Relays capture packets and send via HTTP POST to `/api/wg/packet`
+4. The packet includes `{from: nodeID, to: peerID, data: encryptedPayload}`
+5. Receiving node injects the packet into its local WireGuard interface
+6. WireGuard decrypts and routes - full mesh connectivity achieved!
 
-This would provide the same experience as direct WireGuard mode but through the tunnel.
+**Benefits:**
+- **Full mesh IP routing** - Containers can directly reach remote mesh IPs
+- **No port forwarding** - Only outbound HTTPS required
+- **WireGuard encryption** - All traffic remains encrypted end-to-end
+- **Transparent** - Applications don't know they're going through a tunnel
+
+### Limitations
+
+1. **Higher latency** - Packets route through Cloudflare
+2. **Tunnel dependency** - If Cloudflare is down, cross-node mesh fails
+3. **Bandwidth** - HTTP overhead compared to raw UDP
 
 ---
 
@@ -428,6 +457,13 @@ This would provide the same experience as direct WireGuard mode but through the 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/proxy/{mesh_ip}/{path}` | ANY | Proxy request to workload (local or remote) |
+
+### WireGuard Tunnel (Tunnel-Only Mode)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `GET /api/ws/wg` | WebSocket | WebSocket endpoint for WG packet relay |
+| `POST /api/wg/packet` | POST | HTTP endpoint for WG packet forwarding |
 
 ### Internal (Peer-to-Peer)
 
