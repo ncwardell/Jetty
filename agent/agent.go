@@ -92,9 +92,10 @@ type Agent struct {
 	meshIP   string
 
 	// WireGuard
-	wgPrivKey string
-	wgPubKey  string
-	wgPort    int
+	wgPrivKey  string
+	wgPubKey   string
+	wgPort     int
+	wgDisabled bool // True if using dummy interface (no WireGuard kernel module)
 
 	// Cloudflare WARP
 	warpIP      string // WARP IP address (CGNAT range, e.g., "100.96.x.x")
@@ -221,8 +222,15 @@ func (a *Agent) Start() error {
 	go a.failoverLoop()
 
 	mode := "wireguard"
+	if a.wgDisabled {
+		mode = "dummy (local only)"
+	}
 	if a.tunnelDomain != "" {
-		mode = "tunnel-only (" + a.tunnelDomain + ") [WebSocket UDP tunnel]"
+		if a.wgDisabled {
+			mode = "tunnel-only (" + a.tunnelDomain + ") [dummy + HTTP proxy]"
+		} else {
+			mode = "tunnel-only (" + a.tunnelDomain + ") [WebSocket UDP tunnel]"
+		}
 	}
 	if a.warpEnabled {
 		mode = "warp (" + a.warpIP + ")"
@@ -307,13 +315,13 @@ func (a *Agent) loadOrCreateHWID() string {
 }
 
 // =============================================================================
-// WireGuard
+// Network Interface (WireGuard or Dummy fallback)
 // =============================================================================
 
 func (a *Agent) initWireGuard() error {
 	keyFile := filepath.Join(a.dataDir, "wg_private_key")
 
-	// Load or generate keys
+	// Load or generate keys (still useful for peer identity even without WG)
 	if data, err := os.ReadFile(keyFile); err == nil {
 		a.wgPrivKey = strings.TrimSpace(string(data))
 		a.wgPubKey = derivePubKey(a.wgPrivKey)
@@ -325,31 +333,75 @@ func (a *Agent) initWireGuard() error {
 	// Derive mesh IP
 	a.meshIP = a.deriveMeshIP(a.hwid)
 
-	// Setup interface
+	// Clean up any existing interface
 	exec.Command("ip", "link", "del", "jetty0").Run()
-	if err := exec.Command("ip", "link", "add", "dev", "jetty0", "type", "wireguard").Run(); err != nil {
-		return err
+
+	// Try WireGuard first
+	if err := a.tryWireGuard(keyFile); err != nil {
+		log.Printf("WireGuard not available (%v), using dummy interface", err)
+		if err := a.initDummyInterface(); err != nil {
+			return err
+		}
 	}
 
+	// Enable forwarding
+	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
+
+	return nil
+}
+
+// tryWireGuard attempts to create a WireGuard interface
+func (a *Agent) tryWireGuard(keyFile string) error {
+	// Try to create WireGuard interface
+	if err := exec.Command("ip", "link", "add", "dev", "jetty0", "type", "wireguard").Run(); err != nil {
+		return fmt.Errorf("create interface: %w", err)
+	}
+
+	// Configure WireGuard
 	if err := exec.Command("wg", "set", "jetty0",
 		"listen-port", fmt.Sprintf("%d", a.wgPort),
 		"private-key", keyFile).Run(); err != nil {
-		return err
+		// Clean up failed interface
+		exec.Command("ip", "link", "del", "jetty0").Run()
+		return fmt.Errorf("configure wg: %w", err)
 	}
 
+	// Add IP and bring up
 	_, network, _ := net.ParseCIDR(a.meshCIDR)
 	pfx, _ := network.Mask.Size()
 	exec.Command("ip", "addr", "add", fmt.Sprintf("%s/%d", a.meshIP, pfx), "dev", "jetty0").Run()
 	exec.Command("ip", "link", "set", "up", "dev", "jetty0").Run()
 
-	// Enable forwarding
-	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
-
 	log.Printf("WireGuard up: %s", a.meshIP)
 	return nil
 }
 
+// initDummyInterface creates a dummy interface for local IP binding
+// Used when WireGuard kernel module is not available
+func (a *Agent) initDummyInterface() error {
+	a.wgDisabled = true
+
+	// Create dummy interface
+	if err := exec.Command("ip", "link", "add", "dev", "jetty0", "type", "dummy").Run(); err != nil {
+		return fmt.Errorf("create dummy interface: %w", err)
+	}
+
+	// Add IP and bring up
+	_, network, _ := net.ParseCIDR(a.meshCIDR)
+	pfx, _ := network.Mask.Size()
+	exec.Command("ip", "addr", "add", fmt.Sprintf("%s/%d", a.meshIP, pfx), "dev", "jetty0").Run()
+	exec.Command("ip", "link", "set", "up", "dev", "jetty0").Run()
+
+	log.Printf("Dummy interface up: %s (WireGuard disabled, use tunnel/WARP for inter-node)", a.meshIP)
+	return nil
+}
+
 func (a *Agent) addWGPeer(p *Peer) {
+	// Skip WireGuard operations if using dummy interface
+	if a.wgDisabled {
+		return
+	}
+
 	if p.PublicKey == a.wgPubKey {
 		return
 	}
@@ -618,6 +670,10 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 		},
 		"peers":     peers,
 		"workloads": workloads,
+		"wireguard": map[string]interface{}{
+			"enabled": !a.wgDisabled,
+			"mode":    func() string { if a.wgDisabled { return "dummy" } else { return "kernel" } }(),
+		},
 		"tunnel": map[string]interface{}{
 			"configured": hasTunnel,
 			"running":    a.isTunnelRunning(),
