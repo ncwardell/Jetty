@@ -34,9 +34,10 @@ Jetty is a decentralized container orchestration system that enables multiple no
 
 Each node gets a unique mesh IP (e.g., `10.100.x.x`) derived from its hardware ID. Nodes communicate over encrypted WireGuard tunnels.
 
-- **Interface**: `jetty0` - the WireGuard interface
+- **Interface**: `jetty0` - the WireGuard or dummy interface
 - **Default CIDR**: `10.100.0.0/16` (65k+ possible IPs)
 - **Peer Discovery**: Automatic via gossip protocol
+- **No host dependencies**: If WireGuard kernel module is unavailable, Jetty falls back to a dummy interface for local IP binding. Inter-node communication works via Cloudflare Tunnel or WARP instead.
 
 ### 2. Workloads
 
@@ -99,16 +100,17 @@ docker build -t jetty .
 # Run first node (bootstrap)
 docker run -d \
   --name jetty \
+  --network host \
   --cap-add NET_ADMIN \
   --cap-add NET_RAW \
-  -p 8080:8080 \
-  -p 51820:51820/udp \
   -v jetty-data:/data \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e JETTY_SECRET=my-cluster-password \
   -e JETTY_CF_TOKEN=eyJhIjoiNjA2... \
   jetty
 ```
+
+> **Note:** `--network host` is required for mesh IP routing. Without it, the Jetty container cannot reach workload containers on other Docker networks via iptables DNAT rules. This also means ports 8080 and 51820 are automatically exposed on the host.
 
 ### Option 2: Binary
 
@@ -326,8 +328,8 @@ Tunnel-only mode eliminates the need for UDP port 51820 to be forwarded. All int
 ```bash
 # On ALL nodes, set the tunnel domain
 docker run -d --name jetty \
+  --network host \
   --cap-add NET_ADMIN --cap-add NET_RAW \
-  -p 8080:8080 \
   -v jetty-data:/data \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e JETTY_SECRET=my-cluster-password \
@@ -336,15 +338,15 @@ docker run -d --name jetty \
   jetty
 ```
 
-Notice: **No UDP port 51820 exposed!**
+Notice: **No UDP port 51820 needed in tunnel-only mode!** The `--network host` is still required for mesh IP routing to work.
 
 ### Joining in Tunnel-Only Mode
 
 ```bash
 # Join via the tunnel domain
 docker run -d --name jetty \
+  --network host \
   --cap-add NET_ADMIN --cap-add NET_RAW \
-  -p 8080:8080 \
   -v jetty-data:/data \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e JETTY_SECRET=my-cluster-password \
@@ -457,8 +459,8 @@ By default, Cloudflare load balances requests randomly across nodes. This works 
 ```bash
 # Node A
 docker run -d --name jetty \
+  --network host \
   --cap-add NET_ADMIN --cap-add NET_RAW \
-  -p 8080:8080 \
   -v jetty-data:/data \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e JETTY_SECRET=my-cluster-password \
@@ -469,8 +471,8 @@ docker run -d --name jetty \
 
 # Node B
 docker run -d --name jetty \
+  --network host \
   --cap-add NET_ADMIN --cap-add NET_RAW \
-  -p 8080:8080 \
   -v jetty-data:/data \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e JETTY_SECRET=my-cluster-password \
@@ -552,10 +554,10 @@ Cloudflare WARP is a VPN-like service that routes traffic through Cloudflare's n
 ```bash
 # Run with WARP Connector (recommended)
 docker run -d --name jetty \
+  --network host \
   --cap-add NET_ADMIN \
   --cap-add MKNOD \
   --device /dev/net/tun \
-  -p 8080:8080 \
   -v jetty-data:/data \
   -v /var/lib/cloudflare-warp:/var/lib/cloudflare-warp \
   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -591,10 +593,10 @@ When nodes use WARP, they share their WARP IPs with each other during join/annou
 ```bash
 # Node 2 joining via WARP
 docker run -d --name jetty \
+  --network host \
   --cap-add NET_ADMIN \
   --cap-add MKNOD \
   --device /dev/net/tun \
-  -p 8080:8080 \
   -v jetty-data:/data \
   -v /var/lib/cloudflare-warp:/var/lib/cloudflare-warp \
   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -637,10 +639,10 @@ You can use both WARP and Cloudflare Tunnel together:
 
 ```bash
 docker run -d --name jetty \
+  --network host \
   --cap-add NET_ADMIN \
   --cap-add MKNOD \
   --device /dev/net/tun \
-  -p 8080:8080 \
   -v jetty-data:/data \
   -v /var/lib/cloudflare-warp:/var/lib/cloudflare-warp \
   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -1002,8 +1004,8 @@ docker logs jetty 2>&1 | grep cloudflared
 
 ```bash
 docker run -d --name jetty-node1 \
+  --network host \
   --cap-add NET_ADMIN --cap-add NET_RAW \
-  -p 8080:8080 -p 51820:51820/udp \
   -v jetty1:/data \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e JETTY_SECRET=supersecret \
@@ -1015,7 +1017,7 @@ docker run -d --name jetty-node1 \
 ### 2. Get Join Token
 
 ```bash
-TOKEN=$(curl -s -X POST http://203.0.113.1:8080/api/token | jq -r .token)
+TOKEN=$(curl -s -X POST http://localhost:8080/api/token | jq -r .token)
 echo $TOKEN
 ```
 
@@ -1023,8 +1025,8 @@ echo $TOKEN
 
 ```bash
 docker run -d --name jetty-node2 \
+  --network host \
   --cap-add NET_ADMIN --cap-add NET_RAW \
-  -p 8080:8080 -p 51820:51820/udp \
   -v jetty2:/data \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e JETTY_SECRET=supersecret \
