@@ -129,6 +129,7 @@ sudo JETTY_SECRET=my-cluster-password ./jetty
 | `JETTY_SECRET` | (none) | **Required for secure clusters.** Shared password all nodes must have. |
 | `JETTY_CF_TOKEN` | (none) | Cloudflare tunnel token (bootstrap node only). |
 | `JETTY_TUNNEL_DOMAIN` | (none) | **Tunnel-only mode.** Your Cloudflare tunnel domain (e.g., `cluster.example.com`). Eliminates need for UDP port forwarding. |
+| `JETTY_TUNNEL_HOST` | (none) | **Direct WG routing.** This node's specific subdomain (e.g., `node1.cluster.example.com`) for direct WireGuard packet routing. |
 | `JETTY_PUBLIC_IP` | (auto) | Override public IP detection (useful in containers). |
 | `JETTY_DATA_DIR` | `/data` | Directory for state and compose files. |
 | `JETTY_API_PORT` | `8080` | REST API port. |
@@ -413,6 +414,79 @@ Tunnel-only mode now includes **WebSocket UDP tunneling** that provides full Wir
 - **WireGuard encryption** - All traffic remains encrypted end-to-end
 - **Transparent** - Applications don't know they're going through a tunnel
 
+### Subdomain-Based Direct Routing
+
+By default, Cloudflare load balances requests randomly across nodes. This works for control plane operations (gossip, sync) but is inefficient for WireGuard packets that need to reach a specific peer.
+
+**Solution:** Each node gets its own subdomain in Cloudflare, allowing direct routing:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     SUBDOMAIN-BASED DIRECT ROUTING                          │
+│                                                                             │
+│   Node A                          Cloudflare                        Node B  │
+│   node1.cluster.example.com                                node2.cluster.   │
+│                                                            example.com      │
+│   ┌─────────────┐                                        ┌─────────────┐   │
+│   │   Agent A   │──WG packet for B ───────────────────►  │   Agent B   │   │
+│   │             │   POST node2.cluster.example.com       │  (direct!)  │   │
+│   └─────────────┘   /api/wg/packet                       └─────────────┘   │
+│                                                                             │
+│   • Each node has unique subdomain (JETTY_TUNNEL_HOST)                     │
+│   • WG packets sent directly to target peer's subdomain                    │
+│   • No random routing - packets go straight to destination                 │
+│   • Control plane can still use shared domain for load balancing           │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Cloudflare Setup:**
+1. In Cloudflare Tunnel dashboard, add multiple public hostnames
+2. Each hostname points to `http://localhost:8080` on that node
+3. Example hostnames:
+   - `cluster.example.com` → Load balanced to any node (general access)
+   - `node1.cluster.example.com` → Routes only to Node A
+   - `node2.cluster.example.com` → Routes only to Node B
+
+**Node Configuration:**
+
+```bash
+# Node A
+docker run -d --name jetty \
+  --cap-add NET_ADMIN --cap-add NET_RAW \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_CF_TOKEN=eyJhIjoiNjA2... \
+  -e JETTY_TUNNEL_DOMAIN=cluster.example.com \
+  -e JETTY_TUNNEL_HOST=node1.cluster.example.com \
+  jetty
+
+# Node B
+docker run -d --name jetty \
+  --cap-add NET_ADMIN --cap-add NET_RAW \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_TUNNEL_DOMAIN=cluster.example.com \
+  -e JETTY_TUNNEL_HOST=node2.cluster.example.com \
+  -e JETTY_JOIN=https://cluster.example.com \
+  -e JETTY_TOKEN=abc123... \
+  jetty
+```
+
+**How it works:**
+1. Each node announces its `TunnelHost` during join/announce
+2. When sending WG packets, the sender looks up the target peer's `TunnelHost`
+3. If available, packets go directly to `https://{peer.TunnelHost}/api/wg/packet`
+4. If not available, falls back to shared tunnel domain (random routing)
+
+**Benefits:**
+- **No random hops** - Packets reach the correct node immediately
+- **Lower latency** - Direct path instead of multi-hop through random nodes
+- **Better reliability** - No dependency on gossip for packet routing
+
 ### Limitations
 
 1. **Higher latency** - Packets route through Cloudflare
@@ -567,7 +641,7 @@ New Node                                    Existing Node
 │                         STATE                                   │
 │                                                                 │
 │  Peers: map[HWID]*Peer                                          │
-│    └── {ID, Name, MeshIP, Endpoint, PublicKey, Healthy}         │
+│    └── {ID, Name, MeshIP, Endpoint, PublicKey, TunnelHost, ...} │
 │                                                                 │
 │  Workloads: map[MeshIP]*Workload                                │
 │    └── {Name, MeshIP, Compose, Revive, Owner, Version}          │

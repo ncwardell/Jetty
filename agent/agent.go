@@ -49,13 +49,14 @@ type WGPacket struct {
 // =============================================================================
 
 type Peer struct {
-	ID        string    `json:"id"`         // HWID
-	Name      string    `json:"name"`       // Hostname
-	MeshIP    string    `json:"mesh_ip"`
-	Endpoint  string    `json:"endpoint"`   // public:wg_port
-	PublicKey string    `json:"public_key"`
-	Healthy   bool      `json:"healthy"`
-	LastSeen  time.Time `json:"last_seen"`
+	ID         string    `json:"id"`          // HWID
+	Name       string    `json:"name"`        // Hostname
+	MeshIP     string    `json:"mesh_ip"`
+	Endpoint   string    `json:"endpoint"`    // public:wg_port
+	PublicKey  string    `json:"public_key"`
+	TunnelHost string    `json:"tunnel_host"` // Peer-specific tunnel hostname (e.g., "node1.cluster.example.com")
+	Healthy    bool      `json:"healthy"`
+	LastSeen   time.Time `json:"last_seen"`
 }
 
 type Workload struct {
@@ -102,6 +103,7 @@ type Agent struct {
 	joinTok       string
 	clusterSecret string // Shared secret all nodes must have to join
 	tunnelDomain  string // Cloudflare tunnel domain for tunnel-only mode (no WG port forwarding needed)
+	tunnelHost    string // This node's specific tunnel hostname (e.g., "node1.cluster.example.com")
 
 	// State
 	state   *State
@@ -147,6 +149,7 @@ func New() (*Agent, error) {
 		joinTok:       getEnv("JETTY_TOKEN", ""),
 		clusterSecret: getEnv("JETTY_SECRET", ""),
 		tunnelDomain:  getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - enables tunnel-only mode
+		tunnelHost:    getEnv("JETTY_TUNNEL_HOST", ""),   // e.g., "node1.cluster.example.com" - this node's specific subdomain
 		composeDir:    filepath.Join(dataDir, "compose"),
 		hostsFile:     "/etc/hosts",
 		state: &State{
@@ -451,13 +454,14 @@ func (a *Agent) joinCluster() error {
 	publicIP := getPublicIP()
 
 	req := map[string]string{
-		"token":      a.joinTok,
-		"secret":     a.clusterSecret,
-		"id":         a.hwid,
-		"name":       a.hostname,
-		"mesh_ip":    a.meshIP,
-		"endpoint":   fmt.Sprintf("%s:%d", publicIP, a.wgPort),
-		"public_key": a.wgPubKey,
+		"token":       a.joinTok,
+		"secret":      a.clusterSecret,
+		"id":          a.hwid,
+		"name":        a.hostname,
+		"mesh_ip":     a.meshIP,
+		"endpoint":    fmt.Sprintf("%s:%d", publicIP, a.wgPort),
+		"public_key":  a.wgPubKey,
+		"tunnel_host": a.tunnelHost, // Our specific subdomain for direct WG packet routing
 	}
 
 	data, _ := json.Marshal(req)
@@ -816,13 +820,14 @@ func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 
 func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Token     string `json:"token"`
-		Secret    string `json:"secret"`
-		ID        string `json:"id"`
-		Name      string `json:"name"`
-		MeshIP    string `json:"mesh_ip"`
-		Endpoint  string `json:"endpoint"`
-		PublicKey string `json:"public_key"`
+		Token      string `json:"token"`
+		Secret     string `json:"secret"`
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		MeshIP     string `json:"mesh_ip"`
+		Endpoint   string `json:"endpoint"`
+		PublicKey  string `json:"public_key"`
+		TunnelHost string `json:"tunnel_host"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
@@ -873,13 +878,14 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 
 	// Create peer
 	peer := &Peer{
-		ID:        req.ID,
-		Name:      req.Name,
-		MeshIP:    req.MeshIP,
-		Endpoint:  req.Endpoint,
-		PublicKey: req.PublicKey,
-		Healthy:   true,
-		LastSeen:  time.Now(),
+		ID:         req.ID,
+		Name:       req.Name,
+		MeshIP:     req.MeshIP,
+		Endpoint:   req.Endpoint,
+		PublicKey:  req.PublicKey,
+		TunnelHost: req.TunnelHost,
+		Healthy:    true,
+		LastSeen:   time.Now(),
 	}
 
 	a.stateMu.Lock()
@@ -887,12 +893,13 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 
 	// Build response with all peers (including self)
 	allPeers := []*Peer{{
-		ID:        a.hwid,
-		Name:      a.hostname,
-		MeshIP:    a.meshIP,
-		Endpoint:  fmt.Sprintf("%s:%d", getPublicIP(), a.wgPort),
-		PublicKey: a.wgPubKey,
-		Healthy:   true,
+		ID:         a.hwid,
+		Name:       a.hostname,
+		MeshIP:     a.meshIP,
+		Endpoint:   fmt.Sprintf("%s:%d", getPublicIP(), a.wgPort),
+		PublicKey:  a.wgPubKey,
+		TunnelHost: a.tunnelHost,
+		Healthy:    true,
 	}}
 	for _, p := range a.state.Peers {
 		if p.ID != req.ID {
@@ -2154,6 +2161,8 @@ func (a *Agent) runUDPRelay(relay *udpRelay) {
 }
 
 // sendWGPacket sends a WireGuard packet through the Cloudflare tunnel.
+// If the target peer has a specific TunnelHost, send directly to that subdomain.
+// Otherwise, fall back to the general tunnel domain (random routing).
 func (a *Agent) sendWGPacket(pkt *WGPacket) {
 	if a.tunnelDomain == "" {
 		return
@@ -2164,8 +2173,21 @@ func (a *Agent) sendWGPacket(pkt *WGPacket) {
 		return
 	}
 
+	// Look up peer's specific tunnel host for direct routing
+	var targetHost string
+	a.stateMu.RLock()
+	if peer, ok := a.state.Peers[pkt.ToID]; ok && peer.TunnelHost != "" {
+		targetHost = peer.TunnelHost
+	}
+	a.stateMu.RUnlock()
+
+	// Fall back to general tunnel domain if peer has no specific host
+	if targetHost == "" {
+		targetHost = a.tunnelDomain
+	}
+
 	// Try HTTP POST (more reliable through CF tunnel than WebSocket)
-	url := fmt.Sprintf("https://%s/api/wg/packet", a.tunnelDomain)
+	url := fmt.Sprintf("https://%s/api/wg/packet", targetHost)
 	resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
 	if err != nil {
 		// Log occasionally, not every packet
@@ -2205,11 +2227,16 @@ func (a *Agent) getRelayEndpoint(peerID string) (string, error) {
 // =============================================================================
 
 // getPeerAPIURL returns the URL to reach a peer's API.
-// In tunnel-only mode, uses the Cloudflare tunnel domain.
-// Otherwise, uses the peer's mesh IP directly.
+// In tunnel-only mode, uses the peer's specific TunnelHost if available,
+// otherwise falls back to the general Cloudflare tunnel domain.
+// In direct mode, uses the peer's mesh IP.
 func (a *Agent) getPeerAPIURL(peer *Peer, path string) string {
 	if a.tunnelDomain != "" {
-		// Tunnel-only mode: route through Cloudflare tunnel
+		// Tunnel-only mode: prefer peer's specific subdomain for direct routing
+		if peer.TunnelHost != "" {
+			return fmt.Sprintf("https://%s%s", peer.TunnelHost, path)
+		}
+		// Fall back to general tunnel domain (random routing)
 		return fmt.Sprintf("https://%s%s", a.tunnelDomain, path)
 	}
 	// Direct mode: use peer's mesh IP
