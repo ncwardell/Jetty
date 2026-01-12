@@ -81,7 +81,8 @@ type State struct {
 	Peers     map[string]*Peer     `json:"peers"`     // ID -> Peer
 	Workloads map[string]*Workload `json:"workloads"` // MeshIP -> Workload
 	Tokens    map[string]*Token    `json:"tokens"`
-	CFToken   string               `json:"cf_token,omitempty"` // Cloudflare tunnel token (shared cluster-wide)
+	CFToken   string               `json:"cf_token,omitempty"`   // Cloudflare tunnel token (shared cluster-wide)
+	WarpToken string               `json:"warp_token,omitempty"` // Cloudflare WARP connector token (shared cluster-wide)
 }
 
 // =============================================================================
@@ -168,7 +169,8 @@ func New() (*Agent, error) {
 			Peers:     make(map[string]*Peer),
 			Workloads: make(map[string]*Workload),
 			Tokens:    make(map[string]*Token),
-			CFToken:   getEnv("JETTY_CF_TOKEN", ""), // Bootstrap tunnel token
+			CFToken:   getEnv("JETTY_CF_TOKEN", ""),            // Bootstrap tunnel token
+			WarpToken: getEnv("JETTY_WARP_CONNECTOR_TOKEN", ""), // Bootstrap WARP connector token
 		},
 		wgRelays:    make(map[string]*udpRelay),
 		wgRelayBase: 51821, // Start relay ports from 51821
@@ -634,6 +636,7 @@ func (a *Agent) joinCluster() error {
 		Peers     []*Peer     `json:"peers"`
 		Workloads []*Workload `json:"workloads"`
 		CFToken   string      `json:"cf_token,omitempty"`
+		WarpToken string      `json:"warp_token,omitempty"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return fmt.Errorf("decode join response: %w", err)
@@ -646,9 +649,12 @@ func (a *Agent) joinCluster() error {
 	for _, w := range result.Workloads {
 		a.state.Workloads[w.MeshIP] = w
 	}
-	// Store the CF token received from the cluster
+	// Store tokens received from the cluster
 	if result.CFToken != "" {
 		a.state.CFToken = result.CFToken
+	}
+	if result.WarpToken != "" {
+		a.state.WarpToken = result.WarpToken
 	}
 	a.stateMu.Unlock()
 
@@ -662,13 +668,61 @@ func (a *Agent) joinCluster() error {
 		}
 	}
 
-	log.Printf("Joined: %d peers, %d workloads, tunnel=%v", len(result.Peers), len(result.Workloads), result.CFToken != "")
+	log.Printf("Joined: %d peers, %d workloads, tunnel=%v, warp=%v",
+		len(result.Peers), len(result.Workloads), result.CFToken != "", result.WarpToken != "")
 	return nil
 }
 
 // =============================================================================
 // API
 // =============================================================================
+
+// apiKeyMiddleware checks for valid API key on protected endpoints.
+// The API key is the cluster secret (JETTY_SECRET).
+func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip authentication if no secret is configured
+		if a.clusterSecret == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Public endpoints that don't require API key
+		publicPaths := []string{
+			"/api/health",      // Monitoring
+			"/api/join",        // Node joining (uses token + secret in body)
+			"/api/sync",        // Internal cluster sync (uses secret in body)
+			"/api/peer-announce", // Internal peer announcement
+			"/api/heartbeat",   // Internal heartbeat
+			"/api/tunnel/sync", // Internal tunnel sync
+			"/api/token/sync",  // Internal token sync
+			"/api/ws/wg",       // WireGuard WebSocket tunnel
+			"/api/wg/packet",   // WireGuard HTTP tunnel
+			"/swagger/",        // API documentation
+		}
+
+		path := r.URL.Path
+		for _, p := range publicPaths {
+			if strings.HasPrefix(path, p) {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		// Check API key from header or query param
+		apiKey := r.Header.Get("X-API-Key")
+		if apiKey == "" {
+			apiKey = r.URL.Query().Get("api_key")
+		}
+
+		if apiKey != a.clusterSecret {
+			http.Error(w, "unauthorized: invalid or missing API key", http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
 
 func (a *Agent) runAPI() {
 	r := mux.NewRouter()
@@ -694,15 +748,18 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 	r.HandleFunc("/api/heartbeat", a.apiHeartbeat).Methods("POST")
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)
-	r.HandleFunc("/api/ws/wg", a.wsWireGuard)                      // WebSocket endpoint for WG packets
+	r.HandleFunc("/api/ws/wg", a.wsWireGuard)                     // WebSocket endpoint for WG packets
 	r.HandleFunc("/api/wg/packet", a.apiWGPacket).Methods("POST") // HTTP fallback for WG packets
 
 	// Swagger UI
 	r.PathPrefix("/swagger/").Handler(httpSwagger.WrapHandler)
 
+	// Wrap router with API key middleware
+	handler := a.apiKeyMiddleware(r)
+
 	addr := fmt.Sprintf(":%d", a.apiPort)
-	log.Printf("API on %s", addr)
-	http.ListenAndServe(addr, r)
+	log.Printf("API on %s (auth=%v)", addr, a.clusterSecret != "")
+	http.ListenAndServe(addr, handler)
 }
 
 // apiStatus godoc
@@ -1423,6 +1480,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		allWorkloads = append(allWorkloads, w)
 	}
 	cfToken := a.state.CFToken
+	warpToken := a.state.WarpToken
 	a.stateMu.Unlock()
 
 	a.addWGPeer(peer)
@@ -1440,6 +1498,11 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	// Include CF token so new peer can start its tunnel
 	if cfToken != "" {
 		resp["cf_token"] = cfToken
+	}
+
+	// Include WARP connector token so new peer can join WARP network
+	if warpToken != "" {
+		resp["warp_token"] = warpToken
 	}
 
 	w.Header().Set("Content-Type", "application/json")
