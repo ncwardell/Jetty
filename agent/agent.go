@@ -21,6 +21,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
+	httpSwagger "github.com/swaggo/http-swagger"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -684,14 +685,24 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 	r.HandleFunc("/api/heartbeat", a.apiHeartbeat).Methods("POST")
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)
-	r.HandleFunc("/api/ws/wg", a.wsWireGuard)             // WebSocket endpoint for WG packets
+	r.HandleFunc("/api/ws/wg", a.wsWireGuard)                      // WebSocket endpoint for WG packets
 	r.HandleFunc("/api/wg/packet", a.apiWGPacket).Methods("POST") // HTTP fallback for WG packets
+
+	// Swagger UI
+	r.PathPrefix("/swagger/").Handler(httpSwagger.WrapHandler)
 
 	addr := fmt.Sprintf(":%d", a.apiPort)
 	log.Printf("API on %s", addr)
 	http.ListenAndServe(addr, r)
 }
 
+// apiStatus godoc
+// @Summary Get cluster status
+// @Description Returns full cluster status including node info, peers, workloads, and connectivity status
+// @Tags cluster
+// @Produce json
+// @Success 200 {object} StatusResponse
+// @Router /status [get]
 func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RLock()
 	peers := make([]*Peer, 0, len(a.state.Peers))
@@ -733,6 +744,13 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// apiListWorkloads godoc
+// @Summary List all workloads
+// @Description Returns all workloads in the cluster
+// @Tags workloads
+// @Produce json
+// @Success 200 {array} Workload
+// @Router /workloads [get]
 func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RLock()
 	workloads := make([]*Workload, 0, len(a.state.Workloads))
@@ -745,6 +763,18 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(workloads)
 }
 
+// apiCreateWorkload godoc
+// @Summary Deploy a new workload
+// @Description Creates and deploys a new Docker Compose workload with a mesh IP
+// @Tags workloads
+// @Accept json
+// @Produce json
+// @Param workload body WorkloadRequest true "Workload configuration"
+// @Success 201 {object} Workload
+// @Failure 400 {object} ErrorResponse "Invalid request"
+// @Failure 409 {object} ErrorResponse "Mesh IP already in use"
+// @Failure 500 {object} ErrorResponse "Deployment failed"
+// @Router /workloads [post]
 func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	var wl Workload
 	if err := json.NewDecoder(r.Body).Decode(&wl); err != nil {
@@ -802,6 +832,15 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(wl)
 }
 
+// apiGetWorkload godoc
+// @Summary Get workload details
+// @Description Returns details for a specific workload by name
+// @Tags workloads
+// @Produce json
+// @Param name path string true "Workload name"
+// @Success 200 {object} Workload
+// @Failure 404 {object} ErrorResponse "Workload not found"
+// @Router /workloads/{name} [get]
 func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 
@@ -824,6 +863,14 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(found)
 }
 
+// apiDeleteWorkload godoc
+// @Summary Delete a workload
+// @Description Stops and removes a workload from the cluster
+// @Tags workloads
+// @Param name path string true "Workload name"
+// @Success 204 "Workload deleted"
+// @Failure 404 {object} ErrorResponse "Workload not found"
+// @Router /workloads/{name} [delete]
 func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 
@@ -869,6 +916,17 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 
+// apiMoveWorkload godoc
+// @Summary Move workload to another node
+// @Description Migrates a workload to a different node in the cluster
+// @Tags workloads
+// @Accept json
+// @Param name path string true "Workload name"
+// @Param target body MoveRequest true "Target node"
+// @Success 200 "Workload moved"
+// @Failure 400 {object} ErrorResponse "Invalid request"
+// @Failure 404 {object} ErrorResponse "Workload or target not found"
+// @Router /workloads/{name}/move [post]
 func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 
@@ -930,6 +988,15 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"moved": "ok", "to": target.Name})
 }
 
+// apiWorkloadLogs godoc
+// @Summary Get workload logs
+// @Description Returns container logs for a workload
+// @Tags workloads
+// @Produce plain
+// @Param name path string true "Workload name"
+// @Success 200 {string} string "Container logs"
+// @Failure 404 {object} ErrorResponse "Workload not found"
+// @Router /workloads/{name}/logs [get]
 func (a *Agent) apiWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 
@@ -953,6 +1020,13 @@ func (a *Agent) apiWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(out))
 }
 
+// apiCreateToken godoc
+// @Summary Create join token
+// @Description Generates a new single-use token for joining the cluster (expires in 24h)
+// @Tags cluster
+// @Produce json
+// @Success 200 {object} TokenResponse
+// @Router /token [post]
 func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 	tok := &Token{
 		Token:     genID() + genID(),
@@ -973,6 +1047,17 @@ func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(tok)
 }
 
+// apiJoin godoc
+// @Summary Join cluster
+// @Description Allows a new node to join the cluster using a token
+// @Tags cluster
+// @Accept json
+// @Produce json
+// @Param request body JoinRequest true "Join request"
+// @Success 200 {object} JoinResponse
+// @Failure 401 {object} ErrorResponse "Invalid token or secret"
+// @Failure 409 {object} ErrorResponse "Mesh IP collision"
+// @Router /join [post]
 func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Token      string `json:"token"`
@@ -1095,6 +1180,13 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Peer joined: %s (%s)", peer.Name, peer.MeshIP)
 }
 
+// apiHealth godoc
+// @Summary Health check
+// @Description Returns health status of this node
+// @Tags cluster
+// @Produce json
+// @Success 200 {object} HealthResponse
+// @Router /health [get]
 func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1119,6 +1211,13 @@ func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(local)
 }
 
+// apiGetTunnel godoc
+// @Summary Get tunnel status
+// @Description Returns Cloudflare tunnel configuration status
+// @Tags tunnel
+// @Produce json
+// @Success 200 {object} TunnelStatus
+// @Router /tunnel [get]
 func (a *Agent) apiGetTunnel(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RLock()
 	hasToken := a.state.CFToken != ""
@@ -1133,6 +1232,15 @@ func (a *Agent) apiGetTunnel(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// apiSetTunnel godoc
+// @Summary Configure tunnel
+// @Description Sets the Cloudflare tunnel token (propagates to all nodes)
+// @Tags tunnel
+// @Accept json
+// @Param token body TunnelRequest true "Tunnel token"
+// @Success 200 "Tunnel configured"
+// @Failure 400 {object} ErrorResponse "Invalid request"
+// @Router /tunnel [post]
 func (a *Agent) apiSetTunnel(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Token string `json:"token"`
@@ -1171,6 +1279,12 @@ func (a *Agent) apiSetTunnel(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Cloudflare tunnel configured")
 }
 
+// apiDeleteTunnel godoc
+// @Summary Remove tunnel
+// @Description Removes the Cloudflare tunnel configuration
+// @Tags tunnel
+// @Success 204 "Tunnel removed"
+// @Router /tunnel [delete]
 func (a *Agent) apiDeleteTunnel(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.Lock()
 	a.state.CFToken = ""
