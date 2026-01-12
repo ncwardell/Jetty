@@ -1018,16 +1018,37 @@ func (a *Agent) deployWorkload(wl *Workload) error {
 }
 
 func (a *Agent) removeWorkload(wl *Workload) {
-	a.composeCmd(wl.Name, "down", "-v", "--remove-orphans")
-
+	// Clean up iptables BEFORE stopping container (need container IP)
 	if wl.MeshIP != "" {
-		exec.Command("ip", "addr", "del", wl.MeshIP+"/32", "dev", "jetty0").Run()
+		a.cleanupWorkloadIP(wl)
 	}
+
+	a.composeCmd(wl.Name, "down", "-v", "--remove-orphans")
 
 	dir := filepath.Join(a.composeDir, wl.Name)
 	os.RemoveAll(dir)
 
 	log.Printf("Removed: %s", wl.Name)
+}
+
+func (a *Agent) cleanupWorkloadIP(wl *Workload) {
+	// Get container IP before it's gone
+	containerName := fmt.Sprintf("jetty_%s-%s-1", wl.Name, wl.Name)
+	out, err := exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerName).Output()
+	if err != nil {
+		containerName = fmt.Sprintf("jetty_%s-1", wl.Name)
+		out, _ = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerName).Output()
+	}
+
+	containerIP := strings.TrimSpace(string(out))
+	if containerIP != "" {
+		// Remove DNAT rules
+		exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-d", wl.MeshIP, "-j", "DNAT", "--to", containerIP).Run()
+		exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-d", wl.MeshIP, "-j", "DNAT", "--to", containerIP).Run()
+	}
+
+	// Remove mesh IP from interface
+	exec.Command("ip", "addr", "del", wl.MeshIP+"/32", "dev", "jetty0").Run()
 }
 
 func (a *Agent) setupWorkloadIP(wl *Workload) {
@@ -1247,11 +1268,10 @@ func (a *Agent) checkFailover() {
 	}
 }
 
+// shouldClaim determines if this node should claim an orphaned workload.
+// NOTE: Caller must already hold stateMu lock.
 func (a *Agent) shouldClaim(wl *Workload) bool {
 	// Deterministic: lowest healthy node ID wins
-	a.stateMu.RLock()
-	defer a.stateMu.RUnlock()
-
 	candidates := []string{a.hwid}
 	for _, p := range a.state.Peers {
 		if p.Healthy {
