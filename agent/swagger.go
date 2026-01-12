@@ -89,6 +89,20 @@ type ErrorResponse struct {
 
 // HealthResponse represents a health check response
 type HealthResponse struct {
-	Status string `json:"status" example:"ok"`
-	ID     string `json:"id" example:"abc123def456"`
+	Healthy        bool     `json:"healthy" example:"true"`
+	ID             string   `json:"id" example:"abc123def456"`
+	Name           string   `json:"name" example:"node1"`
+	MeshIP         string   `json:"mesh_ip" example:"10.100.42.1"`
+	PublicIP       string   `json:"public_ip" example:"203.0.113.1"`
+	Timestamp      string   `json:"timestamp" example:"2024-01-02T15:04:05Z"`
+	WorkloadsLocal []string `json:"workloads_local" example:"nginx:10.100.50.1:running,redis:10.100.50.2:stopped"`
+	WorkloadsTotal int      `json:"workloads_total" example:"5"`
+	WireguardMode  string   `json:"wireguard_mode" example:"kernel"`
+	WarpIP         string   `json:"warp_ip,omitempty" example:"100.96.0.5"`
+}
+
+// WorkloadActionResponse represents start/stop response
+type WorkloadActionResponse struct {
+	Status string `json:"status" example:"started"`
+	Name   string `json:"name" example:"nginx"`
 }

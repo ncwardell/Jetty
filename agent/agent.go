@@ -673,6 +673,8 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/workloads/{name}", a.apiDeleteWorkload).Methods("DELETE")
 	r.HandleFunc("/api/workloads/{name}/move", a.apiMoveWorkload).Methods("POST")
 	r.HandleFunc("/api/workloads/{name}/logs", a.apiWorkloadLogs).Methods("GET")
+	r.HandleFunc("/api/workloads/{name}/start", a.apiStartWorkload).Methods("POST")
+	r.HandleFunc("/api/workloads/{name}/stop", a.apiStopWorkload).Methods("POST")
 	r.HandleFunc("/api/token", a.apiCreateToken).Methods("POST", "GET")
 	r.HandleFunc("/api/join", a.apiJoin).Methods("POST")
 	r.HandleFunc("/api/health", a.apiHealth).Methods("GET")
@@ -1020,6 +1022,86 @@ func (a *Agent) apiWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(out))
 }
 
+// apiStartWorkload godoc
+// @Summary Start a stopped workload
+// @Description Starts the containers for a workload that was previously stopped
+// @Tags workloads
+// @Param name path string true "Workload name"
+// @Success 200 {object} map[string]string
+// @Failure 404 {object} ErrorResponse "Workload not found"
+// @Failure 500 {object} ErrorResponse "Start failed"
+// @Router /workloads/{name}/start [post]
+func (a *Agent) apiStartWorkload(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+
+	a.stateMu.RLock()
+	var found *Workload
+	for _, wl := range a.state.Workloads {
+		if wl.Name == name && wl.Owner == a.hwid {
+			found = wl
+			break
+		}
+	}
+	a.stateMu.RUnlock()
+
+	if found == nil {
+		http.Error(w, "not found or not local", 404)
+		return
+	}
+
+	if out, err := a.composeCmd(found.Name, "start"); err != nil {
+		http.Error(w, fmt.Sprintf("start failed: %s", out), 500)
+		return
+	}
+
+	// Re-setup mesh IP routing (container IP may have changed)
+	a.setupWorkloadIP(found)
+
+	log.Printf("Started workload: %s", found.Name)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "started", "name": found.Name})
+}
+
+// apiStopWorkload godoc
+// @Summary Stop a running workload
+// @Description Stops the containers for a workload without removing them
+// @Tags workloads
+// @Param name path string true "Workload name"
+// @Success 200 {object} map[string]string
+// @Failure 404 {object} ErrorResponse "Workload not found"
+// @Failure 500 {object} ErrorResponse "Stop failed"
+// @Router /workloads/{name}/stop [post]
+func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+
+	a.stateMu.RLock()
+	var found *Workload
+	for _, wl := range a.state.Workloads {
+		if wl.Name == name && wl.Owner == a.hwid {
+			found = wl
+			break
+		}
+	}
+	a.stateMu.RUnlock()
+
+	if found == nil {
+		http.Error(w, "not found or not local", 404)
+		return
+	}
+
+	// Clean up iptables before stopping (need container IP)
+	a.cleanupWorkloadIP(found)
+
+	if out, err := a.composeCmd(found.Name, "stop"); err != nil {
+		http.Error(w, fmt.Sprintf("stop failed: %s", out), 500)
+		return
+	}
+
+	log.Printf("Stopped workload: %s", found.Name)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "stopped", "name": found.Name})
+}
+
 // apiCreateToken godoc
 // @Summary Create join token
 // @Description Generates a new single-use token for joining the cluster (expires in 24h)
@@ -1188,11 +1270,36 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} HealthResponse
 // @Router /health [get]
 func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
+	// Count workloads
+	a.stateMu.RLock()
+	var localWorkloads []string
+	var totalWorkloads int
+	for _, wl := range a.state.Workloads {
+		totalWorkloads++
+		if wl.Owner == a.hwid {
+			// Check if container is running
+			out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
+			status := "stopped"
+			if len(strings.TrimSpace(string(out))) > 0 {
+				status = "running"
+			}
+			localWorkloads = append(localWorkloads, fmt.Sprintf("%s:%s:%s", wl.Name, wl.MeshIP, status))
+		}
+	}
+	a.stateMu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"healthy": true,
-		"id":      a.hwid,
-		"name":    a.hostname,
+		"healthy":         true,
+		"id":              a.hwid,
+		"name":            a.hostname,
+		"mesh_ip":         a.meshIP,
+		"public_ip":       getPublicIP(),
+		"timestamp":       time.Now().UTC().Format(time.RFC3339),
+		"workloads_local": localWorkloads,
+		"workloads_total": totalWorkloads,
+		"wireguard_mode":  func() string { if a.wgDisabled { return "dummy" } else { return "kernel" } }(),
+		"warp_ip":         a.warpIP,
 	})
 }
 
