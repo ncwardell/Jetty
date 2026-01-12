@@ -61,12 +61,13 @@ type Peer struct {
 }
 
 type Workload struct {
-	Name    string `json:"name"`     // DNS hostname
-	MeshIP  string `json:"mesh_ip"`  // Unique lock
-	Compose string `json:"compose"`
-	Revive  bool   `json:"revive"`
-	Owner   string `json:"owner"`    // Node HWID
-	Version int64  `json:"version"`  // Unix timestamp
+	Name      string `json:"name"`      // DNS hostname
+	MeshIP    string `json:"mesh_ip"`   // Unique lock
+	Compose   string `json:"compose"`
+	Revive    bool   `json:"revive"`    // Auto-failover to another node if owner dies
+	Autostart bool   `json:"autostart"` // Auto-start when Jetty starts up
+	Owner     string `json:"owner"`     // Node HWID
+	Version   int64  `json:"version"`   // Unix timestamp
 }
 
 type Token struct {
@@ -202,7 +203,14 @@ func (a *Agent) Start() error {
 		if err := a.joinCluster(); err != nil {
 			return fmt.Errorf("join: %w", err)
 		}
+	} else {
+		// Not joining - sync state from known peers before autostart
+		// This handles the case where we restarted and workloads were revived by other nodes
+		a.syncStateOnStartup()
 	}
+
+	// Auto-start owned workloads (only those we still own after sync)
+	a.autostartWorkloads()
 
 	// Update hosts file
 	a.updateHosts()
@@ -277,6 +285,7 @@ func (a *Agent) detectWarpIP() {
 }
 
 func (a *Agent) Stop() {
+	log.Printf("Shutting down Jetty...")
 	close(a.stopCh)
 	a.stopCloudflared()
 	a.stopUDPRelays()
@@ -284,7 +293,43 @@ func (a *Agent) Stop() {
 		a.wgLocalConn.Close()
 	}
 	a.saveState()
-	exec.Command("ip", "link", "del", "jetty0").Run()
+
+	// Clean up network resources
+	a.cleanupNetwork()
+}
+
+// cleanupNetwork removes all Jetty-created network resources
+func (a *Agent) cleanupNetwork() {
+	log.Printf("Cleaning up network resources...")
+
+	// Clean up iptables rules for all workloads
+	a.stateMu.RLock()
+	for _, wl := range a.state.Workloads {
+		if wl.Owner == a.hwid {
+			// Find container IP and remove DNAT rules
+			out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
+			if len(out) > 0 {
+				containerID := strings.Split(strings.TrimSpace(string(out)), "\n")[0]
+				if containerID != "" {
+					out, _ = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID).Output()
+					containerIP := strings.TrimSpace(string(out))
+					if containerIP != "" {
+						exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-d", wl.MeshIP, "-j", "DNAT", "--to", containerIP).Run()
+						exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-d", wl.MeshIP, "-j", "DNAT", "--to", containerIP).Run()
+						log.Printf("Removed iptables rules for %s (%s -> %s)", wl.Name, wl.MeshIP, containerIP)
+					}
+				}
+			}
+		}
+	}
+	a.stateMu.RUnlock()
+
+	// Remove jetty0 interface (this also removes all IPs bound to it)
+	if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
+		log.Printf("Warning: could not remove jetty0 interface: %v", err)
+	} else {
+		log.Printf("Removed jetty0 interface")
+	}
 }
 
 // =============================================================================
@@ -1500,6 +1545,29 @@ func (a *Agent) cleanupExpiredTokens() {
 // Docker Compose
 // =============================================================================
 
+// autostartWorkloads starts all owned workloads that have autostart enabled
+func (a *Agent) autostartWorkloads() {
+	a.stateMu.RLock()
+	var toStart []*Workload
+	for _, wl := range a.state.Workloads {
+		if wl.Owner == a.hwid && wl.Autostart {
+			toStart = append(toStart, wl)
+		}
+	}
+	a.stateMu.RUnlock()
+
+	if len(toStart) == 0 {
+		return
+	}
+
+	log.Printf("Auto-starting %d workload(s)...", len(toStart))
+	for _, wl := range toStart {
+		if err := a.deployWorkload(wl); err != nil {
+			log.Printf("Failed to auto-start %s: %v", wl.Name, err)
+		}
+	}
+}
+
 func (a *Agent) deployWorkload(wl *Workload) error {
 	dir := filepath.Join(a.composeDir, wl.Name)
 	os.MkdirAll(dir, 0755)
@@ -1706,6 +1774,83 @@ func (a *Agent) tunnelModeHealthCheck() {
 	}
 }
 
+// syncStateOnStartup syncs state from known peers before autostarting workloads.
+// This handles the case where we restarted and workloads were revived by other nodes.
+func (a *Agent) syncStateOnStartup() {
+	a.stateMu.RLock()
+	peerCount := len(a.state.Peers)
+	peers := make([]*Peer, 0, peerCount)
+	for _, p := range a.state.Peers {
+		peers = append(peers, p)
+	}
+	a.stateMu.RUnlock()
+
+	if peerCount == 0 {
+		log.Printf("No known peers - skipping startup sync")
+		return
+	}
+
+	log.Printf("Syncing state from %d known peer(s) before autostart...", peerCount)
+	synced := false
+
+	// Try tunnel domain first if configured
+	if a.tunnelDomain != "" {
+		url := fmt.Sprintf("https://%s/api/sync", a.tunnelDomain)
+		resp, err := httpClient.Get(url)
+		if err == nil {
+			var workloads []*Workload
+			json.NewDecoder(resp.Body).Decode(&workloads)
+			resp.Body.Close()
+
+			a.stateMu.Lock()
+			for _, w := range workloads {
+				existing := a.state.Workloads[w.MeshIP]
+				if existing == nil || w.Version > existing.Version {
+					if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
+						log.Printf("Workload %s was revived by %s while we were down", w.Name, w.Owner[:12])
+					}
+					a.state.Workloads[w.MeshIP] = w
+				}
+			}
+			a.stateMu.Unlock()
+			synced = true
+		}
+	}
+
+	// Try direct peer connections
+	for _, peer := range peers {
+		url := fmt.Sprintf("http://%s:%d/api/sync", peer.MeshIP, a.apiPort)
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			continue
+		}
+
+		var workloads []*Workload
+		json.NewDecoder(resp.Body).Decode(&workloads)
+		resp.Body.Close()
+
+		a.stateMu.Lock()
+		for _, w := range workloads {
+			existing := a.state.Workloads[w.MeshIP]
+			if existing == nil || w.Version > existing.Version {
+				if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
+					log.Printf("Workload %s was revived by %s while we were down", w.Name, w.Owner[:12])
+				}
+				a.state.Workloads[w.MeshIP] = w
+			}
+		}
+		a.stateMu.Unlock()
+		synced = true
+	}
+
+	if synced {
+		log.Printf("Startup sync complete")
+		a.saveState()
+	} else {
+		log.Printf("Warning: could not reach any peers for startup sync")
+	}
+}
+
 func (a *Agent) syncWorkloads() {
 	// In tunnel-only mode, sync through tunnel domain
 	if a.tunnelDomain != "" {
@@ -1723,6 +1868,8 @@ func (a *Agent) syncWorkloads() {
 	}
 	a.stateMu.RUnlock()
 
+	var lostOwnership []*Workload
+
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/sync", peer.MeshIP, a.apiPort)
 		resp, err := httpClient.Get(url)
@@ -1738,10 +1885,21 @@ func (a *Agent) syncWorkloads() {
 		for _, w := range workloads {
 			existing := a.state.Workloads[w.MeshIP]
 			if existing == nil || w.Version > existing.Version {
+				// Check if we lost ownership (IP collision resolution)
+				if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
+					log.Printf("Lost ownership of %s (IP %s) to %s - newer version wins", existing.Name, w.MeshIP, w.Owner[:12])
+					lostOwnership = append(lostOwnership, existing)
+				}
 				a.state.Workloads[w.MeshIP] = w
 			}
 		}
 		a.stateMu.Unlock()
+	}
+
+	// Stop workloads we lost ownership of (outside lock)
+	for _, wl := range lostOwnership {
+		log.Printf("Stopping local workload %s - ownership transferred", wl.Name)
+		a.removeWorkload(wl)
 	}
 
 	a.updateHosts()
@@ -1763,14 +1921,27 @@ func (a *Agent) tunnelModeSyncWorkloads() {
 		return
 	}
 
+	var lostOwnership []*Workload
+
 	a.stateMu.Lock()
 	for _, w := range workloads {
 		existing := a.state.Workloads[w.MeshIP]
 		if existing == nil || w.Version > existing.Version {
+			// Check if we lost ownership (IP collision resolution)
+			if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
+				log.Printf("Lost ownership of %s (IP %s) to %s - newer version wins", existing.Name, w.MeshIP, w.Owner[:12])
+				lostOwnership = append(lostOwnership, existing)
+			}
 			a.state.Workloads[w.MeshIP] = w
 		}
 	}
 	a.stateMu.Unlock()
+
+	// Stop workloads we lost ownership of (outside lock)
+	for _, wl := range lostOwnership {
+		log.Printf("Stopping local workload %s - ownership transferred", wl.Name)
+		a.removeWorkload(wl)
+	}
 
 	a.updateHosts()
 }
