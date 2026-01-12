@@ -115,6 +115,7 @@ func New() (*Agent, error) {
 			Peers:     make(map[string]*Peer),
 			Workloads: make(map[string]*Workload),
 			Tokens:    make(map[string]*Token),
+			CFToken:   getEnv("JETTY_CF_TOKEN", ""), // Bootstrap tunnel token
 		},
 		stopCh: make(chan struct{}),
 	}
@@ -1281,7 +1282,15 @@ func (a *Agent) loadState() {
 	}
 
 	a.stateMu.Lock()
+	// Preserve env var CF token if set
+	envCFToken := a.state.CFToken
+
 	json.Unmarshal(data, a.state)
+
+	// Env var takes precedence over saved state
+	if envCFToken != "" && a.state.CFToken == "" {
+		a.state.CFToken = envCFToken
+	}
 	a.stateMu.Unlock()
 
 	// Reconnect WG peers
