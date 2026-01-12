@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +22,14 @@ import (
 	"github.com/gorilla/mux"
 	"golang.org/x/crypto/curve25519"
 )
+
+// Shared HTTP client with timeout to prevent blocking on hung peers
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
+
+// Valid workload name pattern (alphanumeric, dash, underscore only)
+var validNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // =============================================================================
 // Types
@@ -381,7 +390,7 @@ func (a *Agent) joinCluster() error {
 	}
 
 	data, _ := json.Marshal(req)
-	resp, err := http.Post(a.joinURL+"/api/join", "application/json", strings.NewReader(string(data)))
+	resp, err := httpClient.Post(a.joinURL+"/api/join", "application/json", strings.NewReader(string(data)))
 	if err != nil {
 		return err
 	}
@@ -514,29 +523,41 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if mesh_ip already taken
-	a.stateMu.RLock()
-	existing := a.state.Workloads[wl.MeshIP]
-	a.stateMu.RUnlock()
+	// Validate workload name (prevent path traversal attacks)
+	if !validNamePattern.MatchString(wl.Name) {
+		http.Error(w, "invalid name: must be alphanumeric with dash/underscore only", 400)
+		return
+	}
 
+	// Validate mesh IP format
+	if net.ParseIP(wl.MeshIP) == nil {
+		http.Error(w, "invalid mesh_ip: must be valid IP address", 400)
+		return
+	}
+
+	// Lock for entire check-and-set to prevent race condition
+	a.stateMu.Lock()
+	existing := a.state.Workloads[wl.MeshIP]
 	if existing != nil && existing.Owner != a.hwid {
+		a.stateMu.Unlock()
 		http.Error(w, "mesh_ip already in use", 409)
 		return
 	}
 
 	wl.Owner = a.hwid
 	wl.Version = time.Now().Unix()
+	a.state.Workloads[wl.MeshIP] = &wl
+	a.stateMu.Unlock()
 
-	// Deploy
+	// Deploy (outside lock to avoid blocking other operations)
 	if err := a.deployWorkload(&wl); err != nil {
+		// Rollback on failure
+		a.stateMu.Lock()
+		delete(a.state.Workloads, wl.MeshIP)
+		a.stateMu.Unlock()
 		http.Error(w, err.Error(), 500)
 		return
 	}
-
-	// Save
-	a.stateMu.Lock()
-	a.state.Workloads[wl.MeshIP] = &wl
-	a.stateMu.Unlock()
 
 	a.updateHosts()
 	a.updateWGPeers()
@@ -653,7 +674,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 
 	// Deploy on target
 	data, _ := json.Marshal(found)
-	resp, err := http.Post(fmt.Sprintf("http://%s:%d/api/workloads", target.MeshIP, a.apiPort),
+	resp, err := httpClient.Post(fmt.Sprintf("http://%s:%d/api/workloads", target.MeshIP, a.apiPort),
 		"application/json", strings.NewReader(string(data)))
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -736,15 +757,20 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate token
-	a.stateMu.RLock()
+	// Validate and consume token (single-use)
+	a.stateMu.Lock()
 	tok := a.state.Tokens[req.Token]
-	a.stateMu.RUnlock()
-
 	if tok == nil || time.Now().After(tok.ExpiresAt) {
+		a.stateMu.Unlock()
 		http.Error(w, "invalid token", 401)
 		return
 	}
+	// Delete token after use (single-use tokens)
+	delete(a.state.Tokens, req.Token)
+	a.stateMu.Unlock()
+
+	// Broadcast token deletion to other nodes
+	go a.broadcastTokenDeletion(req.Token)
 
 	// Create peer
 	peer := &Peer{
@@ -944,7 +970,7 @@ func (a *Agent) broadcastTunnelToken(token string) {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/tunnel/sync", peer.MeshIP, a.apiPort)
-		resp, err := http.Post(url, "application/json", strings.NewReader(string(data)))
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
 		if err != nil {
 			log.Printf("Failed to broadcast tunnel token to %s: %v", peer.Name, err)
 			continue
@@ -987,23 +1013,33 @@ func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
 }
 
 // apiTokenSync receives a token from another node (for cluster-wide token availability)
+// Also handles token deletion when "delete" field is set.
 func (a *Agent) apiTokenSync(w http.ResponseWriter, r *http.Request) {
-	var tok Token
-	if err := json.NewDecoder(r.Body).Decode(&tok); err != nil {
+	var req struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+		Delete    string    `json:"delete,omitempty"` // Token to delete (if set)
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
 
-	// Only store if not expired
-	if time.Now().Before(tok.ExpiresAt) {
-		a.stateMu.Lock()
-		// Only add if we don't already have it
-		if _, exists := a.state.Tokens[tok.Token]; !exists {
-			a.state.Tokens[tok.Token] = &tok
+	a.stateMu.Lock()
+	if req.Delete != "" {
+		// Delete a consumed token
+		delete(a.state.Tokens, req.Delete)
+	} else if req.Token != "" && time.Now().Before(req.ExpiresAt) {
+		// Add new token if not expired
+		if _, exists := a.state.Tokens[req.Token]; !exists {
+			a.state.Tokens[req.Token] = &Token{
+				Token:     req.Token,
+				ExpiresAt: req.ExpiresAt,
+			}
 		}
-		a.stateMu.Unlock()
-		a.saveState()
 	}
+	a.stateMu.Unlock()
+	a.saveState()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -1025,12 +1061,48 @@ func (a *Agent) broadcastToken(tok *Token) {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/token/sync", peer.MeshIP, a.apiPort)
-		resp, err := http.Post(url, "application/json", strings.NewReader(string(data)))
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
 		if err != nil {
 			log.Printf("Failed to broadcast token to %s: %v", peer.Name, err)
 			continue
 		}
 		resp.Body.Close()
+	}
+}
+
+// broadcastTokenDeletion tells all peers to delete a consumed token.
+func (a *Agent) broadcastTokenDeletion(tokenStr string) {
+	a.stateMu.RLock()
+	peers := make([]*Peer, 0)
+	for _, p := range a.state.Peers {
+		if p.Healthy {
+			peers = append(peers, p)
+		}
+	}
+	a.stateMu.RUnlock()
+
+	data, _ := json.Marshal(map[string]string{"delete": tokenStr})
+
+	for _, peer := range peers {
+		url := fmt.Sprintf("http://%s:%d/api/token/sync", peer.MeshIP, a.apiPort)
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+	}
+}
+
+// cleanupExpiredTokens removes tokens that have expired from state.
+func (a *Agent) cleanupExpiredTokens() {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+
+	now := time.Now()
+	for k, tok := range a.state.Tokens {
+		if now.After(tok.ExpiresAt) {
+			delete(a.state.Tokens, k)
+		}
 	}
 }
 
@@ -1158,6 +1230,7 @@ func (a *Agent) gossipLoop() {
 		case <-tick.C:
 			a.checkPeers()
 			a.syncWorkloads()
+			a.cleanupExpiredTokens()
 		}
 	}
 }
@@ -1168,7 +1241,7 @@ func (a *Agent) checkPeers() {
 
 	for _, peer := range a.state.Peers {
 		url := fmt.Sprintf("http://%s:%d/api/health", peer.MeshIP, a.apiPort)
-		resp, err := http.Get(url)
+		resp, err := httpClient.Get(url)
 
 		if err != nil {
 			peer.Healthy = false
@@ -1195,7 +1268,7 @@ func (a *Agent) syncWorkloads() {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/sync", peer.MeshIP, a.apiPort)
-		resp, err := http.Get(url)
+		resp, err := httpClient.Get(url)
 		if err != nil {
 			continue
 		}
@@ -1227,7 +1300,7 @@ func (a *Agent) broadcastState() {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/sync", peer.MeshIP, a.apiPort)
-		http.Get(url) // Trigger sync
+		httpClient.Get(url) // Trigger sync
 	}
 }
 
@@ -1253,7 +1326,7 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/peer-announce", peer.MeshIP, a.apiPort)
-		resp, err := http.Post(url, "application/json", strings.NewReader(string(data)))
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
 		if err != nil {
 			log.Printf("Failed to announce peer to %s: %v", peer.Name, err)
 			continue
