@@ -130,10 +130,15 @@ sudo JETTY_SECRET=my-cluster-password ./jetty
 | `JETTY_CF_TOKEN` | (none) | Cloudflare tunnel token (bootstrap node only). |
 | `JETTY_TUNNEL_DOMAIN` | (none) | **Tunnel-only mode.** Your Cloudflare tunnel domain (e.g., `cluster.example.com`). Eliminates need for UDP port forwarding. |
 | `JETTY_TUNNEL_HOST` | (none) | **Direct WG routing.** This node's specific subdomain (e.g., `node1.cluster.example.com`) for direct WireGuard packet routing. |
+| `JETTY_WARP_ENABLED` | `false` | Enable Cloudflare WARP for Layer 3 connectivity. |
+| `JETTY_WARP_CONNECTOR_TOKEN` | (none) | WARP Connector token for Zero Trust site-to-site networking. |
+| `JETTY_WARP_ORGANIZATION` | (none) | Zero Trust organization name for WARP Teams enrollment. |
+| `JETTY_WARP_LICENSE_KEY` | (none) | Optional WARP+ license key for enhanced performance. |
+| `JETTY_WARP_MODE` | (auto) | WARP mode: `warp`, `doh`, `warp+doh`, `proxy`. |
 | `JETTY_PUBLIC_IP` | (auto) | Override public IP detection (useful in containers). |
 | `JETTY_DATA_DIR` | `/data` | Directory for state and compose files. |
 | `JETTY_API_PORT` | `8080` | REST API port. |
-| `JETTY_WG_PORT` | `51820` | WireGuard UDP port (not needed in tunnel-only mode). |
+| `JETTY_WG_PORT` | `51820` | WireGuard UDP port (not needed in tunnel-only or WARP mode). |
 | `JETTY_MESH_CIDR` | `10.100.0.0/16` | Mesh network IP range. |
 | `JETTY_JOIN` | (none) | URL of existing node to join (e.g., `http://node1:8080` or `https://cluster.example.com`). |
 | `JETTY_TOKEN` | (none) | Join token from existing cluster. |
@@ -492,6 +497,174 @@ docker run -d --name jetty \
 1. **Higher latency** - Packets route through Cloudflare
 2. **Tunnel dependency** - If Cloudflare is down, cross-node mesh fails
 3. **Bandwidth** - HTTP overhead compared to raw UDP
+
+---
+
+## Cloudflare WARP Mode (Beta)
+
+WARP Mode provides Layer 3 networking through Cloudflare's WARP service, enabling true IP-level connectivity between nodes without any port forwarding.
+
+### What is WARP?
+
+Cloudflare WARP is a VPN-like service that routes traffic through Cloudflare's network. With **WARP Connector** (part of Cloudflare Zero Trust), you can create site-to-site connectivity where nodes can reach each other via their WARP IPs (in the 100.96.0.0/12 CGNAT range).
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           WARP MODE ARCHITECTURE                             │
+│                                                                              │
+│   Node A                        Cloudflare                         Node B   │
+│   WARP IP: 100.96.0.5          Zero Trust                  WARP IP: 100.96.0.8
+│                                  Network                                     │
+│   ┌─────────────┐                                          ┌─────────────┐  │
+│   │   Jetty     │              ┌──────────┐                │   Jetty     │  │
+│   │ 10.100.x.x  │──WARP Tunnel─│   WARP   │──WARP Tunnel──►│ 10.100.y.y  │  │
+│   └──────┬──────┘              │ Connector│                └──────┬──────┘  │
+│          │                     └──────────┘                       │         │
+│   ┌──────┴──────┐                                          ┌──────┴──────┐  │
+│   │  Workloads  │      Full L3 connectivity!               │  Workloads  │  │
+│   │  (Docker)   │◄─────────────────────────────────────────│  (Docker)   │  │
+│   └─────────────┘                                          └─────────────┘  │
+│                                                                              │
+│   Benefits:                                                                  │
+│   • No port forwarding required                                              │
+│   • True Layer 3 (IP) connectivity                                           │
+│   • Works with raw UDP/TCP - not just HTTP                                   │
+│   • WireGuard packets can flow natively                                      │
+│   • Each node gets stable WARP IP                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Prerequisites
+
+1. **Cloudflare Zero Trust account** (free tier available)
+2. **WARP Connector** enabled in your Zero Trust dashboard
+3. **Docker with privileged access** (for TUN device)
+
+### Setting Up WARP Connector
+
+1. Go to Cloudflare Zero Trust → Settings → WARP Client
+2. Enable "WARP Connector"
+3. Create a new connector and copy the token
+4. Configure your Private Network routes (the mesh CIDR, e.g., 10.100.0.0/16)
+
+### Running Jetty with WARP
+
+```bash
+# Run with WARP Connector (recommended)
+docker run -d --name jetty \
+  --cap-add NET_ADMIN \
+  --cap-add MKNOD \
+  --device /dev/net/tun \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/lib/cloudflare-warp:/var/lib/cloudflare-warp \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_WARP_CONNECTOR_TOKEN=your-connector-token \
+  jetty
+```
+
+### WARP Configuration Options
+
+**Consumer WARP (Simple):**
+```bash
+# Basic WARP - just connect to Cloudflare's network
+-e JETTY_WARP_ENABLED=true
+```
+
+**WARP Connector (Site-to-Site):**
+```bash
+# For Zero Trust site-to-site networking
+-e JETTY_WARP_CONNECTOR_TOKEN=eyJ...your-token
+```
+
+**Zero Trust Organization:**
+```bash
+# Enroll in a Zero Trust org
+-e JETTY_WARP_ORGANIZATION=your-org-name
+```
+
+### Joining a WARP-Enabled Cluster
+
+When nodes use WARP, they share their WARP IPs with each other during join/announce. This allows nodes to establish direct IP connectivity through Cloudflare's network.
+
+```bash
+# Node 2 joining via WARP
+docker run -d --name jetty \
+  --cap-add NET_ADMIN \
+  --cap-add MKNOD \
+  --device /dev/net/tun \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/lib/cloudflare-warp:/var/lib/cloudflare-warp \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_WARP_CONNECTOR_TOKEN=same-connector-token \
+  -e JETTY_JOIN=http://100.96.0.5:8080 \
+  -e JETTY_TOKEN=abc123... \
+  jetty
+```
+
+### Status Check
+
+```bash
+curl http://localhost:8080/api/status | jq '.warp'
+```
+
+```json
+{
+  "enabled": true,
+  "ip": "100.96.0.5"
+}
+```
+
+### WARP vs Tunnel-Only Mode
+
+| Feature | Tunnel-Only | WARP Mode |
+|---------|-------------|-----------|
+| Port Forwarding | Not needed | Not needed |
+| Protocol Support | HTTP only | UDP, TCP, ICMP |
+| WireGuard Traffic | Encapsulated in HTTP | Native UDP |
+| Latency | Higher (HTTP overhead) | Lower (native routing) |
+| Setup Complexity | Simple (just tunnel token) | Medium (Zero Trust config) |
+| Requirements | Cloudflare Tunnel | Cloudflare Zero Trust |
+
+### Combining WARP with Tunnel
+
+You can use both WARP and Cloudflare Tunnel together:
+- **WARP**: For inter-node mesh connectivity
+- **Tunnel**: For external access to your cluster
+
+```bash
+docker run -d --name jetty \
+  --cap-add NET_ADMIN \
+  --cap-add MKNOD \
+  --device /dev/net/tun \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/lib/cloudflare-warp:/var/lib/cloudflare-warp \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_WARP_CONNECTOR_TOKEN=warp-token \
+  -e JETTY_CF_TOKEN=tunnel-token \
+  jetty
+```
+
+### Troubleshooting WARP
+
+```bash
+# Check WARP status inside container
+docker exec jetty warp-cli --accept-tos status
+
+# Check WARP connection
+docker exec jetty warp-cli --accept-tos warp-stats
+
+# View WARP IP
+docker exec jetty ip addr show CloudflareWARP
+
+# Check split tunnel settings
+docker exec jetty warp-cli --accept-tos settings
+```
 
 ---
 

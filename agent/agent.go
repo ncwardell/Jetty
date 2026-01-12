@@ -55,6 +55,7 @@ type Peer struct {
 	Endpoint   string    `json:"endpoint"`    // public:wg_port
 	PublicKey  string    `json:"public_key"`
 	TunnelHost string    `json:"tunnel_host"` // Peer-specific tunnel hostname (e.g., "node1.cluster.example.com")
+	WarpIP     string    `json:"warp_ip"`     // Cloudflare WARP IP (CGNAT range, e.g., "100.96.x.x")
 	Healthy    bool      `json:"healthy"`
 	LastSeen   time.Time `json:"last_seen"`
 }
@@ -94,6 +95,10 @@ type Agent struct {
 	wgPrivKey string
 	wgPubKey  string
 	wgPort    int
+
+	// Cloudflare WARP
+	warpIP      string // WARP IP address (CGNAT range, e.g., "100.96.x.x")
+	warpEnabled bool   // Whether WARP mode is active
 
 	// Config
 	dataDir       string
@@ -172,6 +177,9 @@ func New() (*Agent, error) {
 }
 
 func (a *Agent) Start() error {
+	// Detect WARP IP if WARP is enabled
+	a.detectWarpIP()
+
 	// Init WireGuard (for local workload routing)
 	// In tunnel-only mode, WG is still used for local mesh IP routing but not for inter-node traffic
 	if err := a.initWireGuard(); err != nil {
@@ -216,8 +224,48 @@ func (a *Agent) Start() error {
 	if a.tunnelDomain != "" {
 		mode = "tunnel-only (" + a.tunnelDomain + ") [WebSocket UDP tunnel]"
 	}
+	if a.warpEnabled {
+		mode = "warp (" + a.warpIP + ")"
+	}
 	log.Printf("Jetty started: %s (%s) @ %s [mode: %s]", a.hostname, a.hwid[:12], a.meshIP, mode)
 	return nil
+}
+
+// =============================================================================
+// WARP Detection
+// =============================================================================
+
+// detectWarpIP checks for a Cloudflare WARP interface and extracts its IP.
+// WARP provides Layer 3 connectivity through Cloudflare's network.
+func (a *Agent) detectWarpIP() {
+	// Check environment variable first (set by entrypoint script)
+	if ip := os.Getenv("JETTY_WARP_IP"); ip != "" {
+		a.warpIP = ip
+		a.warpEnabled = true
+		log.Printf("WARP IP from environment: %s", ip)
+		return
+	}
+
+	// Try to find CloudflareWARP interface
+	iface, err := net.InterfaceByName("CloudflareWARP")
+	if err != nil {
+		// WARP not running
+		return
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return
+	}
+
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+			a.warpIP = ipnet.IP.String()
+			a.warpEnabled = true
+			log.Printf("WARP IP detected: %s", a.warpIP)
+			return
+		}
+	}
 }
 
 func (a *Agent) Stop() {
@@ -462,6 +510,7 @@ func (a *Agent) joinCluster() error {
 		"endpoint":    fmt.Sprintf("%s:%d", publicIP, a.wgPort),
 		"public_key":  a.wgPubKey,
 		"tunnel_host": a.tunnelHost, // Our specific subdomain for direct WG packet routing
+		"warp_ip":     a.warpIP,     // Cloudflare WARP IP for L3 connectivity
 	}
 
 	data, _ := json.Marshal(req)
@@ -565,12 +614,17 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 			"name":       a.hostname,
 			"mesh_ip":    a.meshIP,
 			"public_key": a.wgPubKey,
+			"warp_ip":    a.warpIP,
 		},
 		"peers":     peers,
 		"workloads": workloads,
 		"tunnel": map[string]interface{}{
 			"configured": hasTunnel,
 			"running":    a.isTunnelRunning(),
+		},
+		"warp": map[string]interface{}{
+			"enabled": a.warpEnabled,
+			"ip":      a.warpIP,
 		},
 	}
 
@@ -828,6 +882,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		Endpoint   string `json:"endpoint"`
 		PublicKey  string `json:"public_key"`
 		TunnelHost string `json:"tunnel_host"`
+		WarpIP     string `json:"warp_ip"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
@@ -884,6 +939,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		Endpoint:   req.Endpoint,
 		PublicKey:  req.PublicKey,
 		TunnelHost: req.TunnelHost,
+		WarpIP:     req.WarpIP,
 		Healthy:    true,
 		LastSeen:   time.Now(),
 	}
@@ -899,6 +955,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		Endpoint:   fmt.Sprintf("%s:%d", getPublicIP(), a.wgPort),
 		PublicKey:  a.wgPubKey,
 		TunnelHost: a.tunnelHost,
+		WarpIP:     a.warpIP,
 		Healthy:    true,
 	}}
 	for _, p := range a.state.Peers {
