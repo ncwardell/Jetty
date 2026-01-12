@@ -128,12 +128,13 @@ sudo JETTY_SECRET=my-cluster-password ./jetty
 |----------|---------|-------------|
 | `JETTY_SECRET` | (none) | **Required for secure clusters.** Shared password all nodes must have. |
 | `JETTY_CF_TOKEN` | (none) | Cloudflare tunnel token (bootstrap node only). |
+| `JETTY_TUNNEL_DOMAIN` | (none) | **Tunnel-only mode.** Your Cloudflare tunnel domain (e.g., `cluster.example.com`). Eliminates need for UDP port forwarding. |
 | `JETTY_PUBLIC_IP` | (auto) | Override public IP detection (useful in containers). |
 | `JETTY_DATA_DIR` | `/data` | Directory for state and compose files. |
 | `JETTY_API_PORT` | `8080` | REST API port. |
-| `JETTY_WG_PORT` | `51820` | WireGuard UDP port. |
+| `JETTY_WG_PORT` | `51820` | WireGuard UDP port (not needed in tunnel-only mode). |
 | `JETTY_MESH_CIDR` | `10.100.0.0/16` | Mesh network IP range. |
-| `JETTY_JOIN` | (none) | URL of existing node to join (e.g., `http://node1:8080`). |
+| `JETTY_JOIN` | (none) | URL of existing node to join (e.g., `http://node1:8080` or `https://cluster.example.com`). |
 | `JETTY_TOKEN` | (none) | Join token from existing cluster. |
 
 ---
@@ -271,6 +272,126 @@ Now `cluster.example.com` hits any healthy node in your cluster.
 
 ---
 
+## Tunnel-Only Mode (No Port Forwarding)
+
+Tunnel-only mode eliminates the need for UDP port 51820 to be forwarded. All inter-node communication goes through the Cloudflare tunnel.
+
+### When to Use
+
+- **Nodes behind strict NAT/firewall** with no ability to forward UDP ports
+- **Cloud environments** where UDP traffic is blocked
+- **Simplified networking** - only HTTPS outbound required
+
+### How It Works
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        TUNNEL-ONLY MODE                                      │
+│                                                                              │
+│   ┌─────────────┐                             ┌─────────────┐               │
+│   │   Node A    │                             │   Node B    │               │
+│   │ 10.100.x.x  │                             │ 10.100.y.y  │               │
+│   └──────┬──────┘                             └──────┬──────┘               │
+│          │                                           │                       │
+│          │ cloudflared                     cloudflared │                      │
+│          │    │                                   │    │                      │
+│          │    └─────────────┬─────────────────────┘    │                      │
+│          │                  │                          │                      │
+│          │         ┌────────┴────────┐                 │                      │
+│          │         │   Cloudflare    │                 │                      │
+│          │         │     Tunnel      │                 │                      │
+│          │         │ cluster.example │                 │                      │
+│          │         └─────────────────┘                 │                      │
+│          │                                             │                      │
+│   ┌──────┴──────┐                             ┌───────┴─────┐               │
+│   │  Workloads  │     HTTP Proxy API          │  Workloads  │               │
+│   │  (local)    │◄──────────────────────────►│  (local)    │               │
+│   └─────────────┘                             └─────────────┘               │
+│                                                                              │
+│   • Mesh IPs work locally (same node)                                        │
+│   • Cross-node traffic goes through /api/proxy/                              │
+│   • All gossip/sync via tunnel domain                                        │
+│   • Health checks via heartbeat mechanism                                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Enable Tunnel-Only Mode
+
+```bash
+# On ALL nodes, set the tunnel domain
+docker run -d --name jetty \
+  --cap-add NET_ADMIN --cap-add NET_RAW \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_CF_TOKEN=eyJhIjoiNjA2... \
+  -e JETTY_TUNNEL_DOMAIN=cluster.example.com \
+  jetty
+```
+
+Notice: **No UDP port 51820 exposed!**
+
+### Joining in Tunnel-Only Mode
+
+```bash
+# Join via the tunnel domain
+docker run -d --name jetty \
+  --cap-add NET_ADMIN --cap-add NET_RAW \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_TUNNEL_DOMAIN=cluster.example.com \
+  -e JETTY_JOIN=https://cluster.example.com \
+  -e JETTY_TOKEN=abc123... \
+  jetty
+```
+
+### Cross-Node Workload Communication
+
+In tunnel-only mode:
+- **Local workloads**: Accessible via mesh IP directly (DNAT routing)
+- **Remote workloads**: Accessible via HTTP proxy API
+
+```bash
+# Access remote workload through proxy
+curl http://localhost:8080/api/proxy/10.100.50.1/path/to/resource
+
+# Or via the tunnel
+curl https://cluster.example.com/api/proxy/10.100.50.1/path/to/resource
+```
+
+The `/etc/hosts` file shows which workloads are local vs remote:
+```
+# JETTY START - managed by jetty, do not edit
+# Mode: tunnel-only (cluster.example.com)
+# Note: Remote workloads accessible via /api/proxy/{mesh_ip}/
+10.100.42.1    node1    # this node
+10.100.87.3    node2    # peer (healthy)
+10.100.50.1    nginx    # workload (local)
+10.100.50.2    redis    # workload (remote)
+# JETTY END
+```
+
+### Limitations of Tunnel-Only Mode
+
+1. **No direct mesh IP routing across nodes** - Containers can't directly reach remote mesh IPs
+2. **HTTP-only cross-node communication** - UDP/TCP applications need HTTP wrapper
+3. **Higher latency** - All traffic routes through Cloudflare
+4. **Tunnel dependency** - If Cloudflare is down, cross-node communication fails
+
+### Future: WebSocket UDP Tunnel
+
+For full mesh IP connectivity without port forwarding, we're exploring:
+- WebSocket-based UDP encapsulation
+- WireGuard packets wrapped in WebSocket frames
+- Transparent to applications
+
+This would provide the same experience as direct WireGuard mode but through the tunnel.
+
+---
+
 ## API Reference
 
 ### Cluster
@@ -302,11 +423,18 @@ Now `cluster.example.com` hits any healthy node in your cluster.
 | `POST /api/tunnel` | POST | Set tunnel token |
 | `DELETE /api/tunnel` | DELETE | Remove tunnel |
 
+### Proxy (Cross-Node Communication)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/proxy/{mesh_ip}/{path}` | ANY | Proxy request to workload (local or remote) |
+
 ### Internal (Peer-to-Peer)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `POST /api/peer-announce` | POST | Announce new peer |
+| `POST /api/heartbeat` | POST | Health heartbeat (tunnel-only mode) |
 | `POST /api/tunnel/sync` | POST | Sync tunnel token |
 | `POST /api/token/sync` | POST | Sync join tokens |
 
