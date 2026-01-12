@@ -1548,18 +1548,18 @@ func (a *Agent) removeWorkload(wl *Workload) {
 
 func (a *Agent) cleanupWorkloadIP(wl *Workload) {
 	// Get container IP before it's gone
-	containerName := fmt.Sprintf("jetty_%s-%s-1", wl.Name, wl.Name)
-	out, err := exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerName).Output()
-	if err != nil {
-		containerName = fmt.Sprintf("jetty_%s-1", wl.Name)
-		out, _ = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerName).Output()
-	}
-
-	containerIP := strings.TrimSpace(string(out))
-	if containerIP != "" {
-		// Remove DNAT rules
-		exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-d", wl.MeshIP, "-j", "DNAT", "--to", containerIP).Run()
-		exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-d", wl.MeshIP, "-j", "DNAT", "--to", containerIP).Run()
+	out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
+	if len(out) > 0 {
+		containerID := strings.Split(strings.TrimSpace(string(out)), "\n")[0]
+		if containerID != "" {
+			out, _ = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID).Output()
+			containerIP := strings.TrimSpace(string(out))
+			if containerIP != "" {
+				// Remove DNAT rules
+				exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-d", wl.MeshIP, "-j", "DNAT", "--to", containerIP).Run()
+				exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-d", wl.MeshIP, "-j", "DNAT", "--to", containerIP).Run()
+			}
+		}
 	}
 
 	// Remove mesh IP from interface
@@ -1570,13 +1570,26 @@ func (a *Agent) setupWorkloadIP(wl *Workload) {
 	// Add IP to interface
 	exec.Command("ip", "addr", "add", wl.MeshIP+"/32", "dev", "jetty0").Run()
 
+	// Get container IP - use docker ps to find containers in the project
+	// This handles any service name in the compose file
+	out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
+	if err != nil || len(out) == 0 {
+		log.Printf("Warning: no containers found for project jetty_%s", wl.Name)
+		return
+	}
+
+	// Get first container ID
+	containerID := strings.Split(strings.TrimSpace(string(out)), "\n")[0]
+	if containerID == "" {
+		log.Printf("Warning: couldn't get container ID for %s", wl.Name)
+		return
+	}
+
 	// Get container IP
-	containerName := fmt.Sprintf("jetty_%s-%s-1", wl.Name, wl.Name)
-	out, err := exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerName).Output()
+	out, err = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID).Output()
 	if err != nil {
-		// Try alternate naming
-		containerName = fmt.Sprintf("jetty_%s-1", wl.Name)
-		out, _ = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerName).Output()
+		log.Printf("Warning: couldn't inspect container %s: %v", containerID, err)
+		return
 	}
 
 	containerIP := strings.TrimSpace(string(out))
