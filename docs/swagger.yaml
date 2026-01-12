@@ -1,0 +1,477 @@
+basePath: /api
+definitions:
+  agent.ErrorResponse:
+    properties:
+      error:
+        example: workload not found
+        type: string
+    type: object
+  agent.HealthResponse:
+    properties:
+      id:
+        example: abc123def456
+        type: string
+      status:
+        example: ok
+        type: string
+    type: object
+  agent.JoinRequest:
+    properties:
+      endpoint:
+        type: string
+      id:
+        type: string
+      mesh_ip:
+        type: string
+      name:
+        type: string
+      public_key:
+        type: string
+      secret:
+        type: string
+      token:
+        type: string
+    type: object
+  agent.JoinResponse:
+    properties:
+      cf_token:
+        type: string
+      peers:
+        items:
+          $ref: '#/definitions/agent.Peer'
+        type: array
+      workloads:
+        items:
+          $ref: '#/definitions/agent.Workload'
+        type: array
+    type: object
+  agent.MoveRequest:
+    properties:
+      to:
+        example: node2
+        type: string
+    type: object
+  agent.NodeInfo:
+    properties:
+      id:
+        example: abc123def456
+        type: string
+      mesh_ip:
+        example: 10.100.42.1
+        type: string
+      name:
+        example: node1
+        type: string
+      public_key:
+        example: '...'
+        type: string
+      warp_ip:
+        example: 100.96.0.5
+        type: string
+    type: object
+  agent.Peer:
+    properties:
+      endpoint:
+        description: public:wg_port
+        type: string
+      healthy:
+        type: boolean
+      id:
+        description: HWID
+        type: string
+      last_seen:
+        type: string
+      mesh_ip:
+        type: string
+      name:
+        description: Hostname
+        type: string
+      public_key:
+        type: string
+      tunnel_host:
+        description: Peer-specific tunnel hostname (e.g., "node1.cluster.example.com")
+        type: string
+      warp_ip:
+        description: Cloudflare WARP IP (CGNAT range, e.g., "100.96.x.x")
+        type: string
+    type: object
+  agent.StatusResponse:
+    properties:
+      node:
+        $ref: '#/definitions/agent.NodeInfo'
+      peers:
+        items:
+          $ref: '#/definitions/agent.Peer'
+        type: array
+      tunnel:
+        $ref: '#/definitions/agent.TunnelStatus'
+      warp:
+        $ref: '#/definitions/agent.WarpStatus'
+      wireguard:
+        $ref: '#/definitions/agent.WireGuardStatus'
+      workloads:
+        items:
+          $ref: '#/definitions/agent.Workload'
+        type: array
+    type: object
+  agent.TokenResponse:
+    properties:
+      expires_at:
+        example: "2024-01-02T15:04:05Z"
+        type: string
+      token:
+        example: abc123...
+        type: string
+    type: object
+  agent.TunnelRequest:
+    properties:
+      token:
+        example: eyJhIjoiNjA2...
+        type: string
+    type: object
+  agent.TunnelStatus:
+    properties:
+      configured:
+        example: true
+        type: boolean
+      running:
+        example: true
+        type: boolean
+    type: object
+  agent.WarpStatus:
+    properties:
+      enabled:
+        example: false
+        type: boolean
+      ip:
+        example: 100.96.0.5
+        type: string
+    type: object
+  agent.WireGuardStatus:
+    properties:
+      enabled:
+        example: true
+        type: boolean
+      mode:
+        description: '"kernel" or "dummy"'
+        example: kernel
+        type: string
+    type: object
+  agent.Workload:
+    properties:
+      autostart:
+        description: Auto-start when Jetty starts up
+        type: boolean
+      compose:
+        type: string
+      mesh_ip:
+        description: Unique lock
+        type: string
+      name:
+        description: DNS hostname
+        type: string
+      owner:
+        description: Node HWID
+        type: string
+      revive:
+        description: Auto-failover to another node if owner dies
+        type: boolean
+      version:
+        description: Unix timestamp
+        type: integer
+    type: object
+  agent.WorkloadRequest:
+    properties:
+      autostart:
+        example: true
+        type: boolean
+      compose:
+        example: |-
+          version: '3'
+          services:
+            web:
+              image: nginx
+        type: string
+      mesh_ip:
+        example: 10.100.50.1
+        type: string
+      name:
+        example: nginx
+        type: string
+      revive:
+        example: true
+        type: boolean
+    type: object
+host: localhost:8080
+info:
+  contact:
+    name: Jetty Support
+    url: https://github.com/ncwardell/jetty
+  description: P2P Docker Compose orchestration with WireGuard mesh networking
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  termsOfService: http://swagger.io/terms/
+  title: Jetty API
+  version: "1.0"
+paths:
+  /health:
+    get:
+      description: Returns health status of this node
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.HealthResponse'
+      summary: Health check
+      tags:
+      - cluster
+  /join:
+    post:
+      consumes:
+      - application/json
+      description: Allows a new node to join the cluster using a token
+      parameters:
+      - description: Join request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/agent.JoinRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.JoinResponse'
+        "401":
+          description: Invalid token or secret
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "409":
+          description: Mesh IP collision
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Join cluster
+      tags:
+      - cluster
+  /status:
+    get:
+      description: Returns full cluster status including node info, peers, workloads,
+        and connectivity status
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.StatusResponse'
+      summary: Get cluster status
+      tags:
+      - cluster
+  /token:
+    post:
+      description: Generates a new single-use token for joining the cluster (expires
+        in 24h)
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.TokenResponse'
+      summary: Create join token
+      tags:
+      - cluster
+  /tunnel:
+    delete:
+      description: Removes the Cloudflare tunnel configuration
+      responses:
+        "204":
+          description: Tunnel removed
+      summary: Remove tunnel
+      tags:
+      - tunnel
+    get:
+      description: Returns Cloudflare tunnel configuration status
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.TunnelStatus'
+      summary: Get tunnel status
+      tags:
+      - tunnel
+    post:
+      consumes:
+      - application/json
+      description: Sets the Cloudflare tunnel token (propagates to all nodes)
+      parameters:
+      - description: Tunnel token
+        in: body
+        name: token
+        required: true
+        schema:
+          $ref: '#/definitions/agent.TunnelRequest'
+      responses:
+        "200":
+          description: Tunnel configured
+        "400":
+          description: Invalid request
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Configure tunnel
+      tags:
+      - tunnel
+  /workloads:
+    get:
+      description: Returns all workloads in the cluster
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/agent.Workload'
+            type: array
+      summary: List all workloads
+      tags:
+      - workloads
+    post:
+      consumes:
+      - application/json
+      description: Creates and deploys a new Docker Compose workload with a mesh IP
+      parameters:
+      - description: Workload configuration
+        in: body
+        name: workload
+        required: true
+        schema:
+          $ref: '#/definitions/agent.WorkloadRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/agent.Workload'
+        "400":
+          description: Invalid request
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "409":
+          description: Mesh IP already in use
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "500":
+          description: Deployment failed
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Deploy a new workload
+      tags:
+      - workloads
+  /workloads/{name}:
+    delete:
+      description: Stops and removes a workload from the cluster
+      parameters:
+      - description: Workload name
+        in: path
+        name: name
+        required: true
+        type: string
+      responses:
+        "204":
+          description: Workload deleted
+        "404":
+          description: Workload not found
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Delete a workload
+      tags:
+      - workloads
+    get:
+      description: Returns details for a specific workload by name
+      parameters:
+      - description: Workload name
+        in: path
+        name: name
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.Workload'
+        "404":
+          description: Workload not found
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Get workload details
+      tags:
+      - workloads
+  /workloads/{name}/logs:
+    get:
+      description: Returns container logs for a workload
+      parameters:
+      - description: Workload name
+        in: path
+        name: name
+        required: true
+        type: string
+      produces:
+      - text/plain
+      responses:
+        "200":
+          description: Container logs
+          schema:
+            type: string
+        "404":
+          description: Workload not found
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Get workload logs
+      tags:
+      - workloads
+  /workloads/{name}/move:
+    post:
+      consumes:
+      - application/json
+      description: Migrates a workload to a different node in the cluster
+      parameters:
+      - description: Workload name
+        in: path
+        name: name
+        required: true
+        type: string
+      - description: Target node
+        in: body
+        name: target
+        required: true
+        schema:
+          $ref: '#/definitions/agent.MoveRequest'
+      responses:
+        "200":
+          description: Workload moved
+        "400":
+          description: Invalid request
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "404":
+          description: Workload or target not found
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Move workload to another node
+      tags:
+      - workloads
+schemes:
+- http
+- https
+swagger: "2.0"

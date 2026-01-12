@@ -7,7 +7,25 @@ import (
 	"syscall"
 
 	"github.com/ncwardell/jetty/agent"
+
+	_ "github.com/ncwardell/jetty/docs" // swagger docs
 )
+
+// @title Jetty API
+// @version 1.0
+// @description P2P Docker Compose orchestration with WireGuard mesh networking
+// @termsOfService http://swagger.io/terms/
+
+// @contact.name Jetty Support
+// @contact.url https://github.com/ncwardell/jetty
+
+// @license.name MIT
+// @license.url https://opensource.org/licenses/MIT
+
+// @host localhost:8080
+// @BasePath /api
+
+// @schemes http https
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
