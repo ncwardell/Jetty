@@ -450,6 +450,7 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/tunnel", a.apiSetTunnel).Methods("POST")
 	r.HandleFunc("/api/tunnel", a.apiDeleteTunnel).Methods("DELETE")
 	r.HandleFunc("/api/tunnel/sync", a.apiTunnelSync).Methods("POST")
+	r.HandleFunc("/api/token/sync", a.apiTokenSync).Methods("POST")
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 
 	addr := fmt.Sprintf(":%d", a.apiPort)
@@ -708,6 +709,10 @@ func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.Unlock()
 
 	a.saveState()
+
+	// Broadcast token to all peers so any node can validate it
+	// (important when using Cloudflare tunnel load balancing)
+	go a.broadcastToken(tok)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(tok)
@@ -979,6 +984,54 @@ func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// apiTokenSync receives a token from another node (for cluster-wide token availability)
+func (a *Agent) apiTokenSync(w http.ResponseWriter, r *http.Request) {
+	var tok Token
+	if err := json.NewDecoder(r.Body).Decode(&tok); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	// Only store if not expired
+	if time.Now().Before(tok.ExpiresAt) {
+		a.stateMu.Lock()
+		// Only add if we don't already have it
+		if _, exists := a.state.Tokens[tok.Token]; !exists {
+			a.state.Tokens[tok.Token] = &tok
+		}
+		a.stateMu.Unlock()
+		a.saveState()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// broadcastToken sends a new token to all peers so any node can validate join requests.
+// This is critical when using Cloudflare tunnel - the join request may hit any node.
+func (a *Agent) broadcastToken(tok *Token) {
+	a.stateMu.RLock()
+	peers := make([]*Peer, 0)
+	for _, p := range a.state.Peers {
+		if p.Healthy {
+			peers = append(peers, p)
+		}
+	}
+	a.stateMu.RUnlock()
+
+	data, _ := json.Marshal(tok)
+
+	for _, peer := range peers {
+		url := fmt.Sprintf("http://%s:%d/api/token/sync", peer.MeshIP, a.apiPort)
+		resp, err := http.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to broadcast token to %s: %v", peer.Name, err)
+			continue
+		}
+		resp.Body.Close()
+	}
 }
 
 // =============================================================================
