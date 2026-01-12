@@ -127,6 +127,9 @@ type Agent struct {
 	cfMu     sync.Mutex
 	cfStopCh chan struct{}
 
+	// Runtime
+	startTime time.Time // When Jetty started (for uptime tracking)
+
 	// WebSocket WireGuard tunnel (for tunnel-only mode)
 	wgRelays     map[string]*udpRelay // peerID -> local UDP relay
 	wgRelaysMu   sync.RWMutex
@@ -181,6 +184,9 @@ func New() (*Agent, error) {
 }
 
 func (a *Agent) Start() error {
+	// Record start time for uptime tracking
+	a.startTime = time.Now()
+
 	// Detect WARP IP if WARP is enabled
 	a.detectWarpIP()
 
@@ -1414,7 +1420,7 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"healthy":         true,
+		"status":          getHealthStatus(),
 		"id":              a.hwid,
 		"name":            a.hostname,
 		"mesh_ip":         a.meshIP,
@@ -1526,15 +1532,8 @@ func (a *Agent) getSystemStats() map[string]interface{} {
 		}
 	}
 
-	// Get uptime
-	if uptime, err := os.ReadFile("/proc/uptime"); err == nil {
-		fields := strings.Fields(string(uptime))
-		if len(fields) >= 1 {
-			if secs, err := strconv.ParseFloat(fields[0], 64); err == nil {
-				stats["uptime"] = (time.Duration(secs) * time.Second).Round(time.Second).String()
-			}
-		}
-	}
+	// Get Jetty uptime (not system uptime)
+	stats["uptime"] = time.Since(a.startTime).Round(time.Second).String()
 
 	return stats
 }
@@ -1551,6 +1550,87 @@ func formatBytes(b uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// getHealthStatus returns "healthy", "medium", or "full" based on resource usage
+// healthy: CPU < 50% and memory < 60%
+// medium: CPU 50-80% or memory 60-85%
+// full: CPU > 80% or memory > 85%
+func getHealthStatus() string {
+	var memPercent, cpuPercent float64
+
+	// Get memory percentage
+	if memInfo, err := os.ReadFile("/proc/meminfo"); err == nil {
+		var memTotal, memAvail, memFree, buffers, cached uint64
+		lines := strings.Split(string(memInfo), "\n")
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			value, _ := strconv.ParseUint(fields[1], 10, 64)
+			switch fields[0] {
+			case "MemTotal:":
+				memTotal = value
+			case "MemAvailable:":
+				memAvail = value
+			case "MemFree:":
+				memFree = value
+			case "Buffers:":
+				buffers = value
+			case "Cached:":
+				cached = value
+			}
+		}
+		memUsed := memTotal - memAvail
+		if memAvail == 0 {
+			memUsed = memTotal - memFree - buffers - cached
+		}
+		if memTotal > 0 {
+			memPercent = float64(memUsed) / float64(memTotal) * 100
+		}
+	}
+
+	// Get CPU percentage (quick sample)
+	getCPUTimes := func() (idle, total uint64) {
+		if data, err := os.ReadFile("/proc/stat"); err == nil {
+			lines := strings.Split(string(data), "\n")
+			if len(lines) > 0 && strings.HasPrefix(lines[0], "cpu ") {
+				fields := strings.Fields(lines[0])
+				if len(fields) >= 5 {
+					var sum uint64
+					for i := 1; i < len(fields); i++ {
+						val, _ := strconv.ParseUint(fields[i], 10, 64)
+						sum += val
+						if i == 4 {
+							idle = val
+						}
+					}
+					total = sum
+				}
+			}
+		}
+		return
+	}
+
+	idle1, total1 := getCPUTimes()
+	time.Sleep(50 * time.Millisecond) // Brief sample
+	idle2, total2 := getCPUTimes()
+
+	if total2 > total1 {
+		idleDelta := float64(idle2 - idle1)
+		totalDelta := float64(total2 - total1)
+		cpuPercent = (1.0 - idleDelta/totalDelta) * 100
+	}
+
+	// Determine status
+	if cpuPercent > 80 || memPercent > 85 {
+		return "full"
+	}
+	if cpuPercent >= 50 || memPercent >= 60 {
+		return "medium"
+	}
+	return "healthy"
 }
 
 func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
