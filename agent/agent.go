@@ -861,8 +861,128 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Build enriched response with Docker info
+	response := map[string]interface{}{
+		"name":      found.Name,
+		"mesh_ip":   found.MeshIP,
+		"compose":   found.Compose,
+		"revive":    found.Revive,
+		"autostart": found.Autostart,
+		"owner":     found.Owner,
+		"version":   found.Version,
+		"is_local":  found.Owner == a.hwid,
+	}
+
+	// Add Docker container info if this workload is local
+	if found.Owner == a.hwid {
+		containerInfo := a.getContainerInfo(found.Name)
+		response["containers"] = containerInfo
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(found)
+	json.NewEncoder(w).Encode(response)
+}
+
+// getContainerInfo retrieves Docker container details for a workload
+func (a *Agent) getContainerInfo(workloadName string) []map[string]interface{} {
+	var containers []map[string]interface{}
+
+	// Get container IDs for this project
+	out, err := exec.Command("docker", "ps", "-a", "-q", "-f", "label=com.docker.compose.project=jetty_"+workloadName).Output()
+	if err != nil || len(out) == 0 {
+		return containers
+	}
+
+	containerIDs := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, containerID := range containerIDs {
+		if containerID == "" {
+			continue
+		}
+
+		// Get detailed container info using docker inspect
+		inspectOut, err := exec.Command("docker", "inspect", "--format", `{{json .}}`, containerID).Output()
+		if err != nil {
+			continue
+		}
+
+		var inspectData map[string]interface{}
+		if err := json.Unmarshal(inspectOut, &inspectData); err != nil {
+			continue
+		}
+
+		info := make(map[string]interface{})
+		info["id"] = containerID[:12] // Short ID
+
+		// Extract container name
+		if name, ok := inspectData["Name"].(string); ok {
+			info["name"] = strings.TrimPrefix(name, "/")
+		}
+
+		// Extract state info
+		if state, ok := inspectData["State"].(map[string]interface{}); ok {
+			info["status"] = state["Status"]
+			info["running"] = state["Running"]
+			if startedAt, ok := state["StartedAt"].(string); ok && startedAt != "0001-01-01T00:00:00Z" {
+				if t, err := time.Parse(time.RFC3339Nano, startedAt); err == nil {
+					info["started_at"] = t.Format(time.RFC3339)
+					info["uptime"] = time.Since(t).Round(time.Second).String()
+				}
+			}
+			if finishedAt, ok := state["FinishedAt"].(string); ok && finishedAt != "0001-01-01T00:00:00Z" {
+				if t, err := time.Parse(time.RFC3339Nano, finishedAt); err == nil && !t.IsZero() {
+					info["finished_at"] = t.Format(time.RFC3339)
+				}
+			}
+			if exitCode, ok := state["ExitCode"].(float64); ok {
+				info["exit_code"] = int(exitCode)
+			}
+			if health, ok := state["Health"].(map[string]interface{}); ok {
+				info["health"] = health["Status"]
+			}
+		}
+
+		// Extract image info
+		if config, ok := inspectData["Config"].(map[string]interface{}); ok {
+			info["image"] = config["Image"]
+		}
+
+		// Extract network info
+		if netSettings, ok := inspectData["NetworkSettings"].(map[string]interface{}); ok {
+			if networks, ok := netSettings["Networks"].(map[string]interface{}); ok {
+				var ips []string
+				for netName, netData := range networks {
+					if netInfo, ok := netData.(map[string]interface{}); ok {
+						if ip, ok := netInfo["IPAddress"].(string); ok && ip != "" {
+							ips = append(ips, fmt.Sprintf("%s:%s", netName, ip))
+						}
+					}
+				}
+				info["networks"] = ips
+			}
+			if ports, ok := netSettings["Ports"].(map[string]interface{}); ok {
+				var portList []string
+				for port := range ports {
+					portList = append(portList, port)
+				}
+				info["ports"] = portList
+			}
+		}
+
+		// Get resource usage using docker stats (quick snapshot)
+		statsOut, _ := exec.Command("docker", "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}", containerID).Output()
+		if len(statsOut) > 0 {
+			parts := strings.Split(strings.TrimSpace(string(statsOut)), "|")
+			if len(parts) == 3 {
+				info["cpu_percent"] = strings.TrimSpace(parts[0])
+				info["memory_usage"] = strings.TrimSpace(parts[1])
+				info["memory_percent"] = strings.TrimSpace(parts[2])
+			}
+		}
+
+		containers = append(containers, info)
+	}
+
+	return containers
 }
 
 // apiDeleteWorkload godoc
