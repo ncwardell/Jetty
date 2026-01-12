@@ -128,12 +128,19 @@ sudo JETTY_SECRET=my-cluster-password ./jetty
 |----------|---------|-------------|
 | `JETTY_SECRET` | (none) | **Required for secure clusters.** Shared password all nodes must have. |
 | `JETTY_CF_TOKEN` | (none) | Cloudflare tunnel token (bootstrap node only). |
+| `JETTY_TUNNEL_DOMAIN` | (none) | **Tunnel-only mode.** Your Cloudflare tunnel domain (e.g., `cluster.example.com`). Eliminates need for UDP port forwarding. |
+| `JETTY_TUNNEL_HOST` | (none) | **Direct WG routing.** This node's specific subdomain (e.g., `node1.cluster.example.com`) for direct WireGuard packet routing. |
+| `JETTY_WARP_ENABLED` | `false` | Enable Cloudflare WARP for Layer 3 connectivity. |
+| `JETTY_WARP_CONNECTOR_TOKEN` | (none) | WARP Connector token for Zero Trust site-to-site networking. |
+| `JETTY_WARP_ORGANIZATION` | (none) | Zero Trust organization name for WARP Teams enrollment. |
+| `JETTY_WARP_LICENSE_KEY` | (none) | Optional WARP+ license key for enhanced performance. |
+| `JETTY_WARP_MODE` | (auto) | WARP mode: `warp`, `doh`, `warp+doh`, `proxy`. |
 | `JETTY_PUBLIC_IP` | (auto) | Override public IP detection (useful in containers). |
 | `JETTY_DATA_DIR` | `/data` | Directory for state and compose files. |
 | `JETTY_API_PORT` | `8080` | REST API port. |
-| `JETTY_WG_PORT` | `51820` | WireGuard UDP port. |
+| `JETTY_WG_PORT` | `51820` | WireGuard UDP port (not needed in tunnel-only or WARP mode). |
 | `JETTY_MESH_CIDR` | `10.100.0.0/16` | Mesh network IP range. |
-| `JETTY_JOIN` | (none) | URL of existing node to join (e.g., `http://node1:8080`). |
+| `JETTY_JOIN` | (none) | URL of existing node to join (e.g., `http://node1:8080` or `https://cluster.example.com`). |
 | `JETTY_TOKEN` | (none) | Join token from existing cluster. |
 
 ---
@@ -271,6 +278,396 @@ Now `cluster.example.com` hits any healthy node in your cluster.
 
 ---
 
+## Tunnel-Only Mode (No Port Forwarding)
+
+Tunnel-only mode eliminates the need for UDP port 51820 to be forwarded. All inter-node communication goes through the Cloudflare tunnel.
+
+### When to Use
+
+- **Nodes behind strict NAT/firewall** with no ability to forward UDP ports
+- **Cloud environments** where UDP traffic is blocked
+- **Simplified networking** - only HTTPS outbound required
+
+### How It Works
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        TUNNEL-ONLY MODE                                      │
+│                                                                              │
+│   ┌─────────────┐                             ┌─────────────┐               │
+│   │   Node A    │                             │   Node B    │               │
+│   │ 10.100.x.x  │                             │ 10.100.y.y  │               │
+│   └──────┬──────┘                             └──────┬──────┘               │
+│          │                                           │                       │
+│          │ cloudflared                     cloudflared │                      │
+│          │    │                                   │    │                      │
+│          │    └─────────────┬─────────────────────┘    │                      │
+│          │                  │                          │                      │
+│          │         ┌────────┴────────┐                 │                      │
+│          │         │   Cloudflare    │                 │                      │
+│          │         │     Tunnel      │                 │                      │
+│          │         │ cluster.example │                 │                      │
+│          │         └─────────────────┘                 │                      │
+│          │                                             │                      │
+│   ┌──────┴──────┐                             ┌───────┴─────┐               │
+│   │  Workloads  │     HTTP Proxy API          │  Workloads  │               │
+│   │  (local)    │◄──────────────────────────►│  (local)    │               │
+│   └─────────────┘                             └─────────────┘               │
+│                                                                              │
+│   • Mesh IPs work locally (same node)                                        │
+│   • Cross-node traffic goes through /api/proxy/                              │
+│   • All gossip/sync via tunnel domain                                        │
+│   • Health checks via heartbeat mechanism                                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Enable Tunnel-Only Mode
+
+```bash
+# On ALL nodes, set the tunnel domain
+docker run -d --name jetty \
+  --cap-add NET_ADMIN --cap-add NET_RAW \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_CF_TOKEN=eyJhIjoiNjA2... \
+  -e JETTY_TUNNEL_DOMAIN=cluster.example.com \
+  jetty
+```
+
+Notice: **No UDP port 51820 exposed!**
+
+### Joining in Tunnel-Only Mode
+
+```bash
+# Join via the tunnel domain
+docker run -d --name jetty \
+  --cap-add NET_ADMIN --cap-add NET_RAW \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_TUNNEL_DOMAIN=cluster.example.com \
+  -e JETTY_JOIN=https://cluster.example.com \
+  -e JETTY_TOKEN=abc123... \
+  jetty
+```
+
+### Cross-Node Workload Communication
+
+In tunnel-only mode:
+- **Local workloads**: Accessible via mesh IP directly (DNAT routing)
+- **Remote workloads**: Accessible via HTTP proxy API
+
+```bash
+# Access remote workload through proxy
+curl http://localhost:8080/api/proxy/10.100.50.1/path/to/resource
+
+# Or via the tunnel
+curl https://cluster.example.com/api/proxy/10.100.50.1/path/to/resource
+```
+
+The `/etc/hosts` file shows which workloads are local vs remote:
+```
+# JETTY START - managed by jetty, do not edit
+# Mode: tunnel-only (cluster.example.com)
+# Note: Remote workloads accessible via /api/proxy/{mesh_ip}/
+10.100.42.1    node1    # this node
+10.100.87.3    node2    # peer (healthy)
+10.100.50.1    nginx    # workload (local)
+10.100.50.2    redis    # workload (remote)
+# JETTY END
+```
+
+### WebSocket UDP Tunnel (Full Mesh Connectivity)
+
+Tunnel-only mode now includes **WebSocket UDP tunneling** that provides full WireGuard mesh connectivity without port forwarding:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    WEBSOCKET UDP TUNNEL ARCHITECTURE                        │
+│                                                                             │
+│   Node A                          Cloudflare                        Node B  │
+│                                    Tunnel                                   │
+│   ┌─────────┐                                                  ┌─────────┐ │
+│   │WireGuard│──UDP──►┌──────────┐                ┌──────────┐──►│WireGuard│ │
+│   │ jetty0  │        │UDP Relay │──HTTP/WS──────►│/api/wg/  │   │ jetty0  │ │
+│   └─────────┘        │:51821    │   POST         │packet    │   └─────────┘ │
+│                      └──────────┘                └──────────┘               │
+│                                                                             │
+│   • WireGuard sends to local relay (127.0.0.1:51821)                        │
+│   • Relay encapsulates packet in JSON, sends via HTTP POST                  │
+│   • Cloudflare routes to a node                                             │
+│   • Receiving node checks target ID                                         │
+│   • If match: injects into local WireGuard                                  │
+│   • Full mesh IP connectivity - containers can reach remote workloads!      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**How it works:**
+1. For each peer, Jetty creates a local UDP relay (127.0.0.1:51821, 51822, etc.)
+2. WireGuard is configured to send packets to these local relays
+3. Relays capture packets and send via HTTP POST to `/api/wg/packet`
+4. The packet includes `{from: nodeID, to: peerID, data: encryptedPayload}`
+5. Receiving node injects the packet into its local WireGuard interface
+6. WireGuard decrypts and routes - full mesh connectivity achieved!
+
+**Benefits:**
+- **Full mesh IP routing** - Containers can directly reach remote mesh IPs
+- **No port forwarding** - Only outbound HTTPS required
+- **WireGuard encryption** - All traffic remains encrypted end-to-end
+- **Transparent** - Applications don't know they're going through a tunnel
+
+### Subdomain-Based Direct Routing
+
+By default, Cloudflare load balances requests randomly across nodes. This works for control plane operations (gossip, sync) but is inefficient for WireGuard packets that need to reach a specific peer.
+
+**Solution:** Each node gets its own subdomain in Cloudflare, allowing direct routing:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     SUBDOMAIN-BASED DIRECT ROUTING                          │
+│                                                                             │
+│   Node A                          Cloudflare                        Node B  │
+│   node1.cluster.example.com                                node2.cluster.   │
+│                                                            example.com      │
+│   ┌─────────────┐                                        ┌─────────────┐   │
+│   │   Agent A   │──WG packet for B ───────────────────►  │   Agent B   │   │
+│   │             │   POST node2.cluster.example.com       │  (direct!)  │   │
+│   └─────────────┘   /api/wg/packet                       └─────────────┘   │
+│                                                                             │
+│   • Each node has unique subdomain (JETTY_TUNNEL_HOST)                     │
+│   • WG packets sent directly to target peer's subdomain                    │
+│   • No random routing - packets go straight to destination                 │
+│   • Control plane can still use shared domain for load balancing           │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Cloudflare Setup:**
+1. In Cloudflare Tunnel dashboard, add multiple public hostnames
+2. Each hostname points to `http://localhost:8080` on that node
+3. Example hostnames:
+   - `cluster.example.com` → Load balanced to any node (general access)
+   - `node1.cluster.example.com` → Routes only to Node A
+   - `node2.cluster.example.com` → Routes only to Node B
+
+**Node Configuration:**
+
+```bash
+# Node A
+docker run -d --name jetty \
+  --cap-add NET_ADMIN --cap-add NET_RAW \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_CF_TOKEN=eyJhIjoiNjA2... \
+  -e JETTY_TUNNEL_DOMAIN=cluster.example.com \
+  -e JETTY_TUNNEL_HOST=node1.cluster.example.com \
+  jetty
+
+# Node B
+docker run -d --name jetty \
+  --cap-add NET_ADMIN --cap-add NET_RAW \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_TUNNEL_DOMAIN=cluster.example.com \
+  -e JETTY_TUNNEL_HOST=node2.cluster.example.com \
+  -e JETTY_JOIN=https://cluster.example.com \
+  -e JETTY_TOKEN=abc123... \
+  jetty
+```
+
+**How it works:**
+1. Each node announces its `TunnelHost` during join/announce
+2. When sending WG packets, the sender looks up the target peer's `TunnelHost`
+3. If available, packets go directly to `https://{peer.TunnelHost}/api/wg/packet`
+4. If not available, falls back to shared tunnel domain (random routing)
+
+**Benefits:**
+- **No random hops** - Packets reach the correct node immediately
+- **Lower latency** - Direct path instead of multi-hop through random nodes
+- **Better reliability** - No dependency on gossip for packet routing
+
+### Limitations
+
+1. **Higher latency** - Packets route through Cloudflare
+2. **Tunnel dependency** - If Cloudflare is down, cross-node mesh fails
+3. **Bandwidth** - HTTP overhead compared to raw UDP
+
+---
+
+## Cloudflare WARP Mode (Beta)
+
+WARP Mode provides Layer 3 networking through Cloudflare's WARP service, enabling true IP-level connectivity between nodes without any port forwarding.
+
+### What is WARP?
+
+Cloudflare WARP is a VPN-like service that routes traffic through Cloudflare's network. With **WARP Connector** (part of Cloudflare Zero Trust), you can create site-to-site connectivity where nodes can reach each other via their WARP IPs (in the 100.96.0.0/12 CGNAT range).
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           WARP MODE ARCHITECTURE                             │
+│                                                                              │
+│   Node A                        Cloudflare                         Node B   │
+│   WARP IP: 100.96.0.5          Zero Trust                  WARP IP: 100.96.0.8
+│                                  Network                                     │
+│   ┌─────────────┐                                          ┌─────────────┐  │
+│   │   Jetty     │              ┌──────────┐                │   Jetty     │  │
+│   │ 10.100.x.x  │──WARP Tunnel─│   WARP   │──WARP Tunnel──►│ 10.100.y.y  │  │
+│   └──────┬──────┘              │ Connector│                └──────┬──────┘  │
+│          │                     └──────────┘                       │         │
+│   ┌──────┴──────┐                                          ┌──────┴──────┐  │
+│   │  Workloads  │      Full L3 connectivity!               │  Workloads  │  │
+│   │  (Docker)   │◄─────────────────────────────────────────│  (Docker)   │  │
+│   └─────────────┘                                          └─────────────┘  │
+│                                                                              │
+│   Benefits:                                                                  │
+│   • No port forwarding required                                              │
+│   • True Layer 3 (IP) connectivity                                           │
+│   • Works with raw UDP/TCP - not just HTTP                                   │
+│   • WireGuard packets can flow natively                                      │
+│   • Each node gets stable WARP IP                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Prerequisites
+
+1. **Cloudflare Zero Trust account** (free tier available)
+2. **WARP Connector** enabled in your Zero Trust dashboard
+3. **Docker with privileged access** (for TUN device)
+
+### Setting Up WARP Connector
+
+1. Go to Cloudflare Zero Trust → Settings → WARP Client
+2. Enable "WARP Connector"
+3. Create a new connector and copy the token
+4. Configure your Private Network routes (the mesh CIDR, e.g., 10.100.0.0/16)
+
+### Running Jetty with WARP
+
+```bash
+# Run with WARP Connector (recommended)
+docker run -d --name jetty \
+  --cap-add NET_ADMIN \
+  --cap-add MKNOD \
+  --device /dev/net/tun \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/lib/cloudflare-warp:/var/lib/cloudflare-warp \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_WARP_CONNECTOR_TOKEN=your-connector-token \
+  jetty
+```
+
+### WARP Configuration Options
+
+**Consumer WARP (Simple):**
+```bash
+# Basic WARP - just connect to Cloudflare's network
+-e JETTY_WARP_ENABLED=true
+```
+
+**WARP Connector (Site-to-Site):**
+```bash
+# For Zero Trust site-to-site networking
+-e JETTY_WARP_CONNECTOR_TOKEN=eyJ...your-token
+```
+
+**Zero Trust Organization:**
+```bash
+# Enroll in a Zero Trust org
+-e JETTY_WARP_ORGANIZATION=your-org-name
+```
+
+### Joining a WARP-Enabled Cluster
+
+When nodes use WARP, they share their WARP IPs with each other during join/announce. This allows nodes to establish direct IP connectivity through Cloudflare's network.
+
+```bash
+# Node 2 joining via WARP
+docker run -d --name jetty \
+  --cap-add NET_ADMIN \
+  --cap-add MKNOD \
+  --device /dev/net/tun \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/lib/cloudflare-warp:/var/lib/cloudflare-warp \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_WARP_CONNECTOR_TOKEN=same-connector-token \
+  -e JETTY_JOIN=http://100.96.0.5:8080 \
+  -e JETTY_TOKEN=abc123... \
+  jetty
+```
+
+### Status Check
+
+```bash
+curl http://localhost:8080/api/status | jq '.warp'
+```
+
+```json
+{
+  "enabled": true,
+  "ip": "100.96.0.5"
+}
+```
+
+### WARP vs Tunnel-Only Mode
+
+| Feature | Tunnel-Only | WARP Mode |
+|---------|-------------|-----------|
+| Port Forwarding | Not needed | Not needed |
+| Protocol Support | HTTP only | UDP, TCP, ICMP |
+| WireGuard Traffic | Encapsulated in HTTP | Native UDP |
+| Latency | Higher (HTTP overhead) | Lower (native routing) |
+| Setup Complexity | Simple (just tunnel token) | Medium (Zero Trust config) |
+| Requirements | Cloudflare Tunnel | Cloudflare Zero Trust |
+
+### Combining WARP with Tunnel
+
+You can use both WARP and Cloudflare Tunnel together:
+- **WARP**: For inter-node mesh connectivity
+- **Tunnel**: For external access to your cluster
+
+```bash
+docker run -d --name jetty \
+  --cap-add NET_ADMIN \
+  --cap-add MKNOD \
+  --device /dev/net/tun \
+  -p 8080:8080 \
+  -v jetty-data:/data \
+  -v /var/lib/cloudflare-warp:/var/lib/cloudflare-warp \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_WARP_CONNECTOR_TOKEN=warp-token \
+  -e JETTY_CF_TOKEN=tunnel-token \
+  jetty
+```
+
+### Troubleshooting WARP
+
+```bash
+# Check WARP status inside container
+docker exec jetty warp-cli --accept-tos status
+
+# Check WARP connection
+docker exec jetty warp-cli --accept-tos warp-stats
+
+# View WARP IP
+docker exec jetty ip addr show CloudflareWARP
+
+# Check split tunnel settings
+docker exec jetty warp-cli --accept-tos settings
+```
+
+---
+
 ## API Reference
 
 ### Cluster
@@ -302,11 +699,25 @@ Now `cluster.example.com` hits any healthy node in your cluster.
 | `POST /api/tunnel` | POST | Set tunnel token |
 | `DELETE /api/tunnel` | DELETE | Remove tunnel |
 
+### Proxy (Cross-Node Communication)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/proxy/{mesh_ip}/{path}` | ANY | Proxy request to workload (local or remote) |
+
+### WireGuard Tunnel (Tunnel-Only Mode)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `GET /api/ws/wg` | WebSocket | WebSocket endpoint for WG packet relay |
+| `POST /api/wg/packet` | POST | HTTP endpoint for WG packet forwarding |
+
 ### Internal (Peer-to-Peer)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `POST /api/peer-announce` | POST | Announce new peer |
+| `POST /api/heartbeat` | POST | Health heartbeat (tunnel-only mode) |
 | `POST /api/tunnel/sync` | POST | Sync tunnel token |
 | `POST /api/token/sync` | POST | Sync join tokens |
 
@@ -403,7 +814,7 @@ New Node                                    Existing Node
 │                         STATE                                   │
 │                                                                 │
 │  Peers: map[HWID]*Peer                                          │
-│    └── {ID, Name, MeshIP, Endpoint, PublicKey, Healthy}         │
+│    └── {ID, Name, MeshIP, Endpoint, PublicKey, TunnelHost, ...} │
 │                                                                 │
 │  Workloads: map[MeshIP]*Workload                                │
 │    └── {Name, MeshIP, Compose, Revive, Owner, Version}          │
