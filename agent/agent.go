@@ -61,12 +61,13 @@ type Peer struct {
 }
 
 type Workload struct {
-	Name    string `json:"name"`     // DNS hostname
-	MeshIP  string `json:"mesh_ip"`  // Unique lock
-	Compose string `json:"compose"`
-	Revive  bool   `json:"revive"`
-	Owner   string `json:"owner"`    // Node HWID
-	Version int64  `json:"version"`  // Unix timestamp
+	Name      string `json:"name"`      // DNS hostname
+	MeshIP    string `json:"mesh_ip"`   // Unique lock
+	Compose   string `json:"compose"`
+	Revive    bool   `json:"revive"`    // Auto-failover to another node if owner dies
+	Autostart bool   `json:"autostart"` // Auto-start when Jetty starts up
+	Owner     string `json:"owner"`     // Node HWID
+	Version   int64  `json:"version"`   // Unix timestamp
 }
 
 type Token struct {
@@ -203,6 +204,9 @@ func (a *Agent) Start() error {
 			return fmt.Errorf("join: %w", err)
 		}
 	}
+
+	// Auto-start owned workloads
+	a.autostartWorkloads()
 
 	// Update hosts file
 	a.updateHosts()
@@ -1536,6 +1540,29 @@ func (a *Agent) cleanupExpiredTokens() {
 // =============================================================================
 // Docker Compose
 // =============================================================================
+
+// autostartWorkloads starts all owned workloads that have autostart enabled
+func (a *Agent) autostartWorkloads() {
+	a.stateMu.RLock()
+	var toStart []*Workload
+	for _, wl := range a.state.Workloads {
+		if wl.Owner == a.hwid && wl.Autostart {
+			toStart = append(toStart, wl)
+		}
+	}
+	a.stateMu.RUnlock()
+
+	if len(toStart) == 0 {
+		return
+	}
+
+	log.Printf("Auto-starting %d workload(s)...", len(toStart))
+	for _, wl := range toStart {
+		if err := a.deployWorkload(wl); err != nil {
+			log.Printf("Failed to auto-start %s: %v", wl.Name, err)
+		}
+	}
+}
 
 func (a *Agent) deployWorkload(wl *Workload) error {
 	dir := filepath.Join(a.composeDir, wl.Name)

@@ -49,6 +49,7 @@ A workload is a Docker Compose application with a dedicated mesh IP:
   "mesh_ip": "10.100.50.1",
   "compose": "version: '3'\nservices:\n  web:\n    image: nginx",
   "revive": true,
+  "autostart": true,
   "owner": "abc123...",
   "version": 1704067200
 }
@@ -57,7 +58,8 @@ A workload is a Docker Compose application with a dedicated mesh IP:
 - **name**: DNS hostname (accessible as `nginx` from any node)
 - **mesh_ip**: Unique IP on the mesh network
 - **compose**: Docker Compose YAML content
-- **revive**: If true, auto-restart on another node if owner dies
+- **revive**: If true, auto-failover to another node if owner dies
+- **autostart**: If true, auto-start when Jetty starts up (on the owning node)
 - **owner**: HWID of the node running this workload
 - **version**: Unix timestamp for conflict resolution
 
@@ -208,6 +210,7 @@ curl -X POST http://localhost:8080/api/workloads \
     "name": "nginx",
     "mesh_ip": "10.100.50.1",
     "revive": true,
+    "autostart": true,
     "compose": "version: '\''3'\''\nservices:\n  web:\n    image: nginx:alpine\n    ports:\n      - \"80:80\""
   }'
 ```
@@ -1039,12 +1042,13 @@ docker run -d --name jetty-node2 \
 ### 4. Deploy a Workload
 
 ```bash
-curl -X POST http://203.0.113.1:8080/api/workloads \
+curl -X POST http://localhost:8080/api/workloads \
   -H "Content-Type: application/json" \
   -d '{
     "name": "whoami",
     "mesh_ip": "10.100.100.1",
     "revive": true,
+    "autostart": true,
     "compose": "version: '\''3'\''\nservices:\n  web:\n    image: traefik/whoami\n    ports:\n      - \"80:80\""
   }'
 ```
