@@ -1,9 +1,8 @@
 ```html
-<pre>
-╦╔═╗╔╦╗╔╦╗╦ ╦
-║║╣  ║  ║ ╚╦╝
-╚╝╚═╝ ╩  ╩  ╩
-</pre>```
+ ╦ ╔═╗╔╦╗╔╦╗╦ ╦
+ ║ ║╣  ║  ║ ╚╦╝
+╚╝ ╚═╝ ╩  ╩  ╩
+```
 
 Peer-to-peer Docker Compose orchestration. Every node is equal.
 
