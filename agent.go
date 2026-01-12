@@ -54,6 +54,7 @@ type State struct {
 	Peers     map[string]*Peer     `json:"peers"`     // ID -> Peer
 	Workloads map[string]*Workload `json:"workloads"` // MeshIP -> Workload
 	Tokens    map[string]*Token    `json:"tokens"`
+	CFToken   string               `json:"cf_token,omitempty"` // Cloudflare tunnel token (shared cluster-wide)
 }
 
 // =============================================================================
@@ -85,6 +86,11 @@ type Agent struct {
 	// Paths
 	composeDir string
 	hostsFile  string
+
+	// Cloudflare tunnel
+	cfCmd    *exec.Cmd
+	cfMu     sync.Mutex
+	cfStopCh chan struct{}
 
 	stopCh chan struct{}
 }
@@ -138,6 +144,11 @@ func (a *Agent) Start() error {
 	// Update hosts file
 	a.updateHosts()
 
+	// Start Cloudflare tunnel if configured
+	if err := a.startCloudflared(); err != nil {
+		log.Printf("Warning: failed to start cloudflared: %v", err)
+	}
+
 	// Start API
 	go a.runAPI()
 
@@ -153,6 +164,7 @@ func (a *Agent) Start() error {
 
 func (a *Agent) Stop() {
 	close(a.stopCh)
+	a.stopCloudflared()
 	a.saveState()
 	exec.Command("ip", "link", "del", "jetty0").Run()
 }
@@ -379,8 +391,11 @@ func (a *Agent) joinCluster() error {
 	var result struct {
 		Peers     []*Peer     `json:"peers"`
 		Workloads []*Workload `json:"workloads"`
+		CFToken   string      `json:"cf_token,omitempty"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode join response: %w", err)
+	}
 
 	a.stateMu.Lock()
 	for _, p := range result.Peers {
@@ -389,12 +404,23 @@ func (a *Agent) joinCluster() error {
 	for _, w := range result.Workloads {
 		a.state.Workloads[w.MeshIP] = w
 	}
+	// Store the CF token received from the cluster
+	if result.CFToken != "" {
+		a.state.CFToken = result.CFToken
+	}
 	a.stateMu.Unlock()
 
 	a.updateWGPeers()
 	a.saveState()
 
-	log.Printf("Joined: %d peers, %d workloads", len(result.Peers), len(result.Workloads))
+	// Start cloudflared if we received a token
+	if result.CFToken != "" {
+		if err := a.startCloudflared(); err != nil {
+			log.Printf("Warning: failed to start cloudflared: %v", err)
+		}
+	}
+
+	log.Printf("Joined: %d peers, %d workloads, tunnel=%v", len(result.Peers), len(result.Workloads), result.CFToken != "")
 	return nil
 }
 
@@ -416,6 +442,11 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/join", a.apiJoin).Methods("POST")
 	r.HandleFunc("/api/health", a.apiHealth).Methods("GET")
 	r.HandleFunc("/api/sync", a.apiSync).Methods("GET")
+	r.HandleFunc("/api/tunnel", a.apiGetTunnel).Methods("GET")
+	r.HandleFunc("/api/tunnel", a.apiSetTunnel).Methods("POST")
+	r.HandleFunc("/api/tunnel", a.apiDeleteTunnel).Methods("DELETE")
+	r.HandleFunc("/api/tunnel/sync", a.apiTunnelSync).Methods("POST")
+	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 
 	addr := fmt.Sprintf(":%d", a.apiPort)
 	log.Printf("API on %s", addr)
@@ -432,6 +463,7 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 	for _, wl := range a.state.Workloads {
 		workloads = append(workloads, wl)
 	}
+	hasTunnel := a.state.CFToken != ""
 	a.stateMu.RUnlock()
 
 	resp := map[string]interface{}{
@@ -443,6 +475,10 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 		},
 		"peers":     peers,
 		"workloads": workloads,
+		"tunnel": map[string]interface{}{
+			"configured": hasTunnel,
+			"running":    a.isTunnelRunning(),
+		},
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -727,6 +763,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	for _, w := range a.state.Workloads {
 		allWorkloads = append(allWorkloads, w)
 	}
+	cfToken := a.state.CFToken
 	a.stateMu.Unlock()
 
 	a.addWGPeer(peer)
@@ -739,6 +776,11 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]interface{}{
 		"peers":     allPeers,
 		"workloads": allWorkloads,
+	}
+
+	// Include CF token so new peer can start its tunnel
+	if cfToken != "" {
+		resp["cf_token"] = cfToken
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -769,6 +811,154 @@ func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(local)
+}
+
+func (a *Agent) apiGetTunnel(w http.ResponseWriter, r *http.Request) {
+	a.stateMu.RLock()
+	hasToken := a.state.CFToken != ""
+	a.stateMu.RUnlock()
+
+	resp := map[string]interface{}{
+		"configured": hasToken,
+		"running":    a.isTunnelRunning(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (a *Agent) apiSetTunnel(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	if req.Token == "" {
+		http.Error(w, "token required", 400)
+		return
+	}
+
+	a.stateMu.Lock()
+	a.state.CFToken = req.Token
+	a.stateMu.Unlock()
+
+	a.saveState()
+
+	// Start or restart the tunnel
+	if err := a.restartCloudflared(); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	// Broadcast to peers so they also start their tunnels
+	a.broadcastTunnelToken(req.Token)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"configured": true,
+		"running":    a.isTunnelRunning(),
+	})
+
+	log.Printf("Cloudflare tunnel configured")
+}
+
+func (a *Agent) apiDeleteTunnel(w http.ResponseWriter, r *http.Request) {
+	a.stateMu.Lock()
+	a.state.CFToken = ""
+	a.stateMu.Unlock()
+
+	a.stopCloudflared()
+	a.saveState()
+
+	// Notify peers to stop their tunnels
+	a.broadcastTunnelToken("")
+
+	w.WriteHeader(204)
+	log.Printf("Cloudflare tunnel removed")
+}
+
+func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
+	var peer Peer
+	if err := json.NewDecoder(r.Body).Decode(&peer); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	peer.Healthy = true
+	peer.LastSeen = time.Now()
+
+	a.stateMu.Lock()
+	a.state.Peers[peer.ID] = &peer
+	a.stateMu.Unlock()
+
+	a.addWGPeer(&peer)
+	a.updateHosts()
+	a.saveState()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+	log.Printf("Peer announced: %s (%s)", peer.Name, peer.MeshIP)
+}
+
+// broadcastTunnelToken sends the CF token to all peers so they can start their tunnels.
+func (a *Agent) broadcastTunnelToken(token string) {
+	a.stateMu.RLock()
+	peers := make([]*Peer, 0)
+	for _, p := range a.state.Peers {
+		if p.Healthy {
+			peers = append(peers, p)
+		}
+	}
+	a.stateMu.RUnlock()
+
+	data, _ := json.Marshal(map[string]string{"token": token})
+
+	for _, peer := range peers {
+		url := fmt.Sprintf("http://%s:%d/api/tunnel/sync", peer.MeshIP, a.apiPort)
+		resp, err := http.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to broadcast tunnel token to %s: %v", peer.Name, err)
+			continue
+		}
+		resp.Body.Close()
+	}
+}
+
+func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	a.stateMu.Lock()
+	oldToken := a.state.CFToken
+	a.state.CFToken = req.Token
+	a.stateMu.Unlock()
+
+	// Only restart if token changed
+	if oldToken != req.Token {
+		a.saveState()
+		if req.Token == "" {
+			a.stopCloudflared()
+			log.Printf("Cloudflare tunnel removed via sync")
+		} else {
+			if err := a.restartCloudflared(); err != nil {
+				log.Printf("Failed to start tunnel after sync: %v", err)
+			} else {
+				log.Printf("Cloudflare tunnel started via sync")
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // =============================================================================
@@ -1066,6 +1256,153 @@ func (a *Agent) loadState() {
 	a.updateWGPeers()
 
 	log.Printf("Loaded: %d peers, %d workloads", len(a.state.Peers), len(a.state.Workloads))
+}
+
+// =============================================================================
+// Cloudflare Tunnel
+// =============================================================================
+
+// startCloudflared starts the cloudflared tunnel process with the configured token.
+// It runs the tunnel pointing to the local API, providing external access to the cluster.
+// The process is monitored and automatically restarted on failure.
+func (a *Agent) startCloudflared() error {
+	a.cfMu.Lock()
+	defer a.cfMu.Unlock()
+
+	// Check if already running
+	if a.cfCmd != nil && a.cfCmd.Process != nil {
+		return nil
+	}
+
+	a.stateMu.RLock()
+	token := a.state.CFToken
+	a.stateMu.RUnlock()
+
+	if token == "" {
+		return nil // No token configured
+	}
+
+	a.cfStopCh = make(chan struct{})
+
+	// Start cloudflared tunnel
+	a.cfCmd = exec.Command("cloudflared", "tunnel", "run", "--token", token)
+	a.cfCmd.Stdout = os.Stdout
+	a.cfCmd.Stderr = os.Stderr
+
+	if err := a.cfCmd.Start(); err != nil {
+		return fmt.Errorf("cloudflared start: %w", err)
+	}
+
+	log.Printf("Cloudflare tunnel started (pid: %d)", a.cfCmd.Process.Pid)
+
+	// Monitor process and restart on failure
+	go a.monitorCloudflared()
+
+	return nil
+}
+
+// stopCloudflared gracefully stops the cloudflared tunnel process.
+func (a *Agent) stopCloudflared() {
+	a.cfMu.Lock()
+	defer a.cfMu.Unlock()
+
+	if a.cfStopCh != nil {
+		close(a.cfStopCh)
+		a.cfStopCh = nil
+	}
+
+	if a.cfCmd != nil && a.cfCmd.Process != nil {
+		a.cfCmd.Process.Signal(os.Interrupt)
+		// Give it 5 seconds to shutdown gracefully
+		done := make(chan struct{})
+		go func() {
+			a.cfCmd.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			a.cfCmd.Process.Kill()
+		}
+		log.Printf("Cloudflare tunnel stopped")
+	}
+	a.cfCmd = nil
+}
+
+// monitorCloudflared watches the cloudflared process and restarts it if it dies.
+func (a *Agent) monitorCloudflared() {
+	for {
+		a.cfMu.Lock()
+		cmd := a.cfCmd
+		stopCh := a.cfStopCh
+		a.cfMu.Unlock()
+
+		if cmd == nil {
+			return
+		}
+
+		// Wait for process to exit
+		err := cmd.Wait()
+
+		// Check if we were asked to stop
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+
+		if err != nil {
+			log.Printf("Cloudflare tunnel exited: %v, restarting in 5s...", err)
+		} else {
+			log.Printf("Cloudflare tunnel exited, restarting in 5s...")
+		}
+
+		time.Sleep(5 * time.Second)
+
+		// Check again if we should stop
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+
+		// Restart
+		a.cfMu.Lock()
+		a.stateMu.RLock()
+		token := a.state.CFToken
+		a.stateMu.RUnlock()
+
+		if token == "" {
+			a.cfMu.Unlock()
+			return
+		}
+
+		a.cfCmd = exec.Command("cloudflared", "tunnel", "run", "--token", token)
+		a.cfCmd.Stdout = os.Stdout
+		a.cfCmd.Stderr = os.Stderr
+
+		if err := a.cfCmd.Start(); err != nil {
+			log.Printf("Cloudflare tunnel restart failed: %v", err)
+			a.cfMu.Unlock()
+			return
+		}
+		log.Printf("Cloudflare tunnel restarted (pid: %d)", a.cfCmd.Process.Pid)
+		a.cfMu.Unlock()
+	}
+}
+
+// restartCloudflared stops and starts the tunnel (used when token changes).
+func (a *Agent) restartCloudflared() error {
+	a.stopCloudflared()
+	return a.startCloudflared()
+}
+
+// isTunnelRunning returns true if cloudflared is currently running.
+func (a *Agent) isTunnelRunning() bool {
+	a.cfMu.Lock()
+	defer a.cfMu.Unlock()
+	return a.cfCmd != nil && a.cfCmd.Process != nil
 }
 
 // =============================================================================
