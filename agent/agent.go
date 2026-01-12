@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +22,14 @@ import (
 	"github.com/gorilla/mux"
 	"golang.org/x/crypto/curve25519"
 )
+
+// Shared HTTP client with timeout to prevent blocking on hung peers
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
+
+// Valid workload name pattern (alphanumeric, dash, underscore only)
+var validNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // =============================================================================
 // Types
@@ -381,7 +390,7 @@ func (a *Agent) joinCluster() error {
 	}
 
 	data, _ := json.Marshal(req)
-	resp, err := http.Post(a.joinURL+"/api/join", "application/json", strings.NewReader(string(data)))
+	resp, err := httpClient.Post(a.joinURL+"/api/join", "application/json", strings.NewReader(string(data)))
 	if err != nil {
 		return err
 	}
@@ -450,6 +459,7 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/tunnel", a.apiSetTunnel).Methods("POST")
 	r.HandleFunc("/api/tunnel", a.apiDeleteTunnel).Methods("DELETE")
 	r.HandleFunc("/api/tunnel/sync", a.apiTunnelSync).Methods("POST")
+	r.HandleFunc("/api/token/sync", a.apiTokenSync).Methods("POST")
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 
 	addr := fmt.Sprintf(":%d", a.apiPort)
@@ -513,29 +523,41 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if mesh_ip already taken
-	a.stateMu.RLock()
-	existing := a.state.Workloads[wl.MeshIP]
-	a.stateMu.RUnlock()
+	// Validate workload name (prevent path traversal attacks)
+	if !validNamePattern.MatchString(wl.Name) {
+		http.Error(w, "invalid name: must be alphanumeric with dash/underscore only", 400)
+		return
+	}
 
+	// Validate mesh IP format
+	if net.ParseIP(wl.MeshIP) == nil {
+		http.Error(w, "invalid mesh_ip: must be valid IP address", 400)
+		return
+	}
+
+	// Lock for entire check-and-set to prevent race condition
+	a.stateMu.Lock()
+	existing := a.state.Workloads[wl.MeshIP]
 	if existing != nil && existing.Owner != a.hwid {
+		a.stateMu.Unlock()
 		http.Error(w, "mesh_ip already in use", 409)
 		return
 	}
 
 	wl.Owner = a.hwid
 	wl.Version = time.Now().Unix()
+	a.state.Workloads[wl.MeshIP] = &wl
+	a.stateMu.Unlock()
 
-	// Deploy
+	// Deploy (outside lock to avoid blocking other operations)
 	if err := a.deployWorkload(&wl); err != nil {
+		// Rollback on failure
+		a.stateMu.Lock()
+		delete(a.state.Workloads, wl.MeshIP)
+		a.stateMu.Unlock()
 		http.Error(w, err.Error(), 500)
 		return
 	}
-
-	// Save
-	a.stateMu.Lock()
-	a.state.Workloads[wl.MeshIP] = &wl
-	a.stateMu.Unlock()
 
 	a.updateHosts()
 	a.updateWGPeers()
@@ -652,7 +674,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 
 	// Deploy on target
 	data, _ := json.Marshal(found)
-	resp, err := http.Post(fmt.Sprintf("http://%s:%d/api/workloads", target.MeshIP, a.apiPort),
+	resp, err := httpClient.Post(fmt.Sprintf("http://%s:%d/api/workloads", target.MeshIP, a.apiPort),
 		"application/json", strings.NewReader(string(data)))
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -709,6 +731,10 @@ func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 
 	a.saveState()
 
+	// Broadcast token to all peers so any node can validate it
+	// (important when using Cloudflare tunnel load balancing)
+	go a.broadcastToken(tok)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(tok)
 }
@@ -731,15 +757,44 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate token
-	a.stateMu.RLock()
+	// Validate and consume token (single-use)
+	a.stateMu.Lock()
 	tok := a.state.Tokens[req.Token]
-	a.stateMu.RUnlock()
-
 	if tok == nil || time.Now().After(tok.ExpiresAt) {
+		a.stateMu.Unlock()
 		http.Error(w, "invalid token", 401)
 		return
 	}
+	// Delete token after use (single-use tokens)
+	delete(a.state.Tokens, req.Token)
+	a.stateMu.Unlock()
+
+	// Broadcast token deletion to other nodes
+	go a.broadcastTokenDeletion(req.Token)
+
+	// Check for mesh IP collision before creating peer
+	a.stateMu.RLock()
+	// Check against our own IP
+	if req.MeshIP == a.meshIP {
+		a.stateMu.RUnlock()
+		http.Error(w, "mesh_ip collision with existing node", 409)
+		return
+	}
+	// Check against existing peers
+	for _, p := range a.state.Peers {
+		if p.MeshIP == req.MeshIP && p.ID != req.ID {
+			a.stateMu.RUnlock()
+			http.Error(w, "mesh_ip collision with existing node", 409)
+			return
+		}
+	}
+	// Check against workloads
+	if _, exists := a.state.Workloads[req.MeshIP]; exists {
+		a.stateMu.RUnlock()
+		http.Error(w, "mesh_ip collision with existing workload", 409)
+		return
+	}
+	a.stateMu.RUnlock()
 
 	// Create peer
 	peer := &Peer{
@@ -939,7 +994,7 @@ func (a *Agent) broadcastTunnelToken(token string) {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/tunnel/sync", peer.MeshIP, a.apiPort)
-		resp, err := http.Post(url, "application/json", strings.NewReader(string(data)))
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
 		if err != nil {
 			log.Printf("Failed to broadcast tunnel token to %s: %v", peer.Name, err)
 			continue
@@ -981,6 +1036,100 @@ func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// apiTokenSync receives a token from another node (for cluster-wide token availability)
+// Also handles token deletion when "delete" field is set.
+func (a *Agent) apiTokenSync(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+		Delete    string    `json:"delete,omitempty"` // Token to delete (if set)
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	a.stateMu.Lock()
+	if req.Delete != "" {
+		// Delete a consumed token
+		delete(a.state.Tokens, req.Delete)
+	} else if req.Token != "" && time.Now().Before(req.ExpiresAt) {
+		// Add new token if not expired
+		if _, exists := a.state.Tokens[req.Token]; !exists {
+			a.state.Tokens[req.Token] = &Token{
+				Token:     req.Token,
+				ExpiresAt: req.ExpiresAt,
+			}
+		}
+	}
+	a.stateMu.Unlock()
+	a.saveState()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// broadcastToken sends a new token to all peers so any node can validate join requests.
+// This is critical when using Cloudflare tunnel - the join request may hit any node.
+func (a *Agent) broadcastToken(tok *Token) {
+	a.stateMu.RLock()
+	peers := make([]*Peer, 0)
+	for _, p := range a.state.Peers {
+		if p.Healthy {
+			peers = append(peers, p)
+		}
+	}
+	a.stateMu.RUnlock()
+
+	data, _ := json.Marshal(tok)
+
+	for _, peer := range peers {
+		url := fmt.Sprintf("http://%s:%d/api/token/sync", peer.MeshIP, a.apiPort)
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to broadcast token to %s: %v", peer.Name, err)
+			continue
+		}
+		resp.Body.Close()
+	}
+}
+
+// broadcastTokenDeletion tells all peers to delete a consumed token.
+func (a *Agent) broadcastTokenDeletion(tokenStr string) {
+	a.stateMu.RLock()
+	peers := make([]*Peer, 0)
+	for _, p := range a.state.Peers {
+		if p.Healthy {
+			peers = append(peers, p)
+		}
+	}
+	a.stateMu.RUnlock()
+
+	data, _ := json.Marshal(map[string]string{"delete": tokenStr})
+
+	for _, peer := range peers {
+		url := fmt.Sprintf("http://%s:%d/api/token/sync", peer.MeshIP, a.apiPort)
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+	}
+}
+
+// cleanupExpiredTokens removes tokens that have expired from state.
+func (a *Agent) cleanupExpiredTokens() {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+
+	now := time.Now()
+	for k, tok := range a.state.Tokens {
+		if now.After(tok.ExpiresAt) {
+			delete(a.state.Tokens, k)
+		}
+	}
+}
+
 // =============================================================================
 // Docker Compose
 // =============================================================================
@@ -1018,16 +1167,37 @@ func (a *Agent) deployWorkload(wl *Workload) error {
 }
 
 func (a *Agent) removeWorkload(wl *Workload) {
-	a.composeCmd(wl.Name, "down", "-v", "--remove-orphans")
-
+	// Clean up iptables BEFORE stopping container (need container IP)
 	if wl.MeshIP != "" {
-		exec.Command("ip", "addr", "del", wl.MeshIP+"/32", "dev", "jetty0").Run()
+		a.cleanupWorkloadIP(wl)
 	}
+
+	a.composeCmd(wl.Name, "down", "-v", "--remove-orphans")
 
 	dir := filepath.Join(a.composeDir, wl.Name)
 	os.RemoveAll(dir)
 
 	log.Printf("Removed: %s", wl.Name)
+}
+
+func (a *Agent) cleanupWorkloadIP(wl *Workload) {
+	// Get container IP before it's gone
+	containerName := fmt.Sprintf("jetty_%s-%s-1", wl.Name, wl.Name)
+	out, err := exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerName).Output()
+	if err != nil {
+		containerName = fmt.Sprintf("jetty_%s-1", wl.Name)
+		out, _ = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerName).Output()
+	}
+
+	containerIP := strings.TrimSpace(string(out))
+	if containerIP != "" {
+		// Remove DNAT rules
+		exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-d", wl.MeshIP, "-j", "DNAT", "--to", containerIP).Run()
+		exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-d", wl.MeshIP, "-j", "DNAT", "--to", containerIP).Run()
+	}
+
+	// Remove mesh IP from interface
+	exec.Command("ip", "addr", "del", wl.MeshIP+"/32", "dev", "jetty0").Run()
 }
 
 func (a *Agent) setupWorkloadIP(wl *Workload) {
@@ -1084,6 +1254,7 @@ func (a *Agent) gossipLoop() {
 		case <-tick.C:
 			a.checkPeers()
 			a.syncWorkloads()
+			a.cleanupExpiredTokens()
 		}
 	}
 }
@@ -1094,7 +1265,7 @@ func (a *Agent) checkPeers() {
 
 	for _, peer := range a.state.Peers {
 		url := fmt.Sprintf("http://%s:%d/api/health", peer.MeshIP, a.apiPort)
-		resp, err := http.Get(url)
+		resp, err := httpClient.Get(url)
 
 		if err != nil {
 			peer.Healthy = false
@@ -1121,7 +1292,7 @@ func (a *Agent) syncWorkloads() {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/sync", peer.MeshIP, a.apiPort)
-		resp, err := http.Get(url)
+		resp, err := httpClient.Get(url)
 		if err != nil {
 			continue
 		}
@@ -1153,7 +1324,7 @@ func (a *Agent) broadcastState() {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/sync", peer.MeshIP, a.apiPort)
-		http.Get(url) // Trigger sync
+		httpClient.Get(url) // Trigger sync
 	}
 }
 
@@ -1179,7 +1350,7 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/peer-announce", peer.MeshIP, a.apiPort)
-		resp, err := http.Post(url, "application/json", strings.NewReader(string(data)))
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
 		if err != nil {
 			log.Printf("Failed to announce peer to %s: %v", peer.Name, err)
 			continue
@@ -1247,11 +1418,10 @@ func (a *Agent) checkFailover() {
 	}
 }
 
+// shouldClaim determines if this node should claim an orphaned workload.
+// NOTE: Caller must already hold stateMu lock.
 func (a *Agent) shouldClaim(wl *Workload) bool {
 	// Deterministic: lowest healthy node ID wins
-	a.stateMu.RLock()
-	defer a.stateMu.RUnlock()
-
 	candidates := []string{a.hwid}
 	for _, p := range a.state.Peers {
 		if p.Healthy {
@@ -1272,7 +1442,19 @@ func (a *Agent) saveState() {
 	data, _ := json.MarshalIndent(a.state, "", "  ")
 	a.stateMu.RUnlock()
 
-	os.WriteFile(filepath.Join(a.dataDir, "state.json"), data, 0644)
+	// Atomic write: write to temp file then rename
+	statePath := filepath.Join(a.dataDir, "state.json")
+	tempPath := statePath + ".tmp"
+
+	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+		log.Printf("Failed to write state: %v", err)
+		return
+	}
+
+	if err := os.Rename(tempPath, statePath); err != nil {
+		log.Printf("Failed to rename state file: %v", err)
+		os.Remove(tempPath) // Clean up temp file
+	}
 }
 
 func (a *Agent) loadState() {
@@ -1479,12 +1661,31 @@ func getHostname() string {
 }
 
 func getPublicIP() string {
-	c, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "127.0.0.1"
+	// Allow override via environment variable (useful in containers)
+	if ip := os.Getenv("JETTY_PUBLIC_IP"); ip != "" {
+		return ip
 	}
-	defer c.Close()
-	return c.LocalAddr().(*net.UDPAddr).IP.String()
+
+	// Try to determine IP by dialing out
+	c, err := net.Dial("udp", "8.8.8.8:80")
+	if err == nil {
+		defer c.Close()
+		if addr, ok := c.LocalAddr().(*net.UDPAddr); ok && !addr.IP.IsLoopback() {
+			return addr.IP.String()
+		}
+	}
+
+	// Fallback: find first non-loopback interface IP
+	addrs, err := net.InterfaceAddrs()
+	if err == nil {
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+
+	return "127.0.0.1"
 }
 
 func genID() string {
