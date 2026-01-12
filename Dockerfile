@@ -11,7 +11,8 @@ RUN apk add --no-cache \
     iptables \
     docker-cli \
     docker-cli-compose \
-    ca-certificates
+    ca-certificates \
+    cloudflared
 
 COPY --from=builder /app/jetty /usr/local/bin/jetty
 
