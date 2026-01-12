@@ -73,11 +73,12 @@ type Agent struct {
 	wgPort    int
 
 	// Config
-	dataDir  string
-	apiPort  int
-	meshCIDR string
-	joinURL  string
-	joinTok  string
+	dataDir       string
+	apiPort       int
+	meshCIDR      string
+	joinURL       string
+	joinTok       string
+	clusterSecret string // Shared secret all nodes must have to join
 
 	// State
 	state   *State
@@ -100,15 +101,16 @@ func New() (*Agent, error) {
 	os.MkdirAll(dataDir, 0755)
 
 	a := &Agent{
-		hostname:   getHostname(),
-		wgPort:     getEnvInt("JETTY_WG_PORT", 51820),
-		dataDir:    dataDir,
-		apiPort:    getEnvInt("JETTY_API_PORT", 8080),
-		meshCIDR:   getEnv("JETTY_MESH_CIDR", "10.100.0.0/16"),
-		joinURL:    getEnv("JETTY_JOIN", ""),
-		joinTok:    getEnv("JETTY_TOKEN", ""),
-		composeDir: filepath.Join(dataDir, "compose"),
-		hostsFile:  "/etc/hosts",
+		hostname:      getHostname(),
+		wgPort:        getEnvInt("JETTY_WG_PORT", 51820),
+		dataDir:       dataDir,
+		apiPort:       getEnvInt("JETTY_API_PORT", 8080),
+		meshCIDR:      getEnv("JETTY_MESH_CIDR", "10.100.0.0/16"),
+		joinURL:       getEnv("JETTY_JOIN", ""),
+		joinTok:       getEnv("JETTY_TOKEN", ""),
+		clusterSecret: getEnv("JETTY_SECRET", ""),
+		composeDir:    filepath.Join(dataDir, "compose"),
+		hostsFile:     "/etc/hosts",
 		state: &State{
 			Peers:     make(map[string]*Peer),
 			Workloads: make(map[string]*Workload),
@@ -369,6 +371,7 @@ func (a *Agent) joinCluster() error {
 
 	req := map[string]string{
 		"token":      a.joinTok,
+		"secret":     a.clusterSecret,
 		"id":         a.hwid,
 		"name":       a.hostname,
 		"mesh_ip":    a.meshIP,
@@ -712,6 +715,7 @@ func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Token     string `json:"token"`
+		Secret    string `json:"secret"`
 		ID        string `json:"id"`
 		Name      string `json:"name"`
 		MeshIP    string `json:"mesh_ip"`
@@ -719,6 +723,12 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		PublicKey string `json:"public_key"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
+
+	// Validate cluster secret first
+	if a.clusterSecret != "" && req.Secret != a.clusterSecret {
+		http.Error(w, "invalid cluster secret", 401)
+		return
+	}
 
 	// Validate token
 	a.stateMu.RLock()
@@ -881,27 +891,36 @@ func (a *Agent) apiDeleteTunnel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
-	var peer Peer
-	if err := json.NewDecoder(r.Body).Decode(&peer); err != nil {
+	var req struct {
+		Secret string `json:"secret"`
+		Peer   Peer   `json:"peer"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
 
-	peer.Healthy = true
-	peer.LastSeen = time.Now()
+	// Validate cluster secret
+	if a.clusterSecret != "" && req.Secret != a.clusterSecret {
+		http.Error(w, "invalid cluster secret", 401)
+		return
+	}
+
+	req.Peer.Healthy = true
+	req.Peer.LastSeen = time.Now()
 
 	a.stateMu.Lock()
-	a.state.Peers[peer.ID] = &peer
+	a.state.Peers[req.Peer.ID] = &req.Peer
 	a.stateMu.Unlock()
 
-	a.addWGPeer(&peer)
+	a.addWGPeer(&req.Peer)
 	a.updateHosts()
 	a.saveState()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 
-	log.Printf("Peer announced: %s (%s)", peer.Name, peer.MeshIP)
+	log.Printf("Peer announced: %s (%s)", req.Peer.Name, req.Peer.MeshIP)
 }
 
 // broadcastTunnelToken sends the CF token to all peers so they can start their tunnels.
@@ -1147,11 +1166,24 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 	}
 	a.stateMu.RUnlock()
 
+	// Include secret in announcement
+	announcement := struct {
+		Secret string `json:"secret"`
+		Peer   *Peer  `json:"peer"`
+	}{
+		Secret: a.clusterSecret,
+		Peer:   newPeer,
+	}
+	data, _ := json.Marshal(announcement)
+
 	for _, peer := range peers {
-		// Tell existing peers about new peer
-		data, _ := json.Marshal(newPeer)
 		url := fmt.Sprintf("http://%s:%d/api/peer-announce", peer.MeshIP, a.apiPort)
-		http.Post(url, "application/json", strings.NewReader(string(data)))
+		resp, err := http.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to announce peer to %s: %v", peer.Name, err)
+			continue
+		}
+		resp.Body.Close()
 	}
 }
 
