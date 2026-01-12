@@ -855,9 +855,14 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 
 	a.stateMu.RLock()
 	var found *Workload
+	var ownerPeer *Peer
 	for _, wl := range a.state.Workloads {
 		if wl.Name == name {
 			found = wl
+			// Find the owner peer if not local
+			if wl.Owner != a.hwid {
+				ownerPeer = a.state.Peers[wl.Owner]
+			}
 			break
 		}
 	}
@@ -868,7 +873,64 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build enriched response with Docker info
+	// If workload is remote, proxy the request to the owner node
+	if found.Owner != a.hwid {
+		if ownerPeer == nil || !ownerPeer.Healthy {
+			// Owner not reachable, return basic info without container details
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"name":       found.Name,
+				"mesh_ip":    found.MeshIP,
+				"compose":    found.Compose,
+				"revive":     found.Revive,
+				"autostart":  found.Autostart,
+				"owner":      found.Owner,
+				"version":    found.Version,
+				"is_local":   false,
+				"owner_node": ownerPeer.Name,
+				"error":      "owner node unreachable",
+			})
+			return
+		}
+
+		// Proxy request to owner
+		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"name":       found.Name,
+				"mesh_ip":    found.MeshIP,
+				"compose":    found.Compose,
+				"revive":     found.Revive,
+				"autostart":  found.Autostart,
+				"owner":      found.Owner,
+				"version":    found.Version,
+				"is_local":   false,
+				"owner_node": ownerPeer.Name,
+				"error":      fmt.Sprintf("failed to reach owner: %v", err),
+			})
+			return
+		}
+		defer resp.Body.Close()
+
+		// Forward the response from owner
+		w.Header().Set("Content-Type", "application/json")
+		body, _ := io.ReadAll(resp.Body)
+
+		// Parse and add owner_node field
+		var remoteResp map[string]interface{}
+		if err := json.Unmarshal(body, &remoteResp); err == nil {
+			remoteResp["owner_node"] = ownerPeer.Name
+			remoteResp["is_local"] = false // Override since we proxied
+			json.NewEncoder(w).Encode(remoteResp)
+		} else {
+			w.Write(body)
+		}
+		return
+	}
+
+	// Build enriched response with Docker info for local workload
 	response := map[string]interface{}{
 		"name":      found.Name,
 		"mesh_ip":   found.MeshIP,
@@ -877,14 +939,11 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 		"autostart": found.Autostart,
 		"owner":     found.Owner,
 		"version":   found.Version,
-		"is_local":  found.Owner == a.hwid,
+		"is_local":  true,
 	}
 
-	// Add Docker container info if this workload is local
-	if found.Owner == a.hwid {
-		containerInfo := a.getContainerInfo(found.Name)
-		response["containers"] = containerInfo
-	}
+	containerInfo := a.getContainerInfo(found.Name)
+	response["containers"] = containerInfo
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
