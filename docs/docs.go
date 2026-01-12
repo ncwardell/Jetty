@@ -409,6 +409,88 @@ const docTemplate = `{
                     }
                 }
             }
+        },
+        "/workloads/{name}/start": {
+            "post": {
+                "description": "Starts the containers for a workload that was previously stopped",
+                "tags": [
+                    "workloads"
+                ],
+                "summary": "Start a stopped workload",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Workload name",
+                        "name": "name",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Workload not found",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Start failed",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/workloads/{name}/stop": {
+            "post": {
+                "description": "Stops the containers for a workload without removing them",
+                "tags": [
+                    "workloads"
+                ],
+                "summary": "Stop a running workload",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Workload name",
+                        "name": "name",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Workload not found",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Stop failed",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
         }
     },
     "definitions": {
@@ -424,13 +506,51 @@ const docTemplate = `{
         "agent.HealthResponse": {
             "type": "object",
             "properties": {
+                "healthy": {
+                    "type": "boolean",
+                    "example": true
+                },
                 "id": {
                     "type": "string",
                     "example": "abc123def456"
                 },
-                "status": {
+                "mesh_ip": {
                     "type": "string",
-                    "example": "ok"
+                    "example": "10.100.42.1"
+                },
+                "name": {
+                    "type": "string",
+                    "example": "node1"
+                },
+                "public_ip": {
+                    "type": "string",
+                    "example": "203.0.113.1"
+                },
+                "timestamp": {
+                    "type": "string",
+                    "example": "2024-01-02T15:04:05Z"
+                },
+                "warp_ip": {
+                    "type": "string",
+                    "example": "100.96.0.5"
+                },
+                "wireguard_mode": {
+                    "type": "string",
+                    "example": "kernel"
+                },
+                "workloads_local": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "nginx:10.100.50.1:running",
+                        "redis:10.100.50.2:stopped"
+                    ]
+                },
+                "workloads_total": {
+                    "type": "integer",
+                    "example": 5
                 }
             }
         },

@@ -89,6 +89,53 @@ type ErrorResponse struct {
 
 // HealthResponse represents a health check response
 type HealthResponse struct {
-	Status string `json:"status" example:"ok"`
-	ID     string `json:"id" example:"abc123def456"`
+	Status         string            `json:"status" example:"healthy"` // "healthy", "medium", or "full"
+	ID             string            `json:"id" example:"abc123def456"`
+	Name           string            `json:"name" example:"node1"`
+	MeshIP         string            `json:"mesh_ip" example:"10.100.42.1"`
+	PublicIP       string            `json:"public_ip" example:"203.0.113.1"`
+	Timestamp      string            `json:"timestamp" example:"2024-01-02T15:04:05Z"`
+	WorkloadsLocal []string          `json:"workloads_local" example:"nginx:10.100.50.1:running,redis:10.100.50.2:stopped"`
+	WorkloadsTotal int               `json:"workloads_total" example:"5"`
+	WireguardMode  string            `json:"wireguard_mode" example:"kernel"`
+	WarpIP         string            `json:"warp_ip,omitempty" example:"100.96.0.5"`
+	System         map[string]string `json:"system"` // CPU, memory, disk stats, uptime
+}
+
+// WorkloadActionResponse represents start/stop response
+type WorkloadActionResponse struct {
+	Status string `json:"status" example:"started"`
+	Name   string `json:"name" example:"nginx"`
+}
+
+// WorkloadDetailResponse represents enriched workload details with container info
+type WorkloadDetailResponse struct {
+	Name       string          `json:"name" example:"nginx"`
+	MeshIP     string          `json:"mesh_ip" example:"10.100.50.1"`
+	Compose    string          `json:"compose"`
+	Revive     bool            `json:"revive" example:"true"`
+	Autostart  bool            `json:"autostart" example:"true"`
+	Owner      string          `json:"owner" example:"abc123def456"`
+	Version    int64           `json:"version" example:"1704067200"`
+	IsLocal    bool            `json:"is_local" example:"true"`
+	Containers []ContainerInfo `json:"containers,omitempty"`
+}
+
+// ContainerInfo represents Docker container runtime information
+type ContainerInfo struct {
+	ID            string   `json:"id" example:"abc123def456"`
+	Name          string   `json:"name" example:"jetty_nginx-web-1"`
+	Image         string   `json:"image" example:"nginx:alpine"`
+	Status        string   `json:"status" example:"running"`
+	Running       bool     `json:"running" example:"true"`
+	StartedAt     string   `json:"started_at,omitempty" example:"2024-01-02T15:04:05Z"`
+	Uptime        string   `json:"uptime,omitempty" example:"2h30m15s"`
+	FinishedAt    string   `json:"finished_at,omitempty" example:"2024-01-02T15:04:05Z"`
+	ExitCode      int      `json:"exit_code,omitempty" example:"0"`
+	Health        string   `json:"health,omitempty" example:"healthy"`
+	Networks      []string `json:"networks,omitempty" example:"bridge:172.17.0.2"`
+	Ports         []string `json:"ports,omitempty" example:"80/tcp"`
+	CPUPercent    string   `json:"cpu_percent,omitempty" example:"0.50%"`
+	MemoryUsage   string   `json:"memory_usage,omitempty" example:"15MiB / 1.94GiB"`
+	MemoryPercent string   `json:"memory_percent,omitempty" example:"0.75%"`
 }

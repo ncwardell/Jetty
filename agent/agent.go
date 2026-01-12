@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -80,7 +81,8 @@ type State struct {
 	Peers     map[string]*Peer     `json:"peers"`     // ID -> Peer
 	Workloads map[string]*Workload `json:"workloads"` // MeshIP -> Workload
 	Tokens    map[string]*Token    `json:"tokens"`
-	CFToken   string               `json:"cf_token,omitempty"` // Cloudflare tunnel token (shared cluster-wide)
+	CFToken   string               `json:"cf_token,omitempty"`   // Cloudflare tunnel token (shared cluster-wide)
+	WarpToken string               `json:"warp_token,omitempty"` // Cloudflare WARP connector token (shared cluster-wide)
 }
 
 // =============================================================================
@@ -126,6 +128,9 @@ type Agent struct {
 	cfMu     sync.Mutex
 	cfStopCh chan struct{}
 
+	// Runtime
+	startTime time.Time // When Jetty started (for uptime tracking)
+
 	// WebSocket WireGuard tunnel (for tunnel-only mode)
 	wgRelays     map[string]*udpRelay // peerID -> local UDP relay
 	wgRelaysMu   sync.RWMutex
@@ -164,7 +169,8 @@ func New() (*Agent, error) {
 			Peers:     make(map[string]*Peer),
 			Workloads: make(map[string]*Workload),
 			Tokens:    make(map[string]*Token),
-			CFToken:   getEnv("JETTY_CF_TOKEN", ""), // Bootstrap tunnel token
+			CFToken:   getEnv("JETTY_CF_TOKEN", ""),            // Bootstrap tunnel token
+			WarpToken: getEnv("JETTY_WARP_CONNECTOR_TOKEN", ""), // Bootstrap WARP connector token
 		},
 		wgRelays:    make(map[string]*udpRelay),
 		wgRelayBase: 51821, // Start relay ports from 51821
@@ -180,6 +186,9 @@ func New() (*Agent, error) {
 }
 
 func (a *Agent) Start() error {
+	// Record start time for uptime tracking
+	a.startTime = time.Now()
+
 	// Detect WARP IP if WARP is enabled
 	a.detectWarpIP()
 
@@ -627,6 +636,7 @@ func (a *Agent) joinCluster() error {
 		Peers     []*Peer     `json:"peers"`
 		Workloads []*Workload `json:"workloads"`
 		CFToken   string      `json:"cf_token,omitempty"`
+		WarpToken string      `json:"warp_token,omitempty"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return fmt.Errorf("decode join response: %w", err)
@@ -639,9 +649,12 @@ func (a *Agent) joinCluster() error {
 	for _, w := range result.Workloads {
 		a.state.Workloads[w.MeshIP] = w
 	}
-	// Store the CF token received from the cluster
+	// Store tokens received from the cluster
 	if result.CFToken != "" {
 		a.state.CFToken = result.CFToken
+	}
+	if result.WarpToken != "" {
+		a.state.WarpToken = result.WarpToken
 	}
 	a.stateMu.Unlock()
 
@@ -655,13 +668,61 @@ func (a *Agent) joinCluster() error {
 		}
 	}
 
-	log.Printf("Joined: %d peers, %d workloads, tunnel=%v", len(result.Peers), len(result.Workloads), result.CFToken != "")
+	log.Printf("Joined: %d peers, %d workloads, tunnel=%v, warp=%v",
+		len(result.Peers), len(result.Workloads), result.CFToken != "", result.WarpToken != "")
 	return nil
 }
 
 // =============================================================================
 // API
 // =============================================================================
+
+// apiKeyMiddleware checks for valid API key on protected endpoints.
+// The API key is the cluster secret (JETTY_SECRET).
+func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip authentication if no secret is configured
+		if a.clusterSecret == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Public endpoints that don't require API key
+		publicPaths := []string{
+			"/api/health",      // Monitoring
+			"/api/join",        // Node joining (uses token + secret in body)
+			"/api/sync",        // Internal cluster sync (uses secret in body)
+			"/api/peer-announce", // Internal peer announcement
+			"/api/heartbeat",   // Internal heartbeat
+			"/api/tunnel/sync", // Internal tunnel sync
+			"/api/token/sync",  // Internal token sync
+			"/api/ws/wg",       // WireGuard WebSocket tunnel
+			"/api/wg/packet",   // WireGuard HTTP tunnel
+			"/swagger/",        // API documentation
+		}
+
+		path := r.URL.Path
+		for _, p := range publicPaths {
+			if strings.HasPrefix(path, p) {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		// Check API key from header or query param
+		apiKey := r.Header.Get("X-API-Key")
+		if apiKey == "" {
+			apiKey = r.URL.Query().Get("api_key")
+		}
+
+		if apiKey != a.clusterSecret {
+			http.Error(w, "unauthorized: invalid or missing API key", http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
 
 func (a *Agent) runAPI() {
 	r := mux.NewRouter()
@@ -673,6 +734,8 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/workloads/{name}", a.apiDeleteWorkload).Methods("DELETE")
 	r.HandleFunc("/api/workloads/{name}/move", a.apiMoveWorkload).Methods("POST")
 	r.HandleFunc("/api/workloads/{name}/logs", a.apiWorkloadLogs).Methods("GET")
+	r.HandleFunc("/api/workloads/{name}/start", a.apiStartWorkload).Methods("POST")
+	r.HandleFunc("/api/workloads/{name}/stop", a.apiStopWorkload).Methods("POST")
 	r.HandleFunc("/api/token", a.apiCreateToken).Methods("POST", "GET")
 	r.HandleFunc("/api/join", a.apiJoin).Methods("POST")
 	r.HandleFunc("/api/health", a.apiHealth).Methods("GET")
@@ -685,15 +748,18 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 	r.HandleFunc("/api/heartbeat", a.apiHeartbeat).Methods("POST")
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)
-	r.HandleFunc("/api/ws/wg", a.wsWireGuard)                      // WebSocket endpoint for WG packets
+	r.HandleFunc("/api/ws/wg", a.wsWireGuard)                     // WebSocket endpoint for WG packets
 	r.HandleFunc("/api/wg/packet", a.apiWGPacket).Methods("POST") // HTTP fallback for WG packets
 
 	// Swagger UI
 	r.PathPrefix("/swagger/").Handler(httpSwagger.WrapHandler)
 
+	// Wrap router with API key middleware
+	handler := a.apiKeyMiddleware(r)
+
 	addr := fmt.Sprintf(":%d", a.apiPort)
-	log.Printf("API on %s", addr)
-	http.ListenAndServe(addr, r)
+	log.Printf("API on %s (auth=%v)", addr, a.clusterSecret != "")
+	http.ListenAndServe(addr, handler)
 }
 
 // apiStatus godoc
@@ -846,9 +912,14 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 
 	a.stateMu.RLock()
 	var found *Workload
+	var ownerPeer *Peer
 	for _, wl := range a.state.Workloads {
 		if wl.Name == name {
 			found = wl
+			// Find the owner peer if not local
+			if wl.Owner != a.hwid {
+				ownerPeer = a.state.Peers[wl.Owner]
+			}
 			break
 		}
 	}
@@ -859,8 +930,182 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If workload is remote, proxy the request to the owner node
+	if found.Owner != a.hwid {
+		if ownerPeer == nil || !ownerPeer.Healthy {
+			// Owner not reachable, return basic info without container details
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"name":       found.Name,
+				"mesh_ip":    found.MeshIP,
+				"compose":    found.Compose,
+				"revive":     found.Revive,
+				"autostart":  found.Autostart,
+				"owner":      found.Owner,
+				"version":    found.Version,
+				"is_local":   false,
+				"owner_node": ownerPeer.Name,
+				"error":      "owner node unreachable",
+			})
+			return
+		}
+
+		// Proxy request to owner
+		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"name":       found.Name,
+				"mesh_ip":    found.MeshIP,
+				"compose":    found.Compose,
+				"revive":     found.Revive,
+				"autostart":  found.Autostart,
+				"owner":      found.Owner,
+				"version":    found.Version,
+				"is_local":   false,
+				"owner_node": ownerPeer.Name,
+				"error":      fmt.Sprintf("failed to reach owner: %v", err),
+			})
+			return
+		}
+		defer resp.Body.Close()
+
+		// Forward the response from owner
+		w.Header().Set("Content-Type", "application/json")
+		body, _ := io.ReadAll(resp.Body)
+
+		// Parse and add owner_node field
+		var remoteResp map[string]interface{}
+		if err := json.Unmarshal(body, &remoteResp); err == nil {
+			remoteResp["owner_node"] = ownerPeer.Name
+			remoteResp["is_local"] = false // Override since we proxied
+			json.NewEncoder(w).Encode(remoteResp)
+		} else {
+			w.Write(body)
+		}
+		return
+	}
+
+	// Build enriched response with Docker info for local workload
+	response := map[string]interface{}{
+		"name":      found.Name,
+		"mesh_ip":   found.MeshIP,
+		"compose":   found.Compose,
+		"revive":    found.Revive,
+		"autostart": found.Autostart,
+		"owner":     found.Owner,
+		"version":   found.Version,
+		"is_local":  true,
+	}
+
+	containerInfo := a.getContainerInfo(found.Name)
+	response["containers"] = containerInfo
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(found)
+	json.NewEncoder(w).Encode(response)
+}
+
+// getContainerInfo retrieves Docker container details for a workload
+func (a *Agent) getContainerInfo(workloadName string) []map[string]interface{} {
+	var containers []map[string]interface{}
+
+	// Get container IDs for this project
+	out, err := exec.Command("docker", "ps", "-a", "-q", "-f", "label=com.docker.compose.project=jetty_"+workloadName).Output()
+	if err != nil || len(out) == 0 {
+		return containers
+	}
+
+	containerIDs := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, containerID := range containerIDs {
+		if containerID == "" {
+			continue
+		}
+
+		// Get detailed container info using docker inspect
+		inspectOut, err := exec.Command("docker", "inspect", "--format", `{{json .}}`, containerID).Output()
+		if err != nil {
+			continue
+		}
+
+		var inspectData map[string]interface{}
+		if err := json.Unmarshal(inspectOut, &inspectData); err != nil {
+			continue
+		}
+
+		info := make(map[string]interface{})
+		info["id"] = containerID[:12] // Short ID
+
+		// Extract container name
+		if name, ok := inspectData["Name"].(string); ok {
+			info["name"] = strings.TrimPrefix(name, "/")
+		}
+
+		// Extract state info
+		if state, ok := inspectData["State"].(map[string]interface{}); ok {
+			info["status"] = state["Status"]
+			info["running"] = state["Running"]
+			if startedAt, ok := state["StartedAt"].(string); ok && startedAt != "0001-01-01T00:00:00Z" {
+				if t, err := time.Parse(time.RFC3339Nano, startedAt); err == nil {
+					info["started_at"] = t.Format(time.RFC3339)
+					info["uptime"] = time.Since(t).Round(time.Second).String()
+				}
+			}
+			if finishedAt, ok := state["FinishedAt"].(string); ok && finishedAt != "0001-01-01T00:00:00Z" {
+				if t, err := time.Parse(time.RFC3339Nano, finishedAt); err == nil && !t.IsZero() {
+					info["finished_at"] = t.Format(time.RFC3339)
+				}
+			}
+			if exitCode, ok := state["ExitCode"].(float64); ok {
+				info["exit_code"] = int(exitCode)
+			}
+			if health, ok := state["Health"].(map[string]interface{}); ok {
+				info["health"] = health["Status"]
+			}
+		}
+
+		// Extract image info
+		if config, ok := inspectData["Config"].(map[string]interface{}); ok {
+			info["image"] = config["Image"]
+		}
+
+		// Extract network info
+		if netSettings, ok := inspectData["NetworkSettings"].(map[string]interface{}); ok {
+			if networks, ok := netSettings["Networks"].(map[string]interface{}); ok {
+				var ips []string
+				for netName, netData := range networks {
+					if netInfo, ok := netData.(map[string]interface{}); ok {
+						if ip, ok := netInfo["IPAddress"].(string); ok && ip != "" {
+							ips = append(ips, fmt.Sprintf("%s:%s", netName, ip))
+						}
+					}
+				}
+				info["networks"] = ips
+			}
+			if ports, ok := netSettings["Ports"].(map[string]interface{}); ok {
+				var portList []string
+				for port := range ports {
+					portList = append(portList, port)
+				}
+				info["ports"] = portList
+			}
+		}
+
+		// Get resource usage using docker stats (quick snapshot)
+		statsOut, _ := exec.Command("docker", "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}", containerID).Output()
+		if len(statsOut) > 0 {
+			parts := strings.Split(strings.TrimSpace(string(statsOut)), "|")
+			if len(parts) == 3 {
+				info["cpu_percent"] = strings.TrimSpace(parts[0])
+				info["memory_usage"] = strings.TrimSpace(parts[1])
+				info["memory_percent"] = strings.TrimSpace(parts[2])
+			}
+		}
+
+		containers = append(containers, info)
+	}
+
+	return containers
 }
 
 // apiDeleteWorkload godoc
@@ -1020,6 +1265,86 @@ func (a *Agent) apiWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(out))
 }
 
+// apiStartWorkload godoc
+// @Summary Start a stopped workload
+// @Description Starts the containers for a workload that was previously stopped
+// @Tags workloads
+// @Param name path string true "Workload name"
+// @Success 200 {object} map[string]string
+// @Failure 404 {object} ErrorResponse "Workload not found"
+// @Failure 500 {object} ErrorResponse "Start failed"
+// @Router /workloads/{name}/start [post]
+func (a *Agent) apiStartWorkload(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+
+	a.stateMu.RLock()
+	var found *Workload
+	for _, wl := range a.state.Workloads {
+		if wl.Name == name && wl.Owner == a.hwid {
+			found = wl
+			break
+		}
+	}
+	a.stateMu.RUnlock()
+
+	if found == nil {
+		http.Error(w, "not found or not local", 404)
+		return
+	}
+
+	if out, err := a.composeCmd(found.Name, "start"); err != nil {
+		http.Error(w, fmt.Sprintf("start failed: %s", out), 500)
+		return
+	}
+
+	// Re-setup mesh IP routing (container IP may have changed)
+	a.setupWorkloadIP(found)
+
+	log.Printf("Started workload: %s", found.Name)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "started", "name": found.Name})
+}
+
+// apiStopWorkload godoc
+// @Summary Stop a running workload
+// @Description Stops the containers for a workload without removing them
+// @Tags workloads
+// @Param name path string true "Workload name"
+// @Success 200 {object} map[string]string
+// @Failure 404 {object} ErrorResponse "Workload not found"
+// @Failure 500 {object} ErrorResponse "Stop failed"
+// @Router /workloads/{name}/stop [post]
+func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+
+	a.stateMu.RLock()
+	var found *Workload
+	for _, wl := range a.state.Workloads {
+		if wl.Name == name && wl.Owner == a.hwid {
+			found = wl
+			break
+		}
+	}
+	a.stateMu.RUnlock()
+
+	if found == nil {
+		http.Error(w, "not found or not local", 404)
+		return
+	}
+
+	// Clean up iptables before stopping (need container IP)
+	a.cleanupWorkloadIP(found)
+
+	if out, err := a.composeCmd(found.Name, "stop"); err != nil {
+		http.Error(w, fmt.Sprintf("stop failed: %s", out), 500)
+		return
+	}
+
+	log.Printf("Stopped workload: %s", found.Name)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "stopped", "name": found.Name})
+}
+
 // apiCreateToken godoc
 // @Summary Create join token
 // @Description Generates a new single-use token for joining the cluster (expires in 24h)
@@ -1155,6 +1480,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		allWorkloads = append(allWorkloads, w)
 	}
 	cfToken := a.state.CFToken
+	warpToken := a.state.WarpToken
 	a.stateMu.Unlock()
 
 	a.addWGPeer(peer)
@@ -1174,6 +1500,11 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		resp["cf_token"] = cfToken
 	}
 
+	// Include WARP connector token so new peer can join WARP network
+	if warpToken != "" {
+		resp["warp_token"] = warpToken
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 
@@ -1188,12 +1519,240 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} HealthResponse
 // @Router /health [get]
 func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
+	// Count workloads
+	a.stateMu.RLock()
+	var localWorkloads []string
+	var totalWorkloads int
+	for _, wl := range a.state.Workloads {
+		totalWorkloads++
+		if wl.Owner == a.hwid {
+			// Check if container is running
+			out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
+			status := "stopped"
+			if len(strings.TrimSpace(string(out))) > 0 {
+				status = "running"
+			}
+			localWorkloads = append(localWorkloads, fmt.Sprintf("%s:%s:%s", wl.Name, wl.MeshIP, status))
+		}
+	}
+	a.stateMu.RUnlock()
+
+	// Get system stats
+	systemStats := a.getSystemStats()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"healthy": true,
-		"id":      a.hwid,
-		"name":    a.hostname,
+		"status":          getHealthStatus(),
+		"id":              a.hwid,
+		"name":            a.hostname,
+		"mesh_ip":         a.meshIP,
+		"public_ip":       getPublicIP(),
+		"timestamp":       time.Now().UTC().Format(time.RFC3339),
+		"workloads_local": localWorkloads,
+		"workloads_total": totalWorkloads,
+		"wireguard_mode":  func() string { if a.wgDisabled { return "dummy" } else { return "kernel" } }(),
+		"warp_ip":         a.warpIP,
+		"system":          systemStats,
 	})
+}
+
+// getSystemStats returns CPU, memory, and disk statistics for the node
+func (a *Agent) getSystemStats() map[string]interface{} {
+	stats := make(map[string]interface{})
+
+	// Get memory info from /proc/meminfo
+	if memInfo, err := os.ReadFile("/proc/meminfo"); err == nil {
+		var memTotal, memAvail, memFree, buffers, cached uint64
+		lines := strings.Split(string(memInfo), "\n")
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			value, _ := strconv.ParseUint(fields[1], 10, 64)
+			switch fields[0] {
+			case "MemTotal:":
+				memTotal = value * 1024 // Convert KB to bytes
+			case "MemAvailable:":
+				memAvail = value * 1024
+			case "MemFree:":
+				memFree = value * 1024
+			case "Buffers:":
+				buffers = value * 1024
+			case "Cached:":
+				cached = value * 1024
+			}
+		}
+		memUsed := memTotal - memAvail
+		if memAvail == 0 {
+			// Fallback for older kernels without MemAvailable
+			memUsed = memTotal - memFree - buffers - cached
+		}
+		stats["memory_total"] = formatBytes(memTotal)
+		stats["memory_used"] = formatBytes(memUsed)
+		stats["memory_available"] = formatBytes(memAvail)
+		if memTotal > 0 {
+			stats["memory_percent"] = fmt.Sprintf("%.1f%%", float64(memUsed)/float64(memTotal)*100)
+		}
+	}
+
+	// Get CPU usage from /proc/stat (calculate over a brief interval)
+	getCPUTimes := func() (idle, total uint64) {
+		if data, err := os.ReadFile("/proc/stat"); err == nil {
+			lines := strings.Split(string(data), "\n")
+			if len(lines) > 0 && strings.HasPrefix(lines[0], "cpu ") {
+				fields := strings.Fields(lines[0])
+				if len(fields) >= 5 {
+					var sum uint64
+					for i := 1; i < len(fields); i++ {
+						val, _ := strconv.ParseUint(fields[i], 10, 64)
+						sum += val
+						if i == 4 { // idle is 4th field (index 4)
+							idle = val
+						}
+					}
+					total = sum
+				}
+			}
+		}
+		return
+	}
+
+	idle1, total1 := getCPUTimes()
+	time.Sleep(100 * time.Millisecond) // Brief sample period
+	idle2, total2 := getCPUTimes()
+
+	if total2 > total1 {
+		idleDelta := float64(idle2 - idle1)
+		totalDelta := float64(total2 - total1)
+		cpuPercent := (1.0 - idleDelta/totalDelta) * 100
+		stats["cpu_percent"] = fmt.Sprintf("%.1f%%", cpuPercent)
+	}
+
+	// Get load average
+	if loadAvg, err := os.ReadFile("/proc/loadavg"); err == nil {
+		fields := strings.Fields(string(loadAvg))
+		if len(fields) >= 3 {
+			stats["load_average"] = fmt.Sprintf("%s %s %s", fields[0], fields[1], fields[2])
+		}
+	}
+
+	// Get disk usage for /data
+	if out, err := exec.Command("df", "-B1", a.dataDir).Output(); err == nil {
+		lines := strings.Split(string(out), "\n")
+		if len(lines) >= 2 {
+			fields := strings.Fields(lines[1])
+			if len(fields) >= 5 {
+				total, _ := strconv.ParseUint(fields[1], 10, 64)
+				used, _ := strconv.ParseUint(fields[2], 10, 64)
+				avail, _ := strconv.ParseUint(fields[3], 10, 64)
+				stats["disk_total"] = formatBytes(total)
+				stats["disk_used"] = formatBytes(used)
+				stats["disk_available"] = formatBytes(avail)
+				stats["disk_percent"] = fields[4]
+			}
+		}
+	}
+
+	// Get Jetty uptime (not system uptime)
+	stats["uptime"] = time.Since(a.startTime).Round(time.Second).String()
+
+	return stats
+}
+
+// formatBytes converts bytes to human-readable format
+func formatBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// getHealthStatus returns "healthy", "medium", or "full" based on resource usage
+// healthy: CPU < 50% and memory < 60%
+// medium: CPU 50-80% or memory 60-85%
+// full: CPU > 80% or memory > 85%
+func getHealthStatus() string {
+	var memPercent, cpuPercent float64
+
+	// Get memory percentage
+	if memInfo, err := os.ReadFile("/proc/meminfo"); err == nil {
+		var memTotal, memAvail, memFree, buffers, cached uint64
+		lines := strings.Split(string(memInfo), "\n")
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			value, _ := strconv.ParseUint(fields[1], 10, 64)
+			switch fields[0] {
+			case "MemTotal:":
+				memTotal = value
+			case "MemAvailable:":
+				memAvail = value
+			case "MemFree:":
+				memFree = value
+			case "Buffers:":
+				buffers = value
+			case "Cached:":
+				cached = value
+			}
+		}
+		memUsed := memTotal - memAvail
+		if memAvail == 0 {
+			memUsed = memTotal - memFree - buffers - cached
+		}
+		if memTotal > 0 {
+			memPercent = float64(memUsed) / float64(memTotal) * 100
+		}
+	}
+
+	// Get CPU percentage (quick sample)
+	getCPUTimes := func() (idle, total uint64) {
+		if data, err := os.ReadFile("/proc/stat"); err == nil {
+			lines := strings.Split(string(data), "\n")
+			if len(lines) > 0 && strings.HasPrefix(lines[0], "cpu ") {
+				fields := strings.Fields(lines[0])
+				if len(fields) >= 5 {
+					var sum uint64
+					for i := 1; i < len(fields); i++ {
+						val, _ := strconv.ParseUint(fields[i], 10, 64)
+						sum += val
+						if i == 4 {
+							idle = val
+						}
+					}
+					total = sum
+				}
+			}
+		}
+		return
+	}
+
+	idle1, total1 := getCPUTimes()
+	time.Sleep(50 * time.Millisecond) // Brief sample
+	idle2, total2 := getCPUTimes()
+
+	if total2 > total1 {
+		idleDelta := float64(idle2 - idle1)
+		totalDelta := float64(total2 - total1)
+		cpuPercent = (1.0 - idleDelta/totalDelta) * 100
+	}
+
+	// Determine status
+	if cpuPercent > 80 || memPercent > 85 {
+		return "full"
+	}
+	if cpuPercent >= 50 || memPercent >= 60 {
+		return "medium"
+	}
+	return "healthy"
 }
 
 func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {

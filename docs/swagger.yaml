@@ -8,12 +8,40 @@ definitions:
     type: object
   agent.HealthResponse:
     properties:
+      healthy:
+        example: true
+        type: boolean
       id:
         example: abc123def456
         type: string
-      status:
-        example: ok
+      mesh_ip:
+        example: 10.100.42.1
         type: string
+      name:
+        example: node1
+        type: string
+      public_ip:
+        example: 203.0.113.1
+        type: string
+      timestamp:
+        example: "2024-01-02T15:04:05Z"
+        type: string
+      warp_ip:
+        example: 100.96.0.5
+        type: string
+      wireguard_mode:
+        example: kernel
+        type: string
+      workloads_local:
+        example:
+        - nginx:10.100.50.1:running
+        - redis:10.100.50.2:stopped
+        items:
+          type: string
+        type: array
+      workloads_total:
+        example: 5
+        type: integer
     type: object
   agent.JoinRequest:
     properties:
@@ -469,6 +497,60 @@ paths:
           schema:
             $ref: '#/definitions/agent.ErrorResponse'
       summary: Move workload to another node
+      tags:
+      - workloads
+  /workloads/{name}/start:
+    post:
+      description: Starts the containers for a workload that was previously stopped
+      parameters:
+      - description: Workload name
+        in: path
+        name: name
+        required: true
+        type: string
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Workload not found
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "500":
+          description: Start failed
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Start a stopped workload
+      tags:
+      - workloads
+  /workloads/{name}/stop:
+    post:
+      description: Stops the containers for a workload without removing them
+      parameters:
+      - description: Workload name
+        in: path
+        name: name
+        required: true
+        type: string
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Workload not found
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "500":
+          description: Stop failed
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Stop a running workload
       tags:
       - workloads
 schemes:
