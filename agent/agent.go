@@ -277,6 +277,7 @@ func (a *Agent) detectWarpIP() {
 }
 
 func (a *Agent) Stop() {
+	log.Printf("Shutting down Jetty...")
 	close(a.stopCh)
 	a.stopCloudflared()
 	a.stopUDPRelays()
@@ -284,7 +285,43 @@ func (a *Agent) Stop() {
 		a.wgLocalConn.Close()
 	}
 	a.saveState()
-	exec.Command("ip", "link", "del", "jetty0").Run()
+
+	// Clean up network resources
+	a.cleanupNetwork()
+}
+
+// cleanupNetwork removes all Jetty-created network resources
+func (a *Agent) cleanupNetwork() {
+	log.Printf("Cleaning up network resources...")
+
+	// Clean up iptables rules for all workloads
+	a.stateMu.RLock()
+	for _, wl := range a.state.Workloads {
+		if wl.Owner == a.hwid {
+			// Find container IP and remove DNAT rules
+			out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
+			if len(out) > 0 {
+				containerID := strings.Split(strings.TrimSpace(string(out)), "\n")[0]
+				if containerID != "" {
+					out, _ = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID).Output()
+					containerIP := strings.TrimSpace(string(out))
+					if containerIP != "" {
+						exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-d", wl.MeshIP, "-j", "DNAT", "--to", containerIP).Run()
+						exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-d", wl.MeshIP, "-j", "DNAT", "--to", containerIP).Run()
+						log.Printf("Removed iptables rules for %s (%s -> %s)", wl.Name, wl.MeshIP, containerIP)
+					}
+				}
+			}
+		}
+	}
+	a.stateMu.RUnlock()
+
+	// Remove jetty0 interface (this also removes all IPs bound to it)
+	if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
+		log.Printf("Warning: could not remove jetty0 interface: %v", err)
+	} else {
+		log.Printf("Removed jetty0 interface")
+	}
 }
 
 // =============================================================================
