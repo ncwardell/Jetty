@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1408,6 +1409,9 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	a.stateMu.RUnlock()
 
+	// Get system stats
+	systemStats := a.getSystemStats()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"healthy":         true,
@@ -1420,7 +1424,133 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 		"workloads_total": totalWorkloads,
 		"wireguard_mode":  func() string { if a.wgDisabled { return "dummy" } else { return "kernel" } }(),
 		"warp_ip":         a.warpIP,
+		"system":          systemStats,
 	})
+}
+
+// getSystemStats returns CPU, memory, and disk statistics for the node
+func (a *Agent) getSystemStats() map[string]interface{} {
+	stats := make(map[string]interface{})
+
+	// Get memory info from /proc/meminfo
+	if memInfo, err := os.ReadFile("/proc/meminfo"); err == nil {
+		var memTotal, memAvail, memFree, buffers, cached uint64
+		lines := strings.Split(string(memInfo), "\n")
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			value, _ := strconv.ParseUint(fields[1], 10, 64)
+			switch fields[0] {
+			case "MemTotal:":
+				memTotal = value * 1024 // Convert KB to bytes
+			case "MemAvailable:":
+				memAvail = value * 1024
+			case "MemFree:":
+				memFree = value * 1024
+			case "Buffers:":
+				buffers = value * 1024
+			case "Cached:":
+				cached = value * 1024
+			}
+		}
+		memUsed := memTotal - memAvail
+		if memAvail == 0 {
+			// Fallback for older kernels without MemAvailable
+			memUsed = memTotal - memFree - buffers - cached
+		}
+		stats["memory_total"] = formatBytes(memTotal)
+		stats["memory_used"] = formatBytes(memUsed)
+		stats["memory_available"] = formatBytes(memAvail)
+		if memTotal > 0 {
+			stats["memory_percent"] = fmt.Sprintf("%.1f%%", float64(memUsed)/float64(memTotal)*100)
+		}
+	}
+
+	// Get CPU usage from /proc/stat (calculate over a brief interval)
+	getCPUTimes := func() (idle, total uint64) {
+		if data, err := os.ReadFile("/proc/stat"); err == nil {
+			lines := strings.Split(string(data), "\n")
+			if len(lines) > 0 && strings.HasPrefix(lines[0], "cpu ") {
+				fields := strings.Fields(lines[0])
+				if len(fields) >= 5 {
+					var sum uint64
+					for i := 1; i < len(fields); i++ {
+						val, _ := strconv.ParseUint(fields[i], 10, 64)
+						sum += val
+						if i == 4 { // idle is 4th field (index 4)
+							idle = val
+						}
+					}
+					total = sum
+				}
+			}
+		}
+		return
+	}
+
+	idle1, total1 := getCPUTimes()
+	time.Sleep(100 * time.Millisecond) // Brief sample period
+	idle2, total2 := getCPUTimes()
+
+	if total2 > total1 {
+		idleDelta := float64(idle2 - idle1)
+		totalDelta := float64(total2 - total1)
+		cpuPercent := (1.0 - idleDelta/totalDelta) * 100
+		stats["cpu_percent"] = fmt.Sprintf("%.1f%%", cpuPercent)
+	}
+
+	// Get load average
+	if loadAvg, err := os.ReadFile("/proc/loadavg"); err == nil {
+		fields := strings.Fields(string(loadAvg))
+		if len(fields) >= 3 {
+			stats["load_average"] = fmt.Sprintf("%s %s %s", fields[0], fields[1], fields[2])
+		}
+	}
+
+	// Get disk usage for /data
+	if out, err := exec.Command("df", "-B1", a.dataDir).Output(); err == nil {
+		lines := strings.Split(string(out), "\n")
+		if len(lines) >= 2 {
+			fields := strings.Fields(lines[1])
+			if len(fields) >= 5 {
+				total, _ := strconv.ParseUint(fields[1], 10, 64)
+				used, _ := strconv.ParseUint(fields[2], 10, 64)
+				avail, _ := strconv.ParseUint(fields[3], 10, 64)
+				stats["disk_total"] = formatBytes(total)
+				stats["disk_used"] = formatBytes(used)
+				stats["disk_available"] = formatBytes(avail)
+				stats["disk_percent"] = fields[4]
+			}
+		}
+	}
+
+	// Get uptime
+	if uptime, err := os.ReadFile("/proc/uptime"); err == nil {
+		fields := strings.Fields(string(uptime))
+		if len(fields) >= 1 {
+			if secs, err := strconv.ParseFloat(fields[0], 64); err == nil {
+				stats["uptime"] = (time.Duration(secs) * time.Second).Round(time.Second).String()
+			}
+		}
+	}
+
+	return stats
+}
+
+// formatBytes converts bytes to human-readable format
+func formatBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
