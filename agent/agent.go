@@ -203,9 +203,13 @@ func (a *Agent) Start() error {
 		if err := a.joinCluster(); err != nil {
 			return fmt.Errorf("join: %w", err)
 		}
+	} else {
+		// Not joining - sync state from known peers before autostart
+		// This handles the case where we restarted and workloads were revived by other nodes
+		a.syncStateOnStartup()
 	}
 
-	// Auto-start owned workloads
+	// Auto-start owned workloads (only those we still own after sync)
 	a.autostartWorkloads()
 
 	// Update hosts file
@@ -1770,6 +1774,83 @@ func (a *Agent) tunnelModeHealthCheck() {
 	}
 }
 
+// syncStateOnStartup syncs state from known peers before autostarting workloads.
+// This handles the case where we restarted and workloads were revived by other nodes.
+func (a *Agent) syncStateOnStartup() {
+	a.stateMu.RLock()
+	peerCount := len(a.state.Peers)
+	peers := make([]*Peer, 0, peerCount)
+	for _, p := range a.state.Peers {
+		peers = append(peers, p)
+	}
+	a.stateMu.RUnlock()
+
+	if peerCount == 0 {
+		log.Printf("No known peers - skipping startup sync")
+		return
+	}
+
+	log.Printf("Syncing state from %d known peer(s) before autostart...", peerCount)
+	synced := false
+
+	// Try tunnel domain first if configured
+	if a.tunnelDomain != "" {
+		url := fmt.Sprintf("https://%s/api/sync", a.tunnelDomain)
+		resp, err := httpClient.Get(url)
+		if err == nil {
+			var workloads []*Workload
+			json.NewDecoder(resp.Body).Decode(&workloads)
+			resp.Body.Close()
+
+			a.stateMu.Lock()
+			for _, w := range workloads {
+				existing := a.state.Workloads[w.MeshIP]
+				if existing == nil || w.Version > existing.Version {
+					if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
+						log.Printf("Workload %s was revived by %s while we were down", w.Name, w.Owner[:12])
+					}
+					a.state.Workloads[w.MeshIP] = w
+				}
+			}
+			a.stateMu.Unlock()
+			synced = true
+		}
+	}
+
+	// Try direct peer connections
+	for _, peer := range peers {
+		url := fmt.Sprintf("http://%s:%d/api/sync", peer.MeshIP, a.apiPort)
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			continue
+		}
+
+		var workloads []*Workload
+		json.NewDecoder(resp.Body).Decode(&workloads)
+		resp.Body.Close()
+
+		a.stateMu.Lock()
+		for _, w := range workloads {
+			existing := a.state.Workloads[w.MeshIP]
+			if existing == nil || w.Version > existing.Version {
+				if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
+					log.Printf("Workload %s was revived by %s while we were down", w.Name, w.Owner[:12])
+				}
+				a.state.Workloads[w.MeshIP] = w
+			}
+		}
+		a.stateMu.Unlock()
+		synced = true
+	}
+
+	if synced {
+		log.Printf("Startup sync complete")
+		a.saveState()
+	} else {
+		log.Printf("Warning: could not reach any peers for startup sync")
+	}
+}
+
 func (a *Agent) syncWorkloads() {
 	// In tunnel-only mode, sync through tunnel domain
 	if a.tunnelDomain != "" {
@@ -1787,6 +1868,8 @@ func (a *Agent) syncWorkloads() {
 	}
 	a.stateMu.RUnlock()
 
+	var lostOwnership []*Workload
+
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/sync", peer.MeshIP, a.apiPort)
 		resp, err := httpClient.Get(url)
@@ -1802,10 +1885,21 @@ func (a *Agent) syncWorkloads() {
 		for _, w := range workloads {
 			existing := a.state.Workloads[w.MeshIP]
 			if existing == nil || w.Version > existing.Version {
+				// Check if we lost ownership (IP collision resolution)
+				if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
+					log.Printf("Lost ownership of %s (IP %s) to %s - newer version wins", existing.Name, w.MeshIP, w.Owner[:12])
+					lostOwnership = append(lostOwnership, existing)
+				}
 				a.state.Workloads[w.MeshIP] = w
 			}
 		}
 		a.stateMu.Unlock()
+	}
+
+	// Stop workloads we lost ownership of (outside lock)
+	for _, wl := range lostOwnership {
+		log.Printf("Stopping local workload %s - ownership transferred", wl.Name)
+		a.removeWorkload(wl)
 	}
 
 	a.updateHosts()
@@ -1827,14 +1921,27 @@ func (a *Agent) tunnelModeSyncWorkloads() {
 		return
 	}
 
+	var lostOwnership []*Workload
+
 	a.stateMu.Lock()
 	for _, w := range workloads {
 		existing := a.state.Workloads[w.MeshIP]
 		if existing == nil || w.Version > existing.Version {
+			// Check if we lost ownership (IP collision resolution)
+			if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
+				log.Printf("Lost ownership of %s (IP %s) to %s - newer version wins", existing.Name, w.MeshIP, w.Owner[:12])
+				lostOwnership = append(lostOwnership, existing)
+			}
 			a.state.Workloads[w.MeshIP] = w
 		}
 	}
 	a.stateMu.Unlock()
+
+	// Stop workloads we lost ownership of (outside lock)
+	for _, wl := range lostOwnership {
+		log.Printf("Stopping local workload %s - ownership transferred", wl.Name)
+		a.removeWorkload(wl)
+	}
 
 	a.updateHosts()
 }
