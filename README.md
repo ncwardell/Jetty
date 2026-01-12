@@ -1,4 +1,6 @@
-# Jetty
+╦╔═╗╔╦╗╔╦╗╦ ╦
+     ║║╣  ║  ║ ╚╦╝
+    ╚╝╚═╝ ╩  ╩  ╩
 
 Peer-to-peer Docker Compose orchestration. Every node is equal.
 
