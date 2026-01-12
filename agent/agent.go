@@ -772,6 +772,30 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	// Broadcast token deletion to other nodes
 	go a.broadcastTokenDeletion(req.Token)
 
+	// Check for mesh IP collision before creating peer
+	a.stateMu.RLock()
+	// Check against our own IP
+	if req.MeshIP == a.meshIP {
+		a.stateMu.RUnlock()
+		http.Error(w, "mesh_ip collision with existing node", 409)
+		return
+	}
+	// Check against existing peers
+	for _, p := range a.state.Peers {
+		if p.MeshIP == req.MeshIP && p.ID != req.ID {
+			a.stateMu.RUnlock()
+			http.Error(w, "mesh_ip collision with existing node", 409)
+			return
+		}
+	}
+	// Check against workloads
+	if _, exists := a.state.Workloads[req.MeshIP]; exists {
+		a.stateMu.RUnlock()
+		http.Error(w, "mesh_ip collision with existing workload", 409)
+		return
+	}
+	a.stateMu.RUnlock()
+
 	// Create peer
 	peer := &Peer{
 		ID:        req.ID,
@@ -1418,7 +1442,19 @@ func (a *Agent) saveState() {
 	data, _ := json.MarshalIndent(a.state, "", "  ")
 	a.stateMu.RUnlock()
 
-	os.WriteFile(filepath.Join(a.dataDir, "state.json"), data, 0644)
+	// Atomic write: write to temp file then rename
+	statePath := filepath.Join(a.dataDir, "state.json")
+	tempPath := statePath + ".tmp"
+
+	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+		log.Printf("Failed to write state: %v", err)
+		return
+	}
+
+	if err := os.Rename(tempPath, statePath); err != nil {
+		log.Printf("Failed to rename state file: %v", err)
+		os.Remove(tempPath) // Clean up temp file
+	}
 }
 
 func (a *Agent) loadState() {
@@ -1625,12 +1661,31 @@ func getHostname() string {
 }
 
 func getPublicIP() string {
-	c, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "127.0.0.1"
+	// Allow override via environment variable (useful in containers)
+	if ip := os.Getenv("JETTY_PUBLIC_IP"); ip != "" {
+		return ip
 	}
-	defer c.Close()
-	return c.LocalAddr().(*net.UDPAddr).IP.String()
+
+	// Try to determine IP by dialing out
+	c, err := net.Dial("udp", "8.8.8.8:80")
+	if err == nil {
+		defer c.Close()
+		if addr, ok := c.LocalAddr().(*net.UDPAddr); ok && !addr.IP.IsLoopback() {
+			return addr.IP.String()
+		}
+	}
+
+	// Fallback: find first non-loopback interface IP
+	addrs, err := net.InterfaceAddrs()
+	if err == nil {
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+
+	return "127.0.0.1"
 }
 
 func genID() string {
