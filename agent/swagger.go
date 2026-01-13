@@ -60,6 +60,7 @@ type WorkloadResponse struct {
 	AllowedNodes []string  `json:"allowed_nodes,omitempty"`
 	Owner        OwnerInfo `json:"owner"`
 	Version      int64     `json:"version" example:"1704067200"`
+	Status       string    `json:"status" example:"running"`
 }
 
 // WorkloadDetailResponse represents enriched workload details with container info

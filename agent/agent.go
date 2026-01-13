@@ -1049,6 +1049,22 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 		AllowedNodes []string          `json:"allowed_nodes,omitempty"`
 		Owner        map[string]string `json:"owner"`
 		Version      int64             `json:"version"`
+		Status       string            `json:"status"`
+	}
+
+	// Helper to get workload status
+	getStatus := func(wl *Workload) string {
+		if wl.Owner != a.hwid {
+			return "remote" // Can't check status of remote workloads
+		}
+		out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
+		if err != nil {
+			return "unknown"
+		}
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return "running"
+		}
+		return "stopped"
 	}
 
 	var workloads []WorkloadResponse
@@ -1089,13 +1105,14 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 
 		workloads = append(workloads, WorkloadResponse{
 			Name:         wl.Name,
-			IP:       wl.IP,
+			IP:           wl.IP,
 			Compose:      wl.Compose,
 			Revive:       wl.Revive,
 			Autostart:    wl.Autostart,
 			AllowedNodes: wl.AllowedNodes,
 			Owner:        ownerInfo,
 			Version:      wl.Version,
+			Status:       getStatus(wl),
 		})
 	}
 	a.stateMu.RUnlock()
