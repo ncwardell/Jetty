@@ -2,6 +2,7 @@ package agent
 
 import (
 	"crypto/rand"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,9 @@ import (
 	"github.com/ncwardell/jetty/docs"
 	httpSwagger "github.com/swaggo/http-swagger"
 )
+
+//go:embed dashboard.html
+var dashboardHTML []byte
 
 // Shared HTTP client with timeout to prevent blocking on hung peers
 var httpClient = &http.Client{
@@ -434,23 +438,6 @@ func (a *Agent) configureWarpRuntime(token string) error {
 	}
 
 	return fmt.Errorf("WARP connection timeout")
-}
-
-// =============================================================================
-// WARP Private Network Routes
-// =============================================================================
-// NOTE: These functions are no longer used. Workload routing now uses IPIP
-// tunnels between nodes instead of Cloudflare private network routes.
-// Keeping the functions as no-ops to avoid breaking callers.
-
-// registerWarpRoute is a no-op - IPIP tunnels handle routing now.
-func (a *Agent) registerWarpRoute(meshIP string) error {
-	return nil
-}
-
-// unregisterWarpRoute is a no-op - IPIP tunnels handle routing now.
-func (a *Agent) unregisterWarpRoute(meshIP string) error {
-	return nil
 }
 
 func (a *Agent) Stop() {
@@ -1141,6 +1128,13 @@ func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 		}
 
 		path := r.URL.Path
+
+		// Dashboard root is public (exact match)
+		if path == "/" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		for _, p := range publicPaths {
 			if strings.HasPrefix(path, p) {
 				next.ServeHTTP(w, r)
@@ -1192,6 +1186,12 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 	r.HandleFunc("/api/heartbeat", a.apiHeartbeat).Methods("POST")
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)
+
+	// Dashboard UI (embedded)
+	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(dashboardHTML)
+	}).Methods("GET")
 
 	// Swagger UI
 	r.PathPrefix("/swagger/").Handler(httpSwagger.WrapHandler)
@@ -1476,11 +1476,6 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		a.stateMu.Unlock()
 		http.Error(w, err.Error(), 500)
 		return
-	}
-
-	// Register WARP route so workload is reachable via WARP
-	if err := a.registerWarpRoute(wl.IP); err != nil {
-		log.Printf("Warning: failed to register WARP route for %s: %v", wl.IP, err)
 	}
 
 	a.updateHosts()
@@ -1769,11 +1764,6 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		// Remove old deployment
 		a.removeWorkload(found)
 
-		// Unregister old WARP route
-		if foundIP != newMeshIP {
-			a.unregisterWarpRoute(foundIP)
-		}
-
 		// Deploy with new config
 		if err := a.deployWorkload(found); err != nil {
 			// Rollback on failure
@@ -1982,11 +1972,6 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 	// Remove if we're running it
 	if found.Owner == a.hwid {
 		a.removeWorkload(found)
-
-		// Unregister WARP route for this workload
-		if err := a.unregisterWarpRoute(found.IP); err != nil {
-			log.Printf("Warning: failed to unregister WARP route for %s: %v", found.IP, err)
-		}
 	}
 
 	a.updateHosts()
@@ -2078,11 +2063,6 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	// If we own it, remove locally
 	if found.Owner == a.hwid {
 		a.removeWorkload(found)
-
-		// Unregister WARP route (target has registered its own)
-		if err := a.unregisterWarpRoute(found.IP); err != nil {
-			log.Printf("Warning: failed to unregister WARP route for %s: %v", found.IP, err)
-		}
 	} else if currentOwner != nil && currentOwner.Healthy {
 		// Proxy delete to current owner
 		deleteURL := a.getPeerAPIURL(currentOwner, "/api/workloads/"+name)
@@ -3318,11 +3298,6 @@ func (a *Agent) autostartWorkloads() {
 	for _, wl := range toStart {
 		if err := a.deployWorkload(wl); err != nil {
 			log.Printf("Failed to auto-start %s: %v", wl.Name, err)
-		} else {
-			// Register WARP route for successfully started workload
-			if err := a.registerWarpRoute(wl.IP); err != nil {
-				log.Printf("Warning: failed to register WARP route for %s: %v", wl.IP, err)
-			}
 		}
 	}
 }
@@ -3905,10 +3880,6 @@ func (a *Agent) checkFailover() {
 					}
 					a.stateMu.Unlock()
 					return
-				}
-				// Register WARP route so workload is reachable via WARP
-				if err := a.registerWarpRoute(w.IP); err != nil {
-					log.Printf("Warning: failed to register WARP route for failover workload %s: %v", w.IP, err)
 				}
 				a.updateHosts()
 				a.saveState()
