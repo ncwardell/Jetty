@@ -158,7 +158,11 @@ func (a *Agent) Start() error {
 	// Detect WARP IP if WARP is enabled
 	a.detectWarpIP()
 
+	// Load state first so we can check for IP collisions
+	a.loadState()
+
 	// Init network interface (dummy interface for local mesh IP binding)
+	// This uses collision-checked IP derivation based on loaded peer state
 	if err := a.initNetwork(); err != nil {
 		return fmt.Errorf("network: %w", err)
 	}
@@ -169,9 +173,6 @@ func (a *Agent) Start() error {
 			log.Printf("Warning: failed to init WARP rules: %v", err)
 		}
 	}
-
-	// Load state
-	a.loadState()
 
 	// Join or bootstrap
 	if a.joinURL != "" {
@@ -382,8 +383,10 @@ func (a *Agent) loadOrCreateHWID() string {
 // initNetwork creates a dummy interface for local mesh IP binding.
 // WARP handles all inter-node connectivity through Cloudflare's network.
 func (a *Agent) initNetwork() error {
-	// Derive mesh IP from HWID
-	a.meshIP = a.deriveMeshIP(a.hwid)
+	// Derive mesh IP from HWID with collision checking against known peers
+	a.stateMu.RLock()
+	a.meshIP = a.deriveMeshIPWithCollisionCheck(a.hwid)
+	a.stateMu.RUnlock()
 
 	// Clean up any existing interface
 	exec.Command("ip", "link", "del", "jetty0").Run()
@@ -474,6 +477,118 @@ func (a *Agent) deriveMeshIP(id string) string {
 	return fmt.Sprintf("%d.%d.%d.%d", (ipInt>>24)&0xff, (ipInt>>16)&0xff, (ipInt>>8)&0xff, ipInt&0xff)
 }
 
+// isIPInCIDR checks if an IP address is within the mesh CIDR range.
+func (a *Agent) isIPInCIDR(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	_, network, err := net.ParseCIDR(a.meshCIDR)
+	if err != nil {
+		return false
+	}
+	return network.Contains(ip)
+}
+
+// isIPTaken checks if an IP is already used by this node, a peer, or a workload.
+// Caller must hold stateMu lock (read or write).
+func (a *Agent) isIPTaken(ipStr string) bool {
+	// Check if it's our own mesh IP
+	if ipStr == a.meshIP {
+		return true
+	}
+
+	// Check peers
+	for _, p := range a.state.Peers {
+		if p.MeshIP == ipStr {
+			return true
+		}
+	}
+
+	// Check workloads
+	if _, exists := a.state.Workloads[ipStr]; exists {
+		return true
+	}
+
+	return false
+}
+
+// allocateMeshIP finds the next available IP in the mesh CIDR for a workload.
+// Returns empty string if no IPs are available.
+// Caller must hold stateMu lock (read or write).
+func (a *Agent) allocateMeshIP() string {
+	_, network, err := net.ParseCIDR(a.meshCIDR)
+	if err != nil {
+		return ""
+	}
+
+	ones, bits := network.Mask.Size()
+	maxHosts := (1 << (bits - ones)) - 2 // Exclude network and broadcast
+
+	baseIP := network.IP.To4()
+	baseInt := int(baseIP[0])<<24 | int(baseIP[1])<<16 | int(baseIP[2])<<8 | int(baseIP[3])
+
+	// Try to find an available IP, starting from host 1
+	for host := 1; host <= maxHosts; host++ {
+		ipInt := baseInt + host
+		ipStr := fmt.Sprintf("%d.%d.%d.%d", (ipInt>>24)&0xff, (ipInt>>16)&0xff, (ipInt>>8)&0xff, ipInt&0xff)
+
+		if !a.isIPTaken(ipStr) {
+			return ipStr
+		}
+	}
+
+	return "" // No available IPs
+}
+
+// deriveMeshIPWithCollisionCheck derives a mesh IP for a node, checking for collisions.
+// If the derived IP is already taken, it tries sequential IPs until finding an available one.
+// Caller must hold stateMu lock (read or write).
+func (a *Agent) deriveMeshIPWithCollisionCheck(id string) string {
+	_, network, _ := net.ParseCIDR(a.meshCIDR)
+	if network == nil {
+		return "10.100.0.1"
+	}
+
+	// Start with hash-derived IP
+	h := 0
+	for _, c := range id {
+		h = h*31 + int(c)
+	}
+	if h < 0 {
+		h = -h
+	}
+
+	ones, bits := network.Mask.Size()
+	maxHosts := (1 << (bits - ones)) - 2
+	startHost := (h % maxHosts) + 1
+
+	baseIP := network.IP.To4()
+	baseInt := int(baseIP[0])<<24 | int(baseIP[1])<<16 | int(baseIP[2])<<8 | int(baseIP[3])
+
+	// Try the hash-derived IP first, then scan for available IPs
+	for i := 0; i < maxHosts; i++ {
+		host := ((startHost + i - 1) % maxHosts) + 1
+		ipInt := baseInt + host
+		ipStr := fmt.Sprintf("%d.%d.%d.%d", (ipInt>>24)&0xff, (ipInt>>16)&0xff, (ipInt>>8)&0xff, ipInt&0xff)
+
+		// For node IPs, only check against other peers (not our own meshIP which isn't set yet)
+		taken := false
+		for _, p := range a.state.Peers {
+			if p.MeshIP == ipStr {
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			return ipStr
+		}
+	}
+
+	// Fallback (shouldn't happen unless network is full)
+	return fmt.Sprintf("%d.%d.%d.%d", (baseInt+1)>>24&0xff, (baseInt+1)>>16&0xff, (baseInt+1)>>8&0xff, (baseInt+1)&0xff)
+}
+
 // =============================================================================
 // /etc/hosts Management
 // =============================================================================
@@ -554,66 +669,104 @@ func (a *Agent) updateHosts() {
 func (a *Agent) joinCluster() error {
 	log.Printf("Joining cluster via %s", a.joinURL)
 
-	req := map[string]string{
-		"token":       a.joinTok,
-		"secret":      a.clusterSecret,
-		"id":          a.hwid,
-		"name":        a.hostname,
-		"mesh_ip":     a.meshIP,
-		"tunnel_host": a.tunnelHost, // Our specific subdomain for direct API routing
-		"warp_ip":     a.warpIP,     // Cloudflare WARP IP for L3 connectivity
-	}
-
-	data, _ := json.Marshal(req)
-	resp, err := httpClient.Post(a.joinURL+"/api/join", "application/json", strings.NewReader(string(data)))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("join failed: %s", body)
-	}
-
-	var result struct {
-		Peers     []*Peer     `json:"peers"`
-		Workloads []*Workload `json:"workloads"`
-		CFToken   string      `json:"cf_token,omitempty"`
-		WarpToken string      `json:"warp_token,omitempty"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("decode join response: %w", err)
-	}
-
-	a.stateMu.Lock()
-	for _, p := range result.Peers {
-		a.state.Peers[p.ID] = p
-	}
-	for _, w := range result.Workloads {
-		a.state.Workloads[w.MeshIP] = w
-	}
-	// Store tokens received from the cluster
-	if result.CFToken != "" {
-		a.state.CFToken = result.CFToken
-	}
-	if result.WarpToken != "" {
-		a.state.WarpToken = result.WarpToken
-	}
-	a.stateMu.Unlock()
-
-	a.saveState()
-
-	// Start cloudflared if we received a token
-	if result.CFToken != "" {
-		if err := a.startCloudflared(); err != nil {
-			log.Printf("Warning: failed to start cloudflared: %v", err)
+	// Retry loop to handle IP collisions
+	maxRetries := 5
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		req := map[string]string{
+			"token":       a.joinTok,
+			"secret":      a.clusterSecret,
+			"id":          a.hwid,
+			"name":        a.hostname,
+			"mesh_ip":     a.meshIP,
+			"tunnel_host": a.tunnelHost, // Our specific subdomain for direct API routing
+			"warp_ip":     a.warpIP,     // Cloudflare WARP IP for L3 connectivity
 		}
+
+		data, _ := json.Marshal(req)
+		resp, err := httpClient.Post(a.joinURL+"/api/join", "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			return err
+		}
+
+		// Handle IP collision - re-derive IP and retry
+		if resp.StatusCode == http.StatusConflict {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if strings.Contains(string(body), "collision") {
+				log.Printf("Mesh IP %s collision, re-deriving...", a.meshIP)
+
+				// Mark our current IP as taken so derivation skips it
+				a.stateMu.Lock()
+				// Add a temporary "peer" to mark our IP as taken
+				tempPeer := &Peer{ID: "collision-marker", MeshIP: a.meshIP}
+				a.state.Peers["collision-marker-"+a.meshIP] = tempPeer
+				a.meshIP = a.deriveMeshIPWithCollisionCheck(a.hwid)
+				delete(a.state.Peers, "collision-marker-"+tempPeer.MeshIP)
+				a.stateMu.Unlock()
+
+				// Update network interface with new IP
+				_, network, _ := net.ParseCIDR(a.meshCIDR)
+				pfx, _ := network.Mask.Size()
+				exec.Command("ip", "addr", "flush", "dev", "jetty0").Run()
+				exec.Command("ip", "addr", "add", fmt.Sprintf("%s/%d", a.meshIP, pfx), "dev", "jetty0").Run()
+
+				log.Printf("New mesh IP: %s, retrying join...", a.meshIP)
+				continue
+			}
+			return fmt.Errorf("join failed: %s", body)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return fmt.Errorf("join failed: %s", body)
+		}
+
+		// Success - process response
+		var result struct {
+			Peers     []*Peer     `json:"peers"`
+			Workloads []*Workload `json:"workloads"`
+			CFToken   string      `json:"cf_token,omitempty"`
+			WarpToken string      `json:"warp_token,omitempty"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			return fmt.Errorf("decode join response: %w", err)
+		}
+		resp.Body.Close()
+
+		a.stateMu.Lock()
+		for _, p := range result.Peers {
+			a.state.Peers[p.ID] = p
+		}
+		for _, w := range result.Workloads {
+			a.state.Workloads[w.MeshIP] = w
+		}
+		// Store tokens received from the cluster
+		if result.CFToken != "" {
+			a.state.CFToken = result.CFToken
+		}
+		if result.WarpToken != "" {
+			a.state.WarpToken = result.WarpToken
+		}
+		a.stateMu.Unlock()
+
+		a.saveState()
+
+		// Start cloudflared if we received a token
+		if result.CFToken != "" {
+			if err := a.startCloudflared(); err != nil {
+				log.Printf("Warning: failed to start cloudflared: %v", err)
+			}
+		}
+
+		log.Printf("Joined: %d peers, %d workloads, tunnel=%v, warp=%v",
+			len(result.Peers), len(result.Workloads), result.CFToken != "", result.WarpToken != "")
+		return nil
 	}
 
-	log.Printf("Joined: %d peers, %d workloads, tunnel=%v, warp=%v",
-		len(result.Peers), len(result.Workloads), result.CFToken != "", result.WarpToken != "")
-	return nil
+	return fmt.Errorf("join failed after %d attempts due to IP collisions", maxRetries)
 }
 
 // =============================================================================
@@ -782,8 +935,8 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if wl.Name == "" || wl.MeshIP == "" || wl.Compose == "" {
-		http.Error(w, "name, mesh_ip, compose required", 400)
+	if wl.Name == "" || wl.Compose == "" {
+		http.Error(w, "name and compose required", 400)
 		return
 	}
 
@@ -793,19 +946,38 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate mesh IP format
-	if net.ParseIP(wl.MeshIP) == nil {
-		http.Error(w, "invalid mesh_ip: must be valid IP address", 400)
-		return
-	}
-
 	// Lock for entire check-and-set to prevent race condition
 	a.stateMu.Lock()
-	existing := a.state.Workloads[wl.MeshIP]
-	if existing != nil && existing.Owner != a.hwid {
-		a.stateMu.Unlock()
-		http.Error(w, "mesh_ip already in use", 409)
-		return
+
+	// Auto-allocate mesh IP if not provided
+	if wl.MeshIP == "" {
+		wl.MeshIP = a.allocateMeshIP()
+		if wl.MeshIP == "" {
+			a.stateMu.Unlock()
+			http.Error(w, "no available IPs in mesh CIDR", 507)
+			return
+		}
+	} else {
+		// Validate provided mesh IP format
+		if net.ParseIP(wl.MeshIP) == nil {
+			a.stateMu.Unlock()
+			http.Error(w, "invalid mesh_ip: must be valid IP address", 400)
+			return
+		}
+
+		// Validate IP is within mesh CIDR
+		if !a.isIPInCIDR(wl.MeshIP) {
+			a.stateMu.Unlock()
+			http.Error(w, fmt.Sprintf("mesh_ip must be within %s", a.meshCIDR), 400)
+			return
+		}
+
+		// Check if IP is already taken
+		if a.isIPTaken(wl.MeshIP) {
+			a.stateMu.Unlock()
+			http.Error(w, "mesh_ip already in use", 409)
+			return
+		}
 	}
 
 	wl.Owner = a.hwid
