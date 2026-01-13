@@ -1215,10 +1215,70 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 	for _, p := range a.state.Peers {
 		peers = append(peers, p)
 	}
-	workloads := make([]*Workload, 0, len(a.state.Workloads))
-	for _, wl := range a.state.Workloads {
-		workloads = append(workloads, wl)
+
+	// Build peer info maps for enrichment
+	peerIDToInfo := make(map[string]map[string]string)
+	for _, p := range a.state.Peers {
+		peerIDToInfo[p.ID] = map[string]string{
+			"id":   p.ID,
+			"name": p.Name,
+			"ip":   p.IP,
+		}
 	}
+	// Add local node to owner info map
+	peerIDToInfo[a.hwid] = map[string]string{
+		"id":   a.hwid,
+		"name": a.hostname,
+		"ip":   a.ip,
+	}
+
+	// Helper to get workload status
+	getStatus := func(wl *Workload) string {
+		if wl.Owner != a.hwid {
+			return "remote" // Can't check status of remote workloads
+		}
+		out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
+		if err != nil {
+			return "unknown"
+		}
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return "running"
+		}
+		return "stopped"
+	}
+
+	// Build enriched workloads with owner info and status
+	type EnrichedWorkload struct {
+		Name         string            `json:"name"`
+		IP           string            `json:"ip"`
+		Compose      string            `json:"compose"`
+		Revive       bool              `json:"revive"`
+		Autostart    bool              `json:"autostart"`
+		AllowedNodes []string          `json:"allowed_nodes,omitempty"`
+		Owner        map[string]string `json:"owner"`
+		Version      int64             `json:"version"`
+		Status       string            `json:"status"`
+	}
+
+	workloads := make([]EnrichedWorkload, 0, len(a.state.Workloads))
+	for _, wl := range a.state.Workloads {
+		ownerInfo := peerIDToInfo[wl.Owner]
+		if ownerInfo == nil {
+			ownerInfo = map[string]string{"id": wl.Owner, "name": "unknown", "ip": "unknown"}
+		}
+		workloads = append(workloads, EnrichedWorkload{
+			Name:         wl.Name,
+			IP:           wl.IP,
+			Compose:      wl.Compose,
+			Revive:       wl.Revive,
+			Autostart:    wl.Autostart,
+			AllowedNodes: wl.AllowedNodes,
+			Owner:        ownerInfo,
+			Version:      wl.Version,
+			Status:       getStatus(wl),
+		})
+	}
+
 	hasTunnel := a.state.CFToken != ""
 	a.stateMu.RUnlock()
 
