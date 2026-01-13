@@ -115,7 +115,7 @@ func New() (*Agent, error) {
 	a := &Agent{
 		hostname:      getHostname(),
 		dataDir:       dataDir,
-		apiPort:       getEnvInt("JETTY_API_PORT", 8080),
+		apiPort:       getEnvInt("JETTY_API_PORT", 6880),
 		meshCIDR:      getEnv("JETTY_MESH_CIDR", "10.100.0.0/16"),
 		joinURL:       getEnv("JETTY_JOIN", ""),
 		clusterSecret: getEnv("JETTY_SECRET", ""),
