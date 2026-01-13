@@ -57,15 +57,9 @@ type Workload struct {
 	Version   int64  `json:"version"`   // Unix timestamp
 }
 
-type Token struct {
-	Token     string    `json:"token"`
-	ExpiresAt time.Time `json:"expires_at"`
-}
-
 type State struct {
 	Peers     map[string]*Peer     `json:"peers"`     // ID -> Peer
 	Workloads map[string]*Workload `json:"workloads"` // MeshIP -> Workload
-	Tokens    map[string]*Token    `json:"tokens"`
 	CFToken   string               `json:"cf_token,omitempty"`   // Cloudflare tunnel token (shared cluster-wide)
 	WarpToken string               `json:"warp_token,omitempty"` // Cloudflare WARP connector token (shared cluster-wide)
 }
@@ -92,8 +86,7 @@ type Agent struct {
 	apiPort       int
 	meshCIDR      string
 	joinURL       string
-	joinTok       string
-	clusterSecret string // Shared secret all nodes must have to join
+	clusterSecret string // Shared secret for cluster authentication
 	tunnelDomain  string // Cloudflare tunnel domain for API access
 	tunnelHost    string // This node's specific tunnel hostname (e.g., "node1.cluster.example.com")
 
@@ -126,7 +119,6 @@ func New() (*Agent, error) {
 		apiPort:       getEnvInt("JETTY_API_PORT", 8080),
 		meshCIDR:      getEnv("JETTY_MESH_CIDR", "10.100.0.0/16"),
 		joinURL:       getEnv("JETTY_JOIN", ""),
-		joinTok:       getEnv("JETTY_TOKEN", ""),
 		clusterSecret: getEnv("JETTY_SECRET", ""),
 		tunnelDomain:  getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - Cloudflare tunnel for API access
 		tunnelHost:    getEnv("JETTY_TUNNEL_HOST", ""),   // e.g., "node1.cluster.example.com" - this node's specific subdomain
@@ -136,7 +128,6 @@ func New() (*Agent, error) {
 		state: &State{
 			Peers:     make(map[string]*Peer),
 			Workloads: make(map[string]*Workload),
-			Tokens:    make(map[string]*Token),
 			CFToken:   getEnv("JETTY_CF_TOKEN", ""),             // Bootstrap tunnel token
 			WarpToken: getEnv("JETTY_WARP_CONNECTOR_TOKEN", ""), // Bootstrap WARP connector token
 		},
@@ -174,14 +165,18 @@ func (a *Agent) Start() error {
 		}
 	}
 
-	// Join or bootstrap
-	if a.joinURL != "" {
+	// Join cluster or sync with existing peers
+	a.stateMu.RLock()
+	hasClusterState := a.state.CFToken != "" || a.state.WarpToken != "" || len(a.state.Peers) > 0
+	a.stateMu.RUnlock()
+
+	if a.joinURL != "" && !hasClusterState {
+		// First run with join URL - join the cluster
 		if err := a.joinCluster(); err != nil {
 			return fmt.Errorf("join: %w", err)
 		}
 	} else {
-		// Not joining - sync state from known peers before autostart
-		// This handles the case where we restarted and workloads were revived by other nodes
+		// Already part of cluster (restart) or no join URL - sync state with known peers
 		a.syncStateOnStartup()
 	}
 
@@ -673,17 +668,12 @@ func (a *Agent) joinCluster() error {
 	maxRetries := 5
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		req := map[string]string{
-			"secret":      a.clusterSecret, // Primary auth - cluster secret
+			"secret":      a.clusterSecret, // Cluster secret for authentication
 			"id":          a.hwid,
 			"name":        a.hostname,
 			"mesh_ip":     a.meshIP,
 			"tunnel_host": a.tunnelHost, // Our specific subdomain for direct API routing
 			"warp_ip":     a.warpIP,     // Cloudflare WARP IP for L3 connectivity
-		}
-
-		// Include token if provided (for backwards compatibility)
-		if a.joinTok != "" {
-			req["token"] = a.joinTok
 		}
 
 		data, _ := json.Marshal(req)
@@ -817,12 +807,11 @@ func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 		// Public endpoints that don't require API key
 		publicPaths := []string{
 			"/api/health",        // Monitoring
-			"/api/join",          // Node joining (uses token + secret in body)
-			"/api/sync",          // Internal cluster sync (uses secret in body)
+			"/api/join",          // Node joining (uses secret in body)
+			"/api/sync",          // Internal cluster sync
 			"/api/peer-announce", // Internal peer announcement
 			"/api/heartbeat",     // Internal heartbeat
 			"/api/tunnel/sync",   // Internal tunnel sync
-			"/api/token/sync",    // Internal token sync
 			"/swagger/",          // API documentation
 		}
 
@@ -861,7 +850,6 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/workloads/{name}/logs", a.apiWorkloadLogs).Methods("GET")
 	r.HandleFunc("/api/workloads/{name}/start", a.apiStartWorkload).Methods("POST")
 	r.HandleFunc("/api/workloads/{name}/stop", a.apiStopWorkload).Methods("POST")
-	r.HandleFunc("/api/token", a.apiCreateToken).Methods("POST", "GET")
 	r.HandleFunc("/api/join", a.apiJoin).Methods("POST")
 	r.HandleFunc("/api/health", a.apiHealth).Methods("GET")
 	r.HandleFunc("/api/sync", a.apiSync).Methods("GET")
@@ -869,7 +857,6 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/tunnel", a.apiSetTunnel).Methods("POST")
 	r.HandleFunc("/api/tunnel", a.apiDeleteTunnel).Methods("DELETE")
 	r.HandleFunc("/api/tunnel/sync", a.apiTunnelSync).Methods("POST")
-	r.HandleFunc("/api/token/sync", a.apiTokenSync).Methods("POST")
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 	r.HandleFunc("/api/heartbeat", a.apiHeartbeat).Methods("POST")
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)
@@ -1498,83 +1485,37 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "stopped", "name": found.Name})
 }
 
-// apiCreateToken godoc
-// @Summary Create join token
-// @Description Generates a new single-use token for joining the cluster (expires in 24h)
-// @Tags cluster
-// @Produce json
-// @Success 200 {object} TokenResponse
-// @Router /token [post]
-func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
-	tok := &Token{
-		Token:     genID() + genID(),
-		ExpiresAt: time.Now().Add(24 * time.Hour),
-	}
-
-	a.stateMu.Lock()
-	a.state.Tokens[tok.Token] = tok
-	a.stateMu.Unlock()
-
-	a.saveState()
-
-	// Broadcast token to all peers so any node can validate it
-	// (important when using Cloudflare tunnel load balancing)
-	go a.broadcastToken(tok)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tok)
-}
-
 // apiJoin godoc
 // @Summary Join cluster
-// @Description Allows a new node to join the cluster using a token
+// @Description Allows a new node to join the cluster using the cluster secret
 // @Tags cluster
 // @Accept json
 // @Produce json
 // @Param request body JoinRequest true "Join request"
 // @Success 200 {object} JoinResponse
-// @Failure 401 {object} ErrorResponse "Invalid token or secret"
+// @Failure 401 {object} ErrorResponse "Invalid secret"
 // @Failure 409 {object} ErrorResponse "Mesh IP collision"
 // @Router /join [post]
 func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Token      string `json:"token"`       // Optional if secret is provided
-		Secret     string `json:"secret"`      // Cluster secret - sufficient for auth
+		Secret     string `json:"secret"` // Cluster secret for authentication
 		ID         string `json:"id"`
 		Name       string `json:"name"`
 		MeshIP     string `json:"mesh_ip"`
-		Endpoint   string `json:"endpoint"`
-		PublicKey  string `json:"public_key"`
 		TunnelHost string `json:"tunnel_host"`
 		WarpIP     string `json:"warp_ip"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
-	// Authentication: either valid secret OR valid token required
-	hasValidSecret := a.clusterSecret != "" && req.Secret == a.clusterSecret
-
-	if !hasValidSecret {
-		// No valid secret - check for token
-		if req.Token == "" {
-			http.Error(w, "secret or token required", 401)
-			return
-		}
-
-		a.stateMu.Lock()
-		tok := a.state.Tokens[req.Token]
-		if tok == nil || time.Now().After(tok.ExpiresAt) {
-			a.stateMu.Unlock()
-			http.Error(w, "invalid token", 401)
-			return
-		}
-		// Delete token after use (single-use tokens)
-		delete(a.state.Tokens, req.Token)
-		a.stateMu.Unlock()
-
-		// Broadcast token deletion to other nodes
-		go a.broadcastTokenDeletion(req.Token)
+	// Validate cluster secret
+	if a.clusterSecret == "" {
+		http.Error(w, "cluster has no secret configured", 500)
+		return
 	}
-	// If hasValidSecret, we skip token validation entirely
+	if req.Secret != a.clusterSecret {
+		http.Error(w, "invalid secret", 401)
+		return
+	}
 
 	// Check for mesh IP collision before creating peer
 	a.stateMu.RLock()
@@ -1605,8 +1546,6 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		ID:         req.ID,
 		Name:       req.Name,
 		MeshIP:     req.MeshIP,
-		Endpoint:   req.Endpoint,
-		PublicKey:  req.PublicKey,
 		TunnelHost: req.TunnelHost,
 		WarpIP:     req.WarpIP,
 		Healthy:    true,
@@ -2256,124 +2195,6 @@ func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// apiTokenSync receives a token from another node (for cluster-wide token availability)
-// Also handles token deletion when "delete" field is set.
-func (a *Agent) apiTokenSync(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Token     string    `json:"token"`
-		ExpiresAt time.Time `json:"expires_at"`
-		Delete    string    `json:"delete,omitempty"` // Token to delete (if set)
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-
-	a.stateMu.Lock()
-	if req.Delete != "" {
-		// Delete a consumed token
-		delete(a.state.Tokens, req.Delete)
-	} else if req.Token != "" && time.Now().Before(req.ExpiresAt) {
-		// Add new token if not expired
-		if _, exists := a.state.Tokens[req.Token]; !exists {
-			a.state.Tokens[req.Token] = &Token{
-				Token:     req.Token,
-				ExpiresAt: req.ExpiresAt,
-			}
-		}
-	}
-	a.stateMu.Unlock()
-	a.saveState()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
-// broadcastToken sends a new token to all peers so any node can validate join requests.
-// This is critical when using Cloudflare tunnel - the join request may hit any node.
-func (a *Agent) broadcastToken(tok *Token) {
-	data, _ := json.Marshal(tok)
-
-	// In tunnel-only mode, broadcast to tunnel (gossip will propagate)
-	if a.tunnelDomain != "" {
-		url := a.getTunnelAPIURL("/api/token/sync")
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
-		if err != nil {
-			log.Printf("Failed to broadcast token: %v", err)
-		} else {
-			resp.Body.Close()
-		}
-		return
-	}
-
-	// Direct mode: send to each peer
-	a.stateMu.RLock()
-	peers := make([]*Peer, 0)
-	for _, p := range a.state.Peers {
-		if p.Healthy {
-			peers = append(peers, p)
-		}
-	}
-	a.stateMu.RUnlock()
-
-	for _, peer := range peers {
-		url := fmt.Sprintf("http://%s:%d/api/token/sync", peer.MeshIP, a.apiPort)
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
-		if err != nil {
-			log.Printf("Failed to broadcast token to %s: %v", peer.Name, err)
-			continue
-		}
-		resp.Body.Close()
-	}
-}
-
-// broadcastTokenDeletion tells all peers to delete a consumed token.
-func (a *Agent) broadcastTokenDeletion(tokenStr string) {
-	data, _ := json.Marshal(map[string]string{"delete": tokenStr})
-
-	// In tunnel-only mode, broadcast to tunnel
-	if a.tunnelDomain != "" {
-		url := a.getTunnelAPIURL("/api/token/sync")
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
-		if err == nil {
-			resp.Body.Close()
-		}
-		return
-	}
-
-	// Direct mode: send to each peer
-	a.stateMu.RLock()
-	peers := make([]*Peer, 0)
-	for _, p := range a.state.Peers {
-		if p.Healthy {
-			peers = append(peers, p)
-		}
-	}
-	a.stateMu.RUnlock()
-
-	for _, peer := range peers {
-		url := fmt.Sprintf("http://%s:%d/api/token/sync", peer.MeshIP, a.apiPort)
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
-		if err != nil {
-			continue
-		}
-		resp.Body.Close()
-	}
-}
-
-// cleanupExpiredTokens removes tokens that have expired from state.
-func (a *Agent) cleanupExpiredTokens() {
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
-
-	now := time.Now()
-	for k, tok := range a.state.Tokens {
-		if now.After(tok.ExpiresAt) {
-			delete(a.state.Tokens, k)
-		}
-	}
-}
-
 // =============================================================================
 // Docker Compose
 // =============================================================================
@@ -2539,7 +2360,6 @@ func (a *Agent) gossipLoop() {
 		case <-tick.C:
 			a.checkPeers()
 			a.syncWorkloads()
-			a.cleanupExpiredTokens()
 		}
 	}
 }
