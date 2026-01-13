@@ -105,10 +105,8 @@ type Agent struct {
 	warpIP      string // WARP IP address (CGNAT range, e.g., "100.96.x.x")
 	warpEnabled bool   // Whether WARP mode is active
 
-	// Cloudflare API (for WARP private network routes)
-	cfAPIToken   string // Cloudflare API token
-	cfAccountID  string // Cloudflare account ID
-	cfTunnelID   string // WARP connector tunnel ID
+	// Cloudflare tunnel (for WARP private network routes)
+	cfTunnelID string // WARP connector tunnel ID (for route management)
 
 	// Config
 	dataDir       string
@@ -166,11 +164,9 @@ func New() (*Agent, error) {
 		joinURL:       getEnv("JETTY_JOIN", ""),
 		joinTok:       getEnv("JETTY_TOKEN", ""),
 		clusterSecret: getEnv("JETTY_SECRET", ""),
-		tunnelDomain:  getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - enables tunnel-only mode
-		tunnelHost:    getEnv("JETTY_TUNNEL_HOST", ""),   // e.g., "node1.cluster.example.com" - this node's specific subdomain
-		cfAPIToken:    getEnv("JETTY_CF_API_TOKEN", ""),  // Cloudflare API token for route management
-		cfAccountID:   getEnv("JETTY_CF_ACCOUNT_ID", ""), // Cloudflare account ID
-		cfTunnelID:    getEnv("JETTY_CF_TUNNEL_ID", ""),  // WARP connector tunnel ID
+		tunnelDomain: getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - enables tunnel-only mode
+		tunnelHost:   getEnv("JETTY_TUNNEL_HOST", ""),   // e.g., "node1.cluster.example.com" - this node's specific subdomain
+		cfTunnelID:   getEnv("JETTY_CF_TUNNEL_ID", ""),  // WARP connector tunnel ID for route management
 		composeDir:    filepath.Join(dataDir, "compose"),
 		hostsFile:     "/etc/hosts",
 		state: &State{
@@ -303,46 +299,26 @@ func (a *Agent) detectWarpIP() {
 }
 
 // =============================================================================
-// WARP Private Network Routes (Cloudflare API)
+// WARP Private Network Routes (via cloudflared CLI)
 // =============================================================================
 
-// registerWarpRoute adds a private network route for a mesh IP via Cloudflare API.
+// registerWarpRoute adds a private network route for a mesh IP using cloudflared CLI.
 // This allows WARP clients to reach the workload through the tunnel.
 func (a *Agent) registerWarpRoute(meshIP string) error {
-	if a.cfAPIToken == "" || a.cfAccountID == "" || a.cfTunnelID == "" {
+	if a.cfTunnelID == "" {
 		return nil // WARP route management not configured
 	}
 
-	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/teamnet/routes", a.cfAccountID)
-
-	payload := map[string]interface{}{
-		"network":   meshIP + "/32",
-		"tunnel_id": a.cfTunnelID,
-		"comment":   fmt.Sprintf("jetty:%s:%s", a.hostname, meshIP),
-	}
-	data, _ := json.Marshal(payload)
-
-	req, err := http.NewRequest("POST", url, strings.NewReader(string(data)))
+	// Use cloudflared tunnel route command
+	cmd := exec.Command("cloudflared", "tunnel", "route", "ip", "add", meshIP+"/32", a.cfTunnelID)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+a.cfAPIToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("cloudflare API: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
 		// Ignore "already exists" errors
-		if strings.Contains(string(body), "already exists") {
+		if strings.Contains(string(output), "already exists") {
 			log.Printf("WARP route for %s already exists", meshIP)
 			return nil
 		}
-		return fmt.Errorf("cloudflare API error: %s", body)
+		return fmt.Errorf("cloudflared route add: %s", output)
 	}
 
 	log.Printf("WARP route registered: %s -> tunnel %s", meshIP, a.cfTunnelID[:8])
@@ -351,60 +327,18 @@ func (a *Agent) registerWarpRoute(meshIP string) error {
 
 // unregisterWarpRoute removes a private network route for a mesh IP.
 func (a *Agent) unregisterWarpRoute(meshIP string) error {
-	if a.cfAPIToken == "" || a.cfAccountID == "" || a.cfTunnelID == "" {
+	if a.cfTunnelID == "" {
 		return nil // WARP route management not configured
 	}
 
-	// First, find the route ID
-	listURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/teamnet/routes?network=%s",
-		a.cfAccountID, meshIP+"/32")
-
-	req, err := http.NewRequest("GET", listURL, nil)
+	cmd := exec.Command("cloudflared", "tunnel", "route", "ip", "delete", meshIP+"/32")
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+a.cfAPIToken)
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("cloudflare API: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var listResult struct {
-		Success bool `json:"success"`
-		Result  []struct {
-			ID string `json:"id"`
-		} `json:"result"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&listResult); err != nil {
-		return err
-	}
-
-	if !listResult.Success || len(listResult.Result) == 0 {
-		return nil // Route doesn't exist
-	}
-
-	// Delete the route
-	routeID := listResult.Result[0].ID
-	deleteURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/teamnet/routes/%s",
-		a.cfAccountID, routeID)
-
-	req, err = http.NewRequest("DELETE", deleteURL, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+a.cfAPIToken)
-
-	resp, err = httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("cloudflare API: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("cloudflare API delete error: %s", body)
+		// Ignore "not found" errors
+		if strings.Contains(string(output), "not found") {
+			return nil
+		}
+		return fmt.Errorf("cloudflared route delete: %s", output)
 	}
 
 	log.Printf("WARP route unregistered: %s", meshIP)
