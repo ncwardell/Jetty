@@ -26,7 +26,7 @@ import (
 
 // Shared HTTP client with timeout to prevent blocking on hung peers
 var httpClient = &http.Client{
-	Timeout: 10 * time.Second,
+	Timeout: 30 * time.Second,
 }
 
 // Valid workload name pattern (alphanumeric, dash, underscore only)
