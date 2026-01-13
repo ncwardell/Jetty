@@ -25,12 +25,14 @@ import (
 // @host localhost:6880
 // @BasePath /api
 
-// @schemes http https
+// @schemes https http
 
 // @securityDefinitions.apikey ApiKeyAuth
 // @in header
 // @name X-API-Key
 // @description API key for authentication (JETTY_SECRET)
+
+// @Security ApiKeyAuth
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)

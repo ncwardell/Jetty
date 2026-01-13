@@ -956,7 +956,12 @@ const docTemplate = `{
             "name": "X-API-Key",
             "in": "header"
         }
-    }
+    },
+    "security": [
+        {
+            "ApiKeyAuth": []
+        }
+    ]
 }`
 
 // SwaggerInfo holds exported Swagger Info so clients can modify it
@@ -964,7 +969,7 @@ var SwaggerInfo = &swag.Spec{
 	Version:          "2.0",
 	Host:             "localhost:6880",
 	BasePath:         "/api",
-	Schemes:          []string{"http", "https"},
+	Schemes:          []string{"https", "http"},
 	Title:            "Jetty API",
 	Description:      "P2P Docker Compose orchestration with Cloudflare WARP mesh networking",
 	InfoInstanceName: "swagger",

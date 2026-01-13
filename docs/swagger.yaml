@@ -640,8 +640,10 @@ paths:
       tags:
       - workloads
 schemes:
-- http
 - https
+- http
+security:
+- ApiKeyAuth: []
 securityDefinitions:
   ApiKeyAuth:
     description: API key for authentication (JETTY_SECRET)
