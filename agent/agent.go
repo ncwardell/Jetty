@@ -3593,9 +3593,18 @@ func (f *cloudflaredLogFilter) Write(p []byte) (n int, err error) {
 		return len(p), nil
 	}
 
-	// Log all cloudflared output for debugging
-	// TODO: Re-enable filtering once tunnel is working
-	log.Printf("[cloudflared] %s", line)
+	// Only log important messages: errors, warnings, connection status
+	// Filter out verbose debug output (INFO level routine messages)
+	if strings.Contains(line, "ERR") ||
+		strings.Contains(line, "WRN") ||
+		strings.Contains(line, "error") ||
+		strings.Contains(line, "failed") ||
+		strings.Contains(line, "Registered") ||
+		strings.Contains(line, "Unregistered") ||
+		strings.Contains(line, "connected") ||
+		strings.Contains(line, "Starting tunnel") {
+		log.Printf("[cloudflared] %s", line)
+	}
 
 	return len(p), nil
 }
@@ -3618,13 +3627,6 @@ func (a *Agent) startCloudflared() error {
 
 	if token == "" {
 		return nil // No token configured
-	}
-
-	// Debug: log token info to help diagnose "invalid token" errors
-	if len(token) > 20 {
-		log.Printf("Cloudflare tunnel token: len=%d, prefix=%s..., suffix=...%s", len(token), token[:10], token[len(token)-10:])
-	} else {
-		log.Printf("Cloudflare tunnel token: len=%d (too short - likely invalid)", len(token))
 	}
 
 	a.cfStopCh = make(chan struct{})
