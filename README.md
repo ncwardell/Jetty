@@ -38,7 +38,15 @@ Node 1 (node1)            Node 2 (node2)            Node 3 (node3)
 
 ## Quick Start
 
-### First Node
+### Prerequisites
+
+Before starting, you need to set up Cloudflare WARP and Tunnel:
+
+1. **WARP Connector Token**: Create a WARP Connector in your Cloudflare Zero Trust dashboard
+2. **Tunnel Token**: Create a Cloudflare Tunnel for external API access
+3. **Tunnel Domain**: Configure a domain pointing to your tunnel (e.g., `jetty.example.com`)
+
+### First Node (Bootstrap)
 
 ```bash
 docker run -d \
@@ -48,6 +56,9 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v jetty-data:/data \
   -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_WARP_CONNECTOR_TOKEN=your-warp-connector-token \
+  -e JETTY_CF_TOKEN=your-cloudflare-tunnel-token \
+  -e JETTY_TUNNEL_DOMAIN=jetty.example.com \
   jetty:latest
 ```
 
@@ -60,10 +71,15 @@ docker run -d \
   --net host \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v jetty-data:/data \
-  -e JETTY_JOIN=http://<first-node>:8080 \
   -e JETTY_SECRET=my-cluster-password \
+  -e JETTY_WARP_CONNECTOR_TOKEN=your-warp-connector-token \
+  -e JETTY_CF_TOKEN=your-cloudflare-tunnel-token \
+  -e JETTY_TUNNEL_DOMAIN=jetty.example.com \
+  -e JETTY_JOIN=https://jetty.example.com \
   jetty:latest
 ```
+
+> **Note**: All nodes need the WARP connector token for mesh networking and the tunnel token for external access. The `JETTY_JOIN` URL should use the tunnel domain for reliable cluster joining.
 
 ## API
 
@@ -188,7 +204,7 @@ volumes:
 
 ## Failover
 
-When a node goes down (no response for 30s):
+When a node goes down (no response for 45s):
 
 1. All nodes detect via gossip health checks
 2. Workloads with `revive: true` become orphaned
@@ -213,9 +229,10 @@ No coordination needed - all nodes reach same conclusion independently.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `JETTY_SECRET` | Shared cluster password (required) | - |
+| `JETTY_WARP_CONNECTOR_TOKEN` | WARP Connector token for mesh networking (required) | - |
+| `JETTY_CF_TOKEN` | Cloudflare tunnel token for external access (required) | - |
+| `JETTY_TUNNEL_DOMAIN` | Cloudflare tunnel domain (e.g., `jetty.example.com`) (required) | - |
 | `JETTY_DATA_DIR` | Data directory | `/data` |
 | `JETTY_API_PORT` | API port | `8080` |
 | `JETTY_MESH_CIDR` | Mesh network | `10.100.0.0/16` |
-| `JETTY_JOIN` | URL to join existing cluster | - |
-| `JETTY_CF_TOKEN` | Cloudflare tunnel token | - |
-| `JETTY_WARP_CONNECTOR_TOKEN` | WARP Connector token | - |
+| `JETTY_JOIN` | URL to join existing cluster (use tunnel domain) | - |
