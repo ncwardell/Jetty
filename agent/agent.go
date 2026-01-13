@@ -440,10 +440,31 @@ func (a *Agent) addWarpRule(meshIP string) error {
 
 // removeWarpRule removes an nft accept rule for a mesh IP.
 func (a *Agent) removeWarpRule(meshIP string) error {
-	// Find and delete the rule for this mesh IP
-	// Note: This uses a simple approach - in production you might want to track rule handles
-	return exec.Command("nft", "delete", "rule", "inet", "cloudflare-warp", "tun",
-		"ip", "saddr", meshIP, "accept").Run()
+	// List rules with handles to find the one for this mesh IP
+	out, err := exec.Command("nft", "-a", "list", "chain", "inet", "cloudflare-warp", "tun").Output()
+	if err != nil {
+		return fmt.Errorf("failed to list nft rules: %w", err)
+	}
+
+	// Parse output to find the rule handle for this mesh IP
+	// Format: "ip saddr 10.100.0.x accept # handle N"
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, meshIP) && strings.Contains(line, "accept") {
+			// Extract handle number from "# handle N"
+			if idx := strings.Index(line, "# handle "); idx != -1 {
+				handleStr := strings.TrimSpace(line[idx+9:])
+				// Delete by handle
+				if err := exec.Command("nft", "delete", "rule", "inet", "cloudflare-warp", "tun", "handle", handleStr).Run(); err != nil {
+					return fmt.Errorf("failed to delete nft rule handle %s: %w", handleStr, err)
+				}
+				return nil
+			}
+		}
+	}
+
+	// Rule not found - not an error, may have been already removed
+	return nil
 }
 
 func (a *Agent) deriveMeshIP(id string) string {
@@ -531,6 +552,17 @@ func (a *Agent) isNodeAllowed(wl *Workload, nodeID, nodeName string) bool {
 // isThisNodeAllowed checks if this node is allowed to run a workload.
 func (a *Agent) isThisNodeAllowed(wl *Workload) bool {
 	return a.isNodeAllowed(wl, a.hwid, a.hostname)
+}
+
+// isWorkloadNameTaken checks if a workload name is already in use.
+// Caller must hold stateMu lock (read or write).
+func (a *Agent) isWorkloadNameTaken(name string) bool {
+	for _, wl := range a.state.Workloads {
+		if wl.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // findAllowedNode finds a healthy peer that is allowed to run this workload.
@@ -1117,6 +1149,13 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 
 	// Lock for entire check-and-set to prevent race condition
 	a.stateMu.Lock()
+
+	// Check for duplicate workload name (skip during move operation)
+	if !isMove && a.isWorkloadNameTaken(wl.Name) {
+		a.stateMu.Unlock()
+		http.Error(w, "workload name already in use", 409)
+		return
+	}
 
 	// Auto-allocate mesh IP if not provided
 	if wl.MeshIP == "" {
@@ -2527,18 +2566,17 @@ func getHealthStatus() string {
 }
 
 func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
-	// Return our workloads for sync
+	// Return all workloads for sync (not just local ones)
+	// This allows other nodes to get a complete view of cluster state
 	a.stateMu.RLock()
-	local := []*Workload{}
+	workloads := make([]*Workload, 0, len(a.state.Workloads))
 	for _, wl := range a.state.Workloads {
-		if wl.Owner == a.hwid {
-			local = append(local, wl)
-		}
+		workloads = append(workloads, wl)
 	}
 	a.stateMu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(local)
+	json.NewEncoder(w).Encode(workloads)
 }
 
 // apiGetTunnel godoc
@@ -3380,20 +3418,30 @@ func (a *Agent) checkFailover() {
 		if owner != nil && owner.Healthy {
 			continue // Owner is alive
 		}
-		if owner != nil && time.Since(owner.LastSeen) < 30*time.Second {
-			continue // Recently seen
+		if owner != nil && time.Since(owner.LastSeen) < 45*time.Second {
+			continue // Recently seen (3 missed heartbeats + buffer)
 		}
 
 		// Owner is dead - should we claim?
 		if a.shouldClaim(wl) {
 			log.Printf("Claiming orphaned workload: %s", wl.Name)
+			oldOwner := wl.Owner
+			oldVersion := wl.Version
 			wl.Owner = a.hwid
 			wl.Version = time.Now().Unix()
 
-			// Deploy it
-			go func(w *Workload) {
+			// Deploy it - capture workload state for rollback on failure
+			go func(w *Workload, prevOwner string, prevVersion int64) {
 				if err := a.deployWorkload(w); err != nil {
-					log.Printf("Failover deploy failed: %v", err)
+					log.Printf("Failover deploy failed for %s: %v - reverting ownership", w.Name, err)
+					// Rollback ownership on failure so another node can try
+					a.stateMu.Lock()
+					if existing := a.state.Workloads[w.MeshIP]; existing != nil && existing.Owner == a.hwid {
+						existing.Owner = prevOwner
+						existing.Version = prevVersion
+					}
+					a.stateMu.Unlock()
+					return
 				}
 				a.updateHosts()
 				// Add WARP nft rule for this workload
@@ -3403,7 +3451,8 @@ func (a *Agent) checkFailover() {
 					}
 				}
 				a.saveState()
-			}(wl)
+				a.broadcastState()
+			}(wl, oldOwner, oldVersion)
 		}
 	}
 }
@@ -3517,8 +3566,9 @@ func (a *Agent) startCloudflared() error {
 
 	a.cfStopCh = make(chan struct{})
 
-	// Start cloudflared tunnel
-	a.cfCmd = exec.Command("cloudflared", "tunnel", "run", "--token", token)
+	// Start cloudflared tunnel - pass token via environment to avoid exposing in process list
+	a.cfCmd = exec.Command("cloudflared", "tunnel", "run")
+	a.cfCmd.Env = append(os.Environ(), "TUNNEL_TOKEN="+token)
 	a.cfCmd.Stdout = os.Stdout
 	a.cfCmd.Stderr = os.Stderr
 
@@ -3611,7 +3661,9 @@ func (a *Agent) monitorCloudflared() {
 			return
 		}
 
-		a.cfCmd = exec.Command("cloudflared", "tunnel", "run", "--token", token)
+		// Pass token via environment to avoid exposing in process list
+		a.cfCmd = exec.Command("cloudflared", "tunnel", "run")
+		a.cfCmd.Env = append(os.Environ(), "TUNNEL_TOKEN="+token)
 		a.cfCmd.Stdout = os.Stdout
 		a.cfCmd.Stderr = os.Stderr
 
@@ -3677,11 +3729,10 @@ func getEnv(k, d string) string {
 
 func getEnvInt(k string, d int) int {
 	if v := os.Getenv(k); v != "" {
-		n := 0
-		for _, c := range v {
-			if c >= '0' && c <= '9' {
-				n = n*10 + int(c-'0')
-			}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			log.Printf("Warning: invalid integer value for %s: %q, using default %d", k, v, d)
+			return d
 		}
 		return n
 	}
