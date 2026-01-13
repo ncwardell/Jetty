@@ -414,6 +414,13 @@ func (a *Agent) cleanupNetwork() {
 		log.Printf("Removed jetty0 interface")
 	}
 
+	// Unregister WARP device from Cloudflare to prevent orphaned devices
+	if a.warpEnabled {
+		log.Printf("Unregistering WARP device from Cloudflare...")
+		exec.Command("warp-cli", "--accept-tos", "disconnect").Run()
+		exec.Command("warp-cli", "--accept-tos", "registration", "delete").Run()
+	}
+
 	// Clean up WARP network modifications (important for --net host mode)
 	// These persist on the host after container stops, breaking SSH/git
 	exec.Command("ip", "link", "delete", "CloudflareWARP").Run()

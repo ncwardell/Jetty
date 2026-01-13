@@ -206,10 +206,12 @@ cleanup() {
         kill $TUNNEL_PID 2>/dev/null || true
     fi
 
-    # Disconnect and stop WARP
+    # Disconnect, unregister, and stop WARP
     if [ -n "$WARP_SVC_PID" ]; then
         log "Disconnecting WARP..."
         warp-cli --accept-tos disconnect 2>/dev/null || true
+        log "Unregistering WARP device from Cloudflare..."
+        warp-cli --accept-tos registration delete 2>/dev/null || true
         sleep 1
         kill $WARP_SVC_PID 2>/dev/null || true
     fi
