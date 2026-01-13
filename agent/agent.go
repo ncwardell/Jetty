@@ -647,15 +647,17 @@ func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
 	exec.Command("ip", "tunnel", "del", tunName).Run()
 
 	// Create IPIP tunnel: local=our WARP IP, remote=peer's WARP IP
-	if err := exec.Command("ip", "tunnel", "add", tunName, "mode", "ipip",
-		"local", a.ip, "remote", peerIP).Run(); err != nil {
-		return fmt.Errorf("create tunnel to %s: %w", peerIP, err)
+	cmd := exec.Command("ip", "tunnel", "add", tunName, "mode", "ipip",
+		"local", a.ip, "remote", peerIP)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("create tunnel to %s: %s", peerIP, strings.TrimSpace(string(out)))
 	}
 
 	// Bring up the tunnel interface
-	if err := exec.Command("ip", "link", "set", "up", "dev", tunName).Run(); err != nil {
+	cmd = exec.Command("ip", "link", "set", "up", "dev", tunName)
+	if out, err := cmd.CombinedOutput(); err != nil {
 		exec.Command("ip", "tunnel", "del", tunName).Run()
-		return fmt.Errorf("bring up tunnel %s: %w", tunName, err)
+		return fmt.Errorf("bring up tunnel %s: %s", tunName, strings.TrimSpace(string(out)))
 	}
 
 	log.Printf("Created IPIP tunnel %s to peer %s (%s)", tunName, peerID[:8], peerIP)
@@ -1405,7 +1407,8 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		if isMove {
 			url += "?move=true"
 		}
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		req, _ := a.peerRequest("POST", url, strings.NewReader(string(data)))
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to proxy to allowed node: %v", err), 502)
 			return
@@ -1571,7 +1574,8 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 
 		// Proxy request to owner
 		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
-		resp, err := httpClient.Get(url)
+		req, _ := a.peerRequest("GET", url, nil)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			ownerInfo := buildOwnerInfo(ownerPeer.ID, ownerPeer.Name, ownerPeer.IP)
 			w.Header().Set("Content-Type", "application/json")
@@ -1688,8 +1692,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		// Proxy PATCH to owner
 		body, _ := json.Marshal(update)
 		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
-		req, _ := http.NewRequest("PATCH", url, strings.NewReader(string(body)))
-		req.Header.Set("Content-Type", "application/json")
+		req, _ := a.peerRequest("PATCH", url, strings.NewReader(string(body)))
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
@@ -1951,11 +1954,7 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 		if ownerPeer != nil && ownerPeer.Healthy {
 			// Proxy delete to owner node
 			url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
-			req, err := http.NewRequest("DELETE", url, nil)
-			if err != nil {
-				http.Error(w, fmt.Sprintf("failed to create request: %v", err), 500)
-				return
-			}
+			req, _ := a.peerRequest("DELETE", url, nil)
 			resp, err := httpClient.Do(req)
 			if err != nil {
 				http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
@@ -2062,7 +2061,8 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	// Blue-green deployment: deploy on target first (with move=true to allow IP overlap)
 	data, _ := json.Marshal(found)
 	url := a.getPeerAPIURL(target, "/api/workloads?move=true")
-	resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+	deployReq, _ := a.peerRequest("POST", url, strings.NewReader(string(data)))
+	resp, err := httpClient.Do(deployReq)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to deploy on target: %v", err), 502)
 		return
@@ -2086,7 +2086,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	} else if currentOwner != nil && currentOwner.Healthy {
 		// Proxy delete to current owner
 		deleteURL := a.getPeerAPIURL(currentOwner, "/api/workloads/"+name)
-		delReq, _ := http.NewRequest("DELETE", deleteURL, nil)
+		delReq, _ := a.peerRequest("DELETE", deleteURL, nil)
 		delResp, err := httpClient.Do(delReq)
 		if err != nil {
 			log.Printf("Warning: failed to remove workload from original owner: %v", err)
@@ -2139,7 +2139,8 @@ func (a *Agent) apiWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		// Proxy logs request to owner
 		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/logs")
-		resp, err := httpClient.Get(url)
+		req, _ := a.peerRequest("GET", url, nil)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
 			return
@@ -2196,7 +2197,8 @@ func (a *Agent) apiStartWorkload(w http.ResponseWriter, r *http.Request) {
 		}
 		// Proxy start request to owner
 		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/start")
-		resp, err := httpClient.Post(url, "application/json", nil)
+		req, _ := a.peerRequest("POST", url, nil)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
 			return
@@ -2261,7 +2263,8 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 		}
 		// Proxy stop request to owner
 		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/stop")
-		resp, err := httpClient.Post(url, "application/json", nil)
+		req, _ := a.peerRequest("POST", url, nil)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
 			return
@@ -4219,6 +4222,21 @@ func (a *Agent) getPeerAPIURL(peer *Peer, path string) string {
 		return fmt.Sprintf("https://%s%s", a.tunnelDomain, path)
 	}
 	return ""
+}
+
+// peerRequest creates an HTTP request to a peer with auth headers set.
+func (a *Agent) peerRequest(method, url string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if a.clusterSecret != "" {
+		req.Header.Set("X-API-Key", a.clusterSecret)
+	}
+	if method == "POST" || method == "PUT" || method == "PATCH" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req, nil
 }
 
 // getTunnelAPIURL returns the Cloudflare tunnel URL for API calls.
