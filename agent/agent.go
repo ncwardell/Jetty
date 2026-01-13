@@ -248,6 +248,81 @@ func (a *Agent) detectWarpIP() {
 }
 
 // =============================================================================
+// Runtime WARP Configuration
+// =============================================================================
+
+// configureWarpRuntime sets up WARP at runtime after receiving token from cluster join.
+// This handles the case where a node joins without a pre-configured WARP token.
+func (a *Agent) configureWarpRuntime(token string) error {
+	if token == "" {
+		return fmt.Errorf("no WARP token provided")
+	}
+
+	log.Printf("Configuring WARP at runtime...")
+
+	// Check if warp-svc is running, start it if not
+	if err := exec.Command("warp-cli", "--accept-tos", "status").Run(); err != nil {
+		log.Printf("Starting WARP service...")
+
+		// Start warp-svc in background
+		cmd := exec.Command("warp-svc", "--accept-tos")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("failed to start warp-svc: %w", err)
+		}
+
+		// Wait for warp-svc to be ready
+		for i := 0; i < 10; i++ {
+			time.Sleep(time.Second)
+			if exec.Command("warp-cli", "--accept-tos", "status").Run() == nil {
+				break
+			}
+		}
+	}
+
+	// Check if already registered
+	output, _ := exec.Command("warp-cli", "--accept-tos", "registration", "show").CombinedOutput()
+	if !strings.Contains(string(output), "Missing registration") {
+		log.Printf("WARP already registered, connecting...")
+	} else {
+		// Register with connector token
+		log.Printf("Registering WARP connector...")
+		cmd := exec.Command("warp-cli", "--accept-tos", "connector", "new", token)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to register WARP connector: %s", output)
+		}
+	}
+
+	// Connect WARP
+	log.Printf("Connecting WARP...")
+	if err := exec.Command("warp-cli", "--accept-tos", "connect").Run(); err != nil {
+		return fmt.Errorf("failed to connect WARP: %w", err)
+	}
+
+	// Wait for connection and detect IP
+	for i := 0; i < 30; i++ {
+		time.Sleep(time.Second)
+		output, _ := exec.Command("warp-cli", "--accept-tos", "status").CombinedOutput()
+		if strings.Contains(strings.ToLower(string(output)), "connected") {
+			// Detect WARP IP
+			a.detectWarpIP()
+			if a.warpEnabled {
+				log.Printf("WARP connected successfully: %s", a.warpIP)
+
+				// Initialize WARP nft rules
+				if err := a.initWarpRules(); err != nil {
+					log.Printf("Warning: failed to init WARP rules: %v", err)
+				}
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("WARP connection timeout")
+}
+
+// =============================================================================
 // WARP Private Network Routes (via cloudflared CLI)
 // =============================================================================
 
@@ -843,6 +918,13 @@ func (a *Agent) joinCluster() error {
 		a.stateMu.Unlock()
 
 		a.saveState()
+
+		// Configure WARP at runtime if we received a token and WARP isn't already enabled
+		if result.WarpToken != "" && !a.warpEnabled {
+			if err := a.configureWarpRuntime(result.WarpToken); err != nil {
+				log.Printf("Warning: failed to configure WARP at runtime: %v", err)
+			}
+		}
 
 		// Start cloudflared if we received a token
 		if result.CFToken != "" {
