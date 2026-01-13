@@ -103,7 +103,8 @@ type Agent struct {
 	cfStopCh chan struct{}
 
 	// Runtime
-	startTime time.Time // When Jetty started (for uptime tracking)
+	startTime            time.Time // When Jetty started (for uptime tracking)
+	lastHeartbeatErrLog  time.Time // Last time we logged a heartbeat error (to reduce spam)
 
 	stopCh chan struct{}
 }
@@ -3199,7 +3200,11 @@ func (a *Agent) tunnelModeHealthCheck() {
 	url := a.getTunnelAPIURL("/api/heartbeat")
 	resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
 	if err != nil {
-		log.Printf("Heartbeat failed: %v", err)
+		// Only log heartbeat failures once per minute to avoid log spam
+		if time.Since(a.lastHeartbeatErrLog) > time.Minute {
+			log.Printf("Heartbeat failed: %v (suppressing further errors for 1 min)", err)
+			a.lastHeartbeatErrLog = time.Now()
+		}
 	} else {
 		resp.Body.Close()
 	}
