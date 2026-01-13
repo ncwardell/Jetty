@@ -2,6 +2,7 @@ package agent
 
 import (
 	"crypto/rand"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,9 @@ import (
 	"github.com/ncwardell/jetty/docs"
 	httpSwagger "github.com/swaggo/http-swagger"
 )
+
+//go:embed dashboard.html
+var dashboardHTML []byte
 
 // Shared HTTP client with timeout to prevent blocking on hung peers
 var httpClient = &http.Client{
@@ -436,23 +440,6 @@ func (a *Agent) configureWarpRuntime(token string) error {
 	return fmt.Errorf("WARP connection timeout")
 }
 
-// =============================================================================
-// WARP Private Network Routes
-// =============================================================================
-// NOTE: These functions are no longer used. Workload routing now uses IPIP
-// tunnels between nodes instead of Cloudflare private network routes.
-// Keeping the functions as no-ops to avoid breaking callers.
-
-// registerWarpRoute is a no-op - IPIP tunnels handle routing now.
-func (a *Agent) registerWarpRoute(meshIP string) error {
-	return nil
-}
-
-// unregisterWarpRoute is a no-op - IPIP tunnels handle routing now.
-func (a *Agent) unregisterWarpRoute(meshIP string) error {
-	return nil
-}
-
 func (a *Agent) Stop() {
 	log.Printf("Shutting down Jetty...")
 	close(a.stopCh)
@@ -647,15 +634,17 @@ func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
 	exec.Command("ip", "tunnel", "del", tunName).Run()
 
 	// Create IPIP tunnel: local=our WARP IP, remote=peer's WARP IP
-	if err := exec.Command("ip", "tunnel", "add", tunName, "mode", "ipip",
-		"local", a.ip, "remote", peerIP).Run(); err != nil {
-		return fmt.Errorf("create tunnel to %s: %w", peerIP, err)
+	cmd := exec.Command("ip", "tunnel", "add", tunName, "mode", "ipip",
+		"local", a.ip, "remote", peerIP)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("create tunnel to %s: %s", peerIP, strings.TrimSpace(string(out)))
 	}
 
 	// Bring up the tunnel interface
-	if err := exec.Command("ip", "link", "set", "up", "dev", tunName).Run(); err != nil {
+	cmd = exec.Command("ip", "link", "set", "up", "dev", tunName)
+	if out, err := cmd.CombinedOutput(); err != nil {
 		exec.Command("ip", "tunnel", "del", tunName).Run()
-		return fmt.Errorf("bring up tunnel %s: %w", tunName, err)
+		return fmt.Errorf("bring up tunnel %s: %s", tunName, strings.TrimSpace(string(out)))
 	}
 
 	log.Printf("Created IPIP tunnel %s to peer %s (%s)", tunName, peerID[:8], peerIP)
@@ -1139,6 +1128,13 @@ func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 		}
 
 		path := r.URL.Path
+
+		// Dashboard root is public (exact match)
+		if path == "/" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		for _, p := range publicPaths {
 			if strings.HasPrefix(path, p) {
 				next.ServeHTTP(w, r)
@@ -1190,6 +1186,12 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 	r.HandleFunc("/api/heartbeat", a.apiHeartbeat).Methods("POST")
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)
+
+	// Dashboard UI (embedded)
+	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(dashboardHTML)
+	}).Methods("GET")
 
 	// Swagger UI
 	r.PathPrefix("/swagger/").Handler(httpSwagger.WrapHandler)
@@ -1465,7 +1467,8 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		if isMove {
 			url += "?move=true"
 		}
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		req, _ := a.peerRequest("POST", url, strings.NewReader(string(data)))
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to proxy to allowed node: %v", err), 502)
 			return
@@ -1533,11 +1536,6 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		a.stateMu.Unlock()
 		http.Error(w, err.Error(), 500)
 		return
-	}
-
-	// Register WARP route so workload is reachable via WARP
-	if err := a.registerWarpRoute(wl.IP); err != nil {
-		log.Printf("Warning: failed to register WARP route for %s: %v", wl.IP, err)
 	}
 
 	a.updateHosts()
@@ -1631,7 +1629,8 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 
 		// Proxy request to owner
 		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
-		resp, err := httpClient.Get(url)
+		req, _ := a.peerRequest("GET", url, nil)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			ownerInfo := buildOwnerInfo(ownerPeer.ID, ownerPeer.Name, ownerPeer.IP)
 			w.Header().Set("Content-Type", "application/json")
@@ -1748,8 +1747,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		// Proxy PATCH to owner
 		body, _ := json.Marshal(update)
 		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
-		req, _ := http.NewRequest("PATCH", url, strings.NewReader(string(body)))
-		req.Header.Set("Content-Type", "application/json")
+		req, _ := a.peerRequest("PATCH", url, strings.NewReader(string(body)))
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
@@ -1825,11 +1823,6 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	if needsRedeploy {
 		// Remove old deployment
 		a.removeWorkload(found)
-
-		// Unregister old WARP route
-		if foundIP != newMeshIP {
-			a.unregisterWarpRoute(foundIP)
-		}
 
 		// Deploy with new config
 		if err := a.deployWorkload(found); err != nil {
@@ -2011,11 +2004,7 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 		if ownerPeer != nil && ownerPeer.Healthy {
 			// Proxy delete to owner node
 			url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
-			req, err := http.NewRequest("DELETE", url, nil)
-			if err != nil {
-				http.Error(w, fmt.Sprintf("failed to create request: %v", err), 500)
-				return
-			}
+			req, _ := a.peerRequest("DELETE", url, nil)
 			resp, err := httpClient.Do(req)
 			if err != nil {
 				http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
@@ -2043,11 +2032,6 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 	// Remove if we're running it
 	if found.Owner == a.hwid {
 		a.removeWorkload(found)
-
-		// Unregister WARP route for this workload
-		if err := a.unregisterWarpRoute(found.IP); err != nil {
-			log.Printf("Warning: failed to unregister WARP route for %s: %v", found.IP, err)
-		}
 	}
 
 	a.updateHosts()
@@ -2122,7 +2106,8 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	// Blue-green deployment: deploy on target first (with move=true to allow IP overlap)
 	data, _ := json.Marshal(found)
 	url := a.getPeerAPIURL(target, "/api/workloads?move=true")
-	resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+	deployReq, _ := a.peerRequest("POST", url, strings.NewReader(string(data)))
+	resp, err := httpClient.Do(deployReq)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to deploy on target: %v", err), 502)
 		return
@@ -2138,15 +2123,10 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	// If we own it, remove locally
 	if found.Owner == a.hwid {
 		a.removeWorkload(found)
-
-		// Unregister WARP route (target has registered its own)
-		if err := a.unregisterWarpRoute(found.IP); err != nil {
-			log.Printf("Warning: failed to unregister WARP route for %s: %v", found.IP, err)
-		}
 	} else if currentOwner != nil && currentOwner.Healthy {
 		// Proxy delete to current owner
 		deleteURL := a.getPeerAPIURL(currentOwner, "/api/workloads/"+name)
-		delReq, _ := http.NewRequest("DELETE", deleteURL, nil)
+		delReq, _ := a.peerRequest("DELETE", deleteURL, nil)
 		delResp, err := httpClient.Do(delReq)
 		if err != nil {
 			log.Printf("Warning: failed to remove workload from original owner: %v", err)
@@ -2199,7 +2179,8 @@ func (a *Agent) apiWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		// Proxy logs request to owner
 		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/logs")
-		resp, err := httpClient.Get(url)
+		req, _ := a.peerRequest("GET", url, nil)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
 			return
@@ -2256,7 +2237,8 @@ func (a *Agent) apiStartWorkload(w http.ResponseWriter, r *http.Request) {
 		}
 		// Proxy start request to owner
 		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/start")
-		resp, err := httpClient.Post(url, "application/json", nil)
+		req, _ := a.peerRequest("POST", url, nil)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
 			return
@@ -2321,7 +2303,8 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 		}
 		// Proxy stop request to owner
 		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/stop")
-		resp, err := httpClient.Post(url, "application/json", nil)
+		req, _ := a.peerRequest("POST", url, nil)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
 			return
@@ -3375,11 +3358,6 @@ func (a *Agent) autostartWorkloads() {
 	for _, wl := range toStart {
 		if err := a.deployWorkload(wl); err != nil {
 			log.Printf("Failed to auto-start %s: %v", wl.Name, err)
-		} else {
-			// Register WARP route for successfully started workload
-			if err := a.registerWarpRoute(wl.IP); err != nil {
-				log.Printf("Warning: failed to register WARP route for %s: %v", wl.IP, err)
-			}
 		}
 	}
 }
@@ -3963,10 +3941,6 @@ func (a *Agent) checkFailover() {
 					a.stateMu.Unlock()
 					return
 				}
-				// Register WARP route so workload is reachable via WARP
-				if err := a.registerWarpRoute(w.IP); err != nil {
-					log.Printf("Warning: failed to register WARP route for failover workload %s: %v", w.IP, err)
-				}
 				a.updateHosts()
 				a.saveState()
 				a.broadcastState()
@@ -4279,6 +4253,21 @@ func (a *Agent) getPeerAPIURL(peer *Peer, path string) string {
 		return fmt.Sprintf("https://%s%s", a.tunnelDomain, path)
 	}
 	return ""
+}
+
+// peerRequest creates an HTTP request to a peer with auth headers set.
+func (a *Agent) peerRequest(method, url string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if a.clusterSecret != "" {
+		req.Header.Set("X-API-Key", a.clusterSecret)
+	}
+	if method == "POST" || method == "PUT" || method == "PATCH" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req, nil
 }
 
 // getTunnelAPIURL returns the Cloudflare tunnel URL for API calls.
