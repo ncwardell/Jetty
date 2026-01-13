@@ -141,9 +141,9 @@ sudo JETTY_SECRET=my-cluster-password ./jetty
 | `JETTY_WARP_CONNECTOR_TOKEN` | (none) | WARP Connector token for Zero Trust networking. |
 | `JETTY_PUBLIC_IP` | (auto) | Override public IP detection (useful in containers). |
 | `JETTY_DATA_DIR` | `/data` | Directory for state and compose files. |
-| `JETTY_API_PORT` | `8080` | REST API port. |
+| `JETTY_API_PORT` | `6880` | REST API port. |
 | `JETTY_MESH_CIDR` | `10.100.0.0/16` | Mesh network IP range. |
-| `JETTY_JOIN` | (none) | URL of existing node to join (e.g., `http://node1:8080`). |
+| `JETTY_JOIN` | (none) | URL of existing node to join (e.g., `http://node1:6880`). |
 
 ---
 
@@ -161,14 +161,14 @@ JETTY_SECRET=mypassword JETTY_CF_TOKEN=eyJ... ./jetty
 ```bash
 # On new node - just needs the secret and join URL
 JETTY_SECRET=mypassword \
-JETTY_JOIN=http://first-node:8080 \
+JETTY_JOIN=http://first-node:6880 \
 ./jetty
 ```
 
 ### Check Cluster Status
 
 ```bash
-curl http://localhost:8080/api/status
+curl http://localhost:6880/api/status
 ```
 
 ```json
@@ -198,10 +198,10 @@ curl http://localhost:8080/api/status
 
 ```bash
 # Get health from all nodes
-curl http://localhost:8080/api/cluster/health
+curl http://localhost:6880/api/cluster/health
 
 # Filter by specific node
-curl http://localhost:8080/api/cluster/health?node=node1
+curl http://localhost:6880/api/cluster/health?node=node1
 ```
 
 ```json
@@ -231,7 +231,7 @@ curl http://localhost:8080/api/cluster/health?node=node1
 ### Deploy a Workload
 
 ```bash
-curl -X POST http://localhost:8080/api/workloads \
+curl -X POST http://localhost:6880/api/workloads \
   -H "Content-Type: application/json" \
   -d '{
     "name": "nginx",
@@ -251,16 +251,16 @@ If `allowed_nodes` is specified and the current node is not in the list, the req
 
 ```bash
 # All workloads
-curl http://localhost:8080/api/workloads
+curl http://localhost:6880/api/workloads
 
 # Filter by node
-curl http://localhost:8080/api/workloads?node=node1
+curl http://localhost:6880/api/workloads?node=node1
 ```
 
 ### Get Workload Details
 
 ```bash
-curl http://localhost:8080/api/workloads/nginx
+curl http://localhost:6880/api/workloads/nginx
 ```
 
 Returns container runtime info if the workload is local:
@@ -293,7 +293,7 @@ Returns container runtime info if the workload is local:
 
 ```bash
 # Update metadata only (no redeploy)
-curl -X PATCH http://localhost:8080/api/workloads/nginx \
+curl -X PATCH http://localhost:6880/api/workloads/nginx \
   -H "Content-Type: application/json" \
   -d '{
     "revive": false,
@@ -301,7 +301,7 @@ curl -X PATCH http://localhost:8080/api/workloads/nginx \
   }'
 
 # Update compose or mesh_ip (triggers redeploy)
-curl -X PATCH http://localhost:8080/api/workloads/nginx \
+curl -X PATCH http://localhost:6880/api/workloads/nginx \
   -H "Content-Type: application/json" \
   -d '{
     "compose": "services:\n  web:\n    image: nginx:latest",
@@ -312,17 +312,17 @@ curl -X PATCH http://localhost:8080/api/workloads/nginx \
 ### View Workload Logs
 
 ```bash
-curl http://localhost:8080/api/workloads/nginx/logs
+curl http://localhost:6880/api/workloads/nginx/logs
 ```
 
 ### Start/Stop Workload
 
 ```bash
 # Start
-curl -X POST http://localhost:8080/api/workloads/nginx/start
+curl -X POST http://localhost:6880/api/workloads/nginx/start
 
 # Stop
-curl -X POST http://localhost:8080/api/workloads/nginx/stop
+curl -X POST http://localhost:6880/api/workloads/nginx/stop
 ```
 
 ### Move Workload to Another Node
@@ -332,7 +332,7 @@ Uses zero-downtime blue-green deployment:
 2. Remove from source node
 
 ```bash
-curl -X POST http://localhost:8080/api/workloads/nginx/move \
+curl -X POST http://localhost:6880/api/workloads/nginx/move \
   -H "Content-Type: application/json" \
   -d '{"to": "node2"}'
 ```
@@ -340,7 +340,7 @@ curl -X POST http://localhost:8080/api/workloads/nginx/move \
 ### Delete Workload
 
 ```bash
-curl -X DELETE http://localhost:8080/api/workloads/nginx
+curl -X DELETE http://localhost:6880/api/workloads/nginx
 ```
 
 ---
@@ -350,7 +350,7 @@ curl -X DELETE http://localhost:8080/api/workloads/nginx
 Restrict which nodes can run a workload using `allowed_nodes`:
 
 ```bash
-curl -X POST http://localhost:8080/api/workloads \
+curl -X POST http://localhost:6880/api/workloads \
   -d '{
     "name": "database",
     "allowed_nodes": ["node1", "node2"],
@@ -383,7 +383,7 @@ JETTY_CF_TOKEN=eyJhIjoiNjA2... JETTY_SECRET=pass ./jetty
 ### 3. Or Set via API
 
 ```bash
-curl -X POST http://localhost:8080/api/tunnel \
+curl -X POST http://localhost:6880/api/tunnel \
   -H "Content-Type: application/json" \
   -d '{"token": "eyJhIjoiNjA2..."}'
 ```
@@ -393,7 +393,7 @@ The token automatically propagates to all nodes. Each node connects to the same 
 ### 4. Configure Tunnel Route
 
 In Cloudflare Dashboard, set the tunnel to route to:
-- **Service**: `http://localhost:8080`
+- **Service**: `http://localhost:6880`
 - **Domain**: `cluster.example.com`
 
 Now `cluster.example.com` hits any healthy node in your cluster.
@@ -429,7 +429,7 @@ docker run -d --name jetty \
 ### Status Check
 
 ```bash
-curl http://localhost:8080/api/status | jq '.warp'
+curl http://localhost:6880/api/status | jq '.warp'
 ```
 
 ```json
@@ -513,7 +513,7 @@ main.go
                         ├── startWARP()          → If WARP token configured
                         │
                         └── Goroutines:
-                            ├── runAPI()         → HTTP server on :8080
+                            ├── runAPI()         → HTTP server on :6880
                             ├── gossipLoop()     → Every 10s
                             └── failoverLoop()   → Every 15s
 ```
@@ -673,7 +673,7 @@ services:
 
 ```bash
 # Check if target is reachable
-curl http://target-node:8080/api/health
+curl http://target-node:6880/api/health
 
 # Verify secret matches
 echo $JETTY_SECRET
@@ -685,7 +685,7 @@ echo $JETTY_SECRET
 
 ```bash
 # Check if workload is running
-curl http://localhost:8080/api/workloads/myapp
+curl http://localhost:6880/api/workloads/myapp
 
 # Check Docker containers
 docker ps | grep jetty_myapp
@@ -698,17 +698,17 @@ iptables -t nat -L -n | grep 10.100.50.1
 
 ```bash
 # Check WARP status
-curl http://localhost:8080/api/status | jq '.warp'
+curl http://localhost:6880/api/status | jq '.warp'
 
 # Check peer health
-curl http://localhost:8080/api/cluster/health
+curl http://localhost:6880/api/cluster/health
 ```
 
 ### Cloudflare Tunnel Not Working
 
 ```bash
 # Check tunnel status
-curl http://localhost:8080/api/tunnel
+curl http://localhost:6880/api/tunnel
 
 # Check cloudflared process
 ps aux | grep cloudflared
@@ -768,14 +768,14 @@ docker run -d --name jetty-node2 \
   -v jetty2:/data \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e JETTY_SECRET=supersecret \
-  -e JETTY_JOIN=http://node1-ip:8080 \
+  -e JETTY_JOIN=http://node1-ip:6880 \
   jetty
 ```
 
 ### 3. Deploy a Workload
 
 ```bash
-curl -X POST http://localhost:8080/api/workloads \
+curl -X POST http://localhost:6880/api/workloads \
   -H "Content-Type: application/json" \
   -d '{
     "name": "whoami",

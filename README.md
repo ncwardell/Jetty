@@ -81,25 +81,25 @@ docker run -d \
 ### Status
 ```bash
 # Get this node + all peers + all workloads cluster-wide
-curl http://node:8080/api/status
+curl http://node:6880/api/status
 
 # Get aggregate cluster health from all nodes
-curl http://node:8080/api/cluster/health
+curl http://node:6880/api/cluster/health
 
 # Filter by specific node
-curl http://node:8080/api/cluster/health?node=node1
+curl http://node:6880/api/cluster/health?node=node1
 ```
 
 ### Workloads
 ```bash
 # List all workloads (cluster-wide)
-curl http://node:8080/api/workloads
+curl http://node:6880/api/workloads
 
 # Filter by node
-curl http://node:8080/api/workloads?node=node1
+curl http://node:6880/api/workloads?node=node1
 
 # Deploy workload (mesh_ip auto-assigned if omitted)
-curl -X POST http://node:8080/api/workloads -d '{
+curl -X POST http://node:6880/api/workloads -d '{
   "name": "nfs-server",
   "mesh_ip": "10.100.0.50",
   "revive": true,
@@ -109,29 +109,29 @@ curl -X POST http://node:8080/api/workloads -d '{
 }'
 
 # Update workload
-curl -X PATCH http://node:8080/api/workloads/nfs-server -d '{
+curl -X PATCH http://node:6880/api/workloads/nfs-server -d '{
   "revive": false,
   "allowed_nodes": ["node1", "node2", "node3"]
 }'
 
 # Delete workload
-curl -X DELETE http://node:8080/api/workloads/nfs-server
+curl -X DELETE http://node:6880/api/workloads/nfs-server
 
 # Move workload (zero-downtime blue-green deployment)
-curl -X POST http://node:8080/api/workloads/nfs-server/move -d '{"to": "node2"}'
+curl -X POST http://node:6880/api/workloads/nfs-server/move -d '{"to": "node2"}'
 
 # Start/Stop workload
-curl -X POST http://node:8080/api/workloads/nfs-server/start
-curl -X POST http://node:8080/api/workloads/nfs-server/stop
+curl -X POST http://node:6880/api/workloads/nfs-server/start
+curl -X POST http://node:6880/api/workloads/nfs-server/stop
 
 # View logs
-curl http://node:8080/api/workloads/nfs-server/logs
+curl http://node:6880/api/workloads/nfs-server/logs
 ```
 
 ### Cluster Management
 ```bash
 # Join (called automatically by JETTY_JOIN)
-curl -X POST http://node:8080/api/join -d '{...}'
+curl -X POST http://node:6880/api/join -d '{...}'
 ```
 
 ## Workload Schema
@@ -228,5 +228,5 @@ No coordination needed - all nodes reach same conclusion independently.
 | `JETTY_CF_TOKEN` | Cloudflare tunnel token (bootstrap only, synced to joining nodes) | - |
 | `JETTY_JOIN` | URL to join existing cluster | - |
 | `JETTY_DATA_DIR` | Data directory | `/data` |
-| `JETTY_API_PORT` | API port | `8080` |
+| `JETTY_API_PORT` | API port | `6880` |
 | `JETTY_MESH_CIDR` | Mesh network | `10.100.0.0/16` |
