@@ -32,7 +32,9 @@ start_dbus() {
 # Start WARP service daemon
 start_warp_svc() {
     log "Starting WARP service..."
-    warp-svc --accept-tos &
+    # Set RUST_LOG to error to suppress verbose debug output from warp-svc
+    # Also redirect any remaining output to /dev/null to prevent log flooding
+    RUST_LOG=error warp-svc --accept-tos >/dev/null 2>&1 &
     WARP_SVC_PID=$!
 
     # Wait for WARP to be ready
@@ -174,7 +176,8 @@ main() {
     # Start Cloudflare Tunnel if token provided
     if [ -n "$JETTY_TUNNEL_TOKEN" ]; then
         log "Starting Cloudflare Tunnel..."
-        cloudflared tunnel --no-autoupdate run --token "$JETTY_TUNNEL_TOKEN" &
+        # Redirect cloudflared output to /dev/null to prevent log flooding
+        cloudflared tunnel --no-autoupdate run --token "$JETTY_TUNNEL_TOKEN" >/dev/null 2>&1 &
         TUNNEL_PID=$!
         sleep 2
         log "Cloudflare Tunnel started (PID: $TUNNEL_PID)"
