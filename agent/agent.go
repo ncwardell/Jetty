@@ -146,13 +146,35 @@ func (a *Agent) Start() error {
 	// Cache public IP at startup (avoid slow lookups on every health check)
 	a.publicIP = getPublicIP()
 
-	// Detect WARP IP (required for WARP-only mode)
+	// Try to detect WARP IP (may not be available yet if joining)
 	a.detectWarpIP()
 
 	// Load saved state
 	a.loadState()
 
-	// Verify WARP connectivity
+	// Check if we need to join a cluster first (before WARP is configured)
+	a.stateMu.RLock()
+	hasClusterState := a.state.CFToken != "" || a.state.WarpToken != "" || len(a.state.Peers) > 0
+	needsJoin := a.joinURL != "" && !hasClusterState
+	a.stateMu.RUnlock()
+
+	if needsJoin {
+		// Join cluster first - this will give us the WARP token
+		// We join via the tunnel URL, which doesn't require WARP
+		log.Printf("Joining cluster to obtain WARP configuration...")
+		if err := a.joinCluster(); err != nil {
+			return fmt.Errorf("join: %w", err)
+		}
+		// After join, WARP should be configured - detect IP
+		a.detectWarpIP()
+	}
+
+	// Now we should have WARP IP (either from startup or after join)
+	if a.ip == "" {
+		return fmt.Errorf("WARP IP not detected - ensure WARP is connected")
+	}
+
+	// Initialize network (dummy interface for workload IPs)
 	if err := a.initNetwork(); err != nil {
 		return fmt.Errorf("network: %w", err)
 	}
@@ -162,18 +184,8 @@ func (a *Agent) Start() error {
 		log.Printf("Warning: failed to init WARP rules: %v", err)
 	}
 
-	// Join cluster or sync with existing peers
-	a.stateMu.RLock()
-	hasClusterState := a.state.CFToken != "" || a.state.WarpToken != "" || len(a.state.Peers) > 0
-	a.stateMu.RUnlock()
-
-	if a.joinURL != "" && !hasClusterState {
-		// First run with join URL - join the cluster
-		if err := a.joinCluster(); err != nil {
-			return fmt.Errorf("join: %w", err)
-		}
-	} else {
-		// Already part of cluster (restart) or no join URL - sync state with known peers
+	// Sync with existing peers if not a fresh join
+	if !needsJoin {
 		a.syncStateOnStartup()
 	}
 
@@ -772,136 +784,90 @@ func (a *Agent) joinCluster() error {
 	}
 	log.Printf("Joining cluster via %s", joinEndpoint)
 
-	// Retry loop to handle IP collisions
-	maxRetries := 5
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		req := map[string]string{
-			"secret":      a.clusterSecret, // Cluster secret for authentication
-			"id":          a.hwid,
-			"name":        a.hostname,
-			"ip":          a.ip,          // WARP IP for connectivity
-			"tunnel_host": a.tunnelHost,  // Our specific subdomain for direct API routing
-		}
-
-		data, _ := json.Marshal(req)
-		resp, err := httpClient.Post(joinEndpoint, "application/json", strings.NewReader(string(data)))
-		if err != nil {
-			return err
-		}
-
-		// Handle IP collision - re-derive IP and retry
-		if resp.StatusCode == http.StatusConflict {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-
-			if strings.Contains(string(body), "collision") {
-				log.Printf("Mesh IP %s collision, re-deriving...", a.ip)
-
-				// Mark our current IP as taken so derivation skips it
-				a.stateMu.Lock()
-				// Add a temporary "peer" to mark our IP as taken
-				tempPeer := &Peer{ID: "collision-marker", IP: a.ip}
-				a.state.Peers["collision-marker-"+a.ip] = tempPeer
-				a.ip = a.deriveMeshIPWithCollisionCheck(a.hwid)
-				delete(a.state.Peers, "collision-marker-"+tempPeer.IP)
-				a.stateMu.Unlock()
-
-				// Update network interface with new IP
-				_, network, _ := net.ParseCIDR(a.serviceCIDR)
-				pfx, _ := network.Mask.Size()
-				exec.Command("ip", "addr", "flush", "dev", "jetty0").Run()
-				exec.Command("ip", "addr", "add", fmt.Sprintf("%s/%d", a.ip, pfx), "dev", "jetty0").Run()
-
-				log.Printf("New mesh IP: %s, retrying join...", a.ip)
-				continue
-			}
-			return fmt.Errorf("join failed: %s", body)
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return fmt.Errorf("join failed: %s", body)
-		}
-
-		// Success - process response
-		var result struct {
-			Peers        []*Peer     `json:"peers"`
-			Workloads    []*Workload `json:"workloads"`
-			CFToken      string      `json:"cf_token,omitempty"`
-			WarpToken    string      `json:"warp_token,omitempty"`
-			ServiceCIDR     string      `json:"mesh_cidr,omitempty"`
-			TunnelDomain string      `json:"tunnel_domain,omitempty"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			resp.Body.Close()
-			return fmt.Errorf("decode join response: %w", err)
-		}
-		resp.Body.Close()
-
-		// Update mesh CIDR if received and different (cluster's CIDR takes precedence)
-		if result.ServiceCIDR != "" && result.ServiceCIDR != a.serviceCIDR {
-			log.Printf("Adopting cluster mesh CIDR: %s (was %s)", result.ServiceCIDR, a.serviceCIDR)
-			a.serviceCIDR = result.ServiceCIDR
-			// Re-derive our mesh IP for the new CIDR
-			a.stateMu.Lock()
-			oldIP := a.ip
-			a.ip = a.deriveMeshIPWithCollisionCheck(a.hwid)
-			a.stateMu.Unlock()
-			if oldIP != a.ip {
-				// Update network interface with new IP
-				_, network, _ := net.ParseCIDR(a.serviceCIDR)
-				pfx, _ := network.Mask.Size()
-				exec.Command("ip", "addr", "flush", "dev", "jetty0").Run()
-				exec.Command("ip", "addr", "add", fmt.Sprintf("%s/%d", a.ip, pfx), "dev", "jetty0").Run()
-				log.Printf("Updated mesh IP to %s for new CIDR", a.ip)
-			}
-		}
-
-		// Update tunnel domain if received and not set locally
-		if result.TunnelDomain != "" && a.tunnelDomain == "" {
-			a.tunnelDomain = result.TunnelDomain
-			log.Printf("Adopting cluster tunnel domain: %s", a.tunnelDomain)
-		}
-
-		a.stateMu.Lock()
-		for _, p := range result.Peers {
-			a.state.Peers[p.ID] = p
-		}
-		for _, w := range result.Workloads {
-			a.state.Workloads[w.IP] = w
-		}
-		// Store tokens received from the cluster
-		if result.CFToken != "" {
-			a.state.CFToken = result.CFToken
-		}
-		if result.WarpToken != "" {
-			a.state.WarpToken = result.WarpToken
-		}
-		a.stateMu.Unlock()
-
-		a.saveState()
-
-		// Configure WARP at runtime if we received a token and WARP isn't already enabled
-		if result.WarpToken != "" && !true {
-			if err := a.configureWarpRuntime(result.WarpToken); err != nil {
-				log.Printf("Warning: failed to configure WARP at runtime: %v", err)
-			}
-		}
-
-		// Start cloudflared if we received a token
-		if result.CFToken != "" {
-			if err := a.startCloudflared(); err != nil {
-				log.Printf("Warning: failed to start cloudflared: %v", err)
-			}
-		}
-
-		log.Printf("Joined: %d peers, %d workloads, tunnel=%v, warp=%v, cidr=%s",
-			len(result.Peers), len(result.Workloads), result.CFToken != "", result.WarpToken != "", a.serviceCIDR)
-		return nil
+	// Join request - IP may be empty if WARP not yet configured
+	// (will be set after we receive WARP token and connect)
+	req := map[string]string{
+		"secret":      a.clusterSecret, // Cluster secret for authentication
+		"id":          a.hwid,
+		"name":        a.hostname,
+		"ip":          a.ip,         // WARP IP (may be empty, set after WARP connect)
+		"tunnel_host": a.tunnelHost, // Our specific subdomain for direct API routing
 	}
 
-	return fmt.Errorf("join failed after %d attempts due to IP collisions", maxRetries)
+	data, _ := json.Marshal(req)
+	resp, err := httpClient.Post(joinEndpoint, "application/json", strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return fmt.Errorf("join failed: %s", body)
+	}
+
+	// Success - process response
+	var result struct {
+		Peers        []*Peer     `json:"peers"`
+		Workloads    []*Workload `json:"workloads"`
+		CFToken      string      `json:"cf_token,omitempty"`
+		WarpToken    string      `json:"warp_token,omitempty"`
+		ServiceCIDR  string      `json:"service_cidr,omitempty"`
+		TunnelDomain string      `json:"tunnel_domain,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		resp.Body.Close()
+		return fmt.Errorf("decode join response: %w", err)
+	}
+	resp.Body.Close()
+
+	// Update service CIDR if received (for workload IPs)
+	if result.ServiceCIDR != "" && result.ServiceCIDR != a.serviceCIDR {
+		log.Printf("Adopting cluster service CIDR: %s", result.ServiceCIDR)
+		a.serviceCIDR = result.ServiceCIDR
+	}
+
+	// Update tunnel domain if received and not set locally
+	if result.TunnelDomain != "" && a.tunnelDomain == "" {
+		a.tunnelDomain = result.TunnelDomain
+		log.Printf("Adopting cluster tunnel domain: %s", a.tunnelDomain)
+	}
+
+	a.stateMu.Lock()
+	for _, p := range result.Peers {
+		a.state.Peers[p.ID] = p
+	}
+	for _, w := range result.Workloads {
+		a.state.Workloads[w.IP] = w
+	}
+	// Store tokens received from the cluster
+	if result.CFToken != "" {
+		a.state.CFToken = result.CFToken
+	}
+	if result.WarpToken != "" {
+		a.state.WarpToken = result.WarpToken
+	}
+	a.stateMu.Unlock()
+
+	a.saveState()
+
+	// Configure WARP at runtime if we received a token and WARP isn't connected yet
+	if result.WarpToken != "" && a.ip == "" {
+		if err := a.configureWarpRuntime(result.WarpToken); err != nil {
+			log.Printf("Warning: failed to configure WARP at runtime: %v", err)
+		}
+	}
+
+	// Start cloudflared if we received a token
+	if result.CFToken != "" {
+		if err := a.startCloudflared(); err != nil {
+			log.Printf("Warning: failed to start cloudflared: %v", err)
+		}
+	}
+
+	log.Printf("Joined: %d peers, %d workloads, tunnel=%v, warp=%v",
+		len(result.Peers), len(result.Workloads), result.CFToken != "", result.WarpToken != "")
+	return nil
 }
 
 // =============================================================================
