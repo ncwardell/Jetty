@@ -3677,6 +3677,13 @@ func (a *Agent) startCloudflared() error {
 		return nil // No token configured
 	}
 
+	// Debug: log token info to help diagnose "invalid token" errors
+	if len(token) > 20 {
+		log.Printf("Cloudflare tunnel token: len=%d, prefix=%s..., suffix=...%s", len(token), token[:10], token[len(token)-10:])
+	} else {
+		log.Printf("Cloudflare tunnel token: len=%d (too short - likely invalid)", len(token))
+	}
+
 	a.cfStopCh = make(chan struct{})
 
 	// Start cloudflared tunnel with --no-autoupdate to prevent background updates
