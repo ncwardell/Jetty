@@ -1425,7 +1425,7 @@
         function updateStats() {
             const allNodes = [state.node, ...state.peers].filter(Boolean);
             const healthyNodes = allNodes.filter(n => n.healthy !== false);
-            const runningWorkloads = state.workloads.filter(w => w.containers?.some(c => c.running));
+            const runningWorkloads = state.workloads.filter(w => w.status === 'running');
 
             document.getElementById('stat-nodes').textContent = allNodes.length;
             document.getElementById('stat-healthy').textContent = healthyNodes.length;
@@ -1453,7 +1453,7 @@
 
             grid.innerHTML = allNodes.map(node => {
                 const isCurrentNode = node.id === state.node?.id;
-                const nodeWorkloads = state.workloads.filter(w => w.owner === node.id);
+                const nodeWorkloads = state.workloads.filter(w => w.owner?.id === node.id);
                 const healthClass = node.healthy !== false ? 'healthy' : 'unhealthy';
 
                 return `
@@ -1469,7 +1469,7 @@
                             </div>
                         </div>
                         <div class="node-details">
-                            <p><strong>Mesh IP:</strong> ${node.mesh_ip || node.meshIP || 'N/A'}</p>
+                            <p><strong>Mesh IP:</strong> ${node.ip || 'N/A'}</p>
                             ${node.warp_ip || node.warpIP ? `<p><strong>WARP IP:</strong> ${node.warp_ip || node.warpIP}</p>` : ''}
                             ${node.tunnel_host || node.tunnelHost ? `<p><strong>Tunnel:</strong> ${node.tunnel_host || node.tunnelHost}</p>` : ''}
                         </div>
@@ -1477,7 +1477,7 @@
                             <div class="node-workloads-title">Workloads (${nodeWorkloads.length})</div>
                             <div class="node-workloads-list">
                                 ${nodeWorkloads.map(w => {
-                                    const isRunning = w.containers?.some(c => c.running);
+                                    const isRunning = w.status === 'running';
                                     const statusClass = isRunning ? 'running' : 'stopped';
                                     return `
                                         <div class="workload-chip" onclick="showWorkloadDetail('${w.name}')">
@@ -1509,11 +1509,10 @@
             }
 
             tbody.innerHTML = state.workloads.map(w => {
-                const isRunning = w.containers?.some(c => c.running);
+                const isRunning = w.status === 'running';
                 const statusClass = isRunning ? 'running' : 'stopped';
                 const statusText = isRunning ? 'Running' : 'Stopped';
-                const ownerNode = [state.node, ...state.peers].find(n => n?.id === w.owner);
-                const ownerName = ownerNode?.name || w.owner?.substring(0, 8) || 'Unknown';
+                const ownerName = w.owner?.name || w.owner?.id?.substring(0, 8) || 'Unknown';
 
                 return `
                     <tr>
@@ -1528,7 +1527,7 @@
                                 ${statusText}
                             </span>
                         </td>
-                        <td><code>${w.mesh_ip || w.meshIP}</code></td>
+                        <td><code>${w.ip}</code></td>
                         <td>${ownerName}</td>
                         <td>${w.revive ? 'Yes' : 'No'}</td>
                         <td class="actions-cell">
@@ -1596,7 +1595,7 @@
 
             grid.innerHTML = allNodes.map(node => {
                 const isCurrentNode = node.id === state.node?.id;
-                const nodeWorkloads = state.workloads.filter(w => w.owner === node.id);
+                const nodeWorkloads = state.workloads.filter(w => w.owner?.id === node.id);
                 const healthClass = node.healthy !== false ? 'healthy' : 'unhealthy';
 
                 return `
@@ -1616,13 +1615,13 @@
                             </div>
                         </div>
                         <div class="node-details">
-                            <p><strong>Mesh IP:</strong> ${node.mesh_ip || node.meshIP || 'N/A'}</p>
+                            <p><strong>Mesh IP:</strong> ${node.ip || 'N/A'}</p>
                         </div>
                         <div class="node-workloads">
                             <div class="node-workloads-title">Drag workloads here (${nodeWorkloads.length})</div>
                             <div class="node-workloads-list">
                                 ${nodeWorkloads.map(w => {
-                                    const isRunning = w.containers?.some(c => c.running);
+                                    const isRunning = w.status === 'running';
                                     const statusClass = isRunning ? 'running' : 'stopped';
                                     return `
                                         <div class="workload-chip"
@@ -1672,15 +1671,14 @@
                         </thead>
                         <tbody>
                             ${state.workloads.slice(0, 5).map(w => {
-                                const isRunning = w.containers?.some(c => c.running);
+                                const isRunning = w.status === 'running';
                                 const statusClass = isRunning ? 'running' : 'stopped';
-                                const ownerNode = [state.node, ...state.peers].find(n => n?.id === w.owner);
-                                const ownerName = ownerNode?.name || w.owner?.substring(0, 8) || 'Unknown';
+                                const ownerName = w.owner?.name || w.owner?.id?.substring(0, 8) || 'Unknown';
                                 return `
                                     <tr onclick="showWorkloadDetail('${w.name}')" style="cursor: pointer;">
                                         <td>${w.name}</td>
                                         <td><span class="status-badge ${statusClass}">${isRunning ? 'Running' : 'Stopped'}</span></td>
-                                        <td><code>${w.mesh_ip || w.meshIP}</code></td>
+                                        <td><code>${w.ip}</code></td>
                                         <td>${ownerName}</td>
                                     </tr>
                                 `;
@@ -1739,7 +1737,7 @@
             };
 
             if (meshIp) {
-                payload.mesh_ip = meshIp;
+                payload.ip = meshIp;
             }
 
             if (allowedNodesStr) {
@@ -1808,7 +1806,7 @@
 
             const select = document.getElementById('moveTargetNode');
             const workload = state.workloads.find(w => w.name === name);
-            const allNodes = [state.node, ...state.peers].filter(n => n && n.id !== workload?.owner);
+            const allNodes = [state.node, ...state.peers].filter(n => n && n.id !== workload?.owner?.id);
 
             select.innerHTML = allNodes.map(n =>
                 `<option value="${n.id}">${n.name || n.id.substring(0, 8)}</option>`
@@ -1828,7 +1826,7 @@
             if (!workloadToMove || !targetNode) return;
 
             try {
-                await apiCall(`/workloads/${workloadToMove}/move`, 'POST', { target_node: targetNode });
+                await apiCall(`/workloads/${workloadToMove}/move`, 'POST', { to: targetNode });
                 showToast(`Workload "${workloadToMove}" moved successfully`, 'success');
                 closeMoveModal();
                 await refreshStatus();
@@ -1869,13 +1867,13 @@
             if (!draggedWorkload) return;
 
             const workload = state.workloads.find(w => w.name === draggedWorkload);
-            if (workload?.owner === targetNodeId) {
+            if (workload?.owner?.id === targetNodeId) {
                 showToast('Workload is already on this node', 'error');
                 return;
             }
 
             try {
-                await apiCall(`/workloads/${draggedWorkload}/move`, 'POST', { target_node: targetNodeId });
+                await apiCall(`/workloads/${draggedWorkload}/move`, 'POST', { to: targetNodeId });
                 showToast(`Workload "${draggedWorkload}" moved successfully`, 'success');
                 await refreshStatus();
             } catch (error) {
@@ -1895,8 +1893,7 @@
 
             try {
                 const workload = await apiCall(`/workloads/${name}`);
-                const ownerNode = [state.node, ...state.peers].find(n => n?.id === workload.owner);
-                const ownerName = ownerNode?.name || workload.owner?.substring(0, 8) || 'Unknown';
+                const ownerName = workload.owner?.name || workload.owner?.id?.substring(0, 8) || 'Unknown';
                 const isRunning = workload.containers?.some(c => c.running);
 
                 body.innerHTML = `
@@ -1908,7 +1905,7 @@
                         </div>
                         <div class="detail-row">
                             <span class="detail-label">Mesh IP</span>
-                            <span class="detail-value"><code>${workload.mesh_ip || workload.meshIP}</code></span>
+                            <span class="detail-value"><code>${workload.ip}</code></span>
                         </div>
                         <div class="detail-row">
                             <span class="detail-label">Owner Node</span>
@@ -1941,8 +1938,8 @@
                                 <div class="container-details">
                                     <span><strong>Image:</strong> ${c.image}</span>
                                     <span><strong>Status:</strong> ${c.status}</span>
-                                    ${c.cpu_percent !== undefined ? `<span><strong>CPU:</strong> ${c.cpu_percent.toFixed(1)}%</span>` : ''}
-                                    ${c.memory_percent !== undefined ? `<span><strong>Memory:</strong> ${c.memory_percent.toFixed(1)}%</span>` : ''}
+                                    ${c.cpu_percent ? `<span><strong>CPU:</strong> ${c.cpu_percent}</span>` : ''}
+                                    ${c.memory_percent ? `<span><strong>Memory:</strong> ${c.memory_percent}</span>` : ''}
                                     ${c.uptime ? `<span><strong>Uptime:</strong> ${c.uptime}</span>` : ''}
                                 </div>
                             </div>
@@ -1983,8 +1980,15 @@
             panel.classList.add('open');
 
             try {
-                const response = await apiCall(`/workloads/${name}/logs`);
-                const logs = response.logs || 'No logs available';
+                // Logs endpoint returns plain text, not JSON
+                const url = `${state.apiUrl}/api/workloads/${name}/logs`;
+                const response = await fetch(url, {
+                    headers: { 'X-API-Key': state.secretKey }
+                });
+                if (!response.ok) {
+                    throw new Error(await response.text() || `HTTP ${response.status}`);
+                }
+                const logs = await response.text() || 'No logs available';
 
                 body.innerHTML = `
                     <div class="detail-section">
