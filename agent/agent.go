@@ -510,10 +510,16 @@ func (a *Agent) initWarpRules() error {
 	}
 
 	// Fix WARP's overly restrictive firewall that breaks SSH, git, cloudflared, etc.
-	// Allow all established/related connections and new outbound connections
-	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "input", "ct", "state", "established,related", "accept").Run()
-	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "output", "ct", "state", "established,related", "accept").Run()
-	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "output", "ct", "state", "new", "accept").Run()
+	// WARP creates chains with policy DROP - change them to ACCEPT
+	// This allows normal traffic (SSH, git, cloudflared, etc.) to work while still
+	// routing WARP traffic through the CloudflareWARP interface
+	if _, err := exec.Command("nft", "list", "table", "inet", "cloudflare-warp").Output(); err == nil {
+		log.Printf("Found cloudflare-warp table, fixing policies...")
+		// Change input and output chain policies from DROP to ACCEPT
+		exec.Command("nft", "add", "chain", "inet", "cloudflare-warp", "input", "{ policy accept; }").Run()
+		exec.Command("nft", "add", "chain", "inet", "cloudflare-warp", "output", "{ policy accept; }").Run()
+		log.Printf("WARP firewall policies changed to accept")
+	}
 
 	log.Printf("WARP nft rules initialized")
 	return nil
