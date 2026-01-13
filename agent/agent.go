@@ -39,16 +39,15 @@ var validNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 type Peer struct {
 	ID         string    `json:"id"`          // HWID
 	Name       string    `json:"name"`        // Hostname
-	MeshIP     string    `json:"mesh_ip"`     // Mesh network IP
+	IP         string    `json:"ip"`          // WARP IP (100.96.x.x) - primary address for node communication
 	TunnelHost string    `json:"tunnel_host"` // Peer-specific tunnel hostname (e.g., "node1.cluster.example.com")
-	WarpIP     string    `json:"warp_ip"`     // Cloudflare WARP IP (CGNAT range, e.g., "100.96.x.x")
 	Healthy    bool      `json:"healthy"`
 	LastSeen   time.Time `json:"last_seen"`
 }
 
 type Workload struct {
 	Name         string   `json:"name"`                    // DNS hostname
-	MeshIP       string   `json:"mesh_ip"`                 // Unique lock
+	ServiceIP    string   `json:"service_ip"`              // Unique service IP for /etc/hosts (10.100.x.x)
 	Compose      string   `json:"compose"`
 	Revive       bool     `json:"revive"`                  // Auto-failover to another node if owner dies
 	Autostart    bool     `json:"autostart"`               // Auto-start when Jetty starts up
@@ -59,7 +58,7 @@ type Workload struct {
 
 type State struct {
 	Peers     map[string]*Peer     `json:"peers"`     // ID -> Peer
-	Workloads map[string]*Workload `json:"workloads"` // MeshIP -> Workload
+	Workloads map[string]*Workload `json:"workloads"` // ServiceIP -> Workload
 	CFToken   string               `json:"cf_token,omitempty"`   // Cloudflare tunnel token (shared cluster-wide)
 	WarpToken string               `json:"warp_token,omitempty"` // Cloudflare WARP connector token (shared cluster-wide)
 }
@@ -72,11 +71,7 @@ type Agent struct {
 	// Identity
 	hwid     string
 	hostname string
-	meshIP   string
-
-	// Cloudflare WARP
-	warpIP      string // WARP IP address (CGNAT range, e.g., "100.96.x.x")
-	warpEnabled bool   // Whether WARP mode is active
+	ip       string // WARP IP (100.96.x.x) - primary node address
 
 	// Cloudflare tunnel (for WARP private network routes)
 	cfTunnelID string // WARP connector tunnel ID (for route management)
@@ -84,7 +79,7 @@ type Agent struct {
 	// Config
 	dataDir       string
 	apiPort       int
-	meshCIDR      string
+	serviceCIDR   string // CIDR for workload service IPs (10.100.0.0/16)
 	joinURL       string
 	clusterSecret string // Shared secret for cluster authentication
 	tunnelDomain  string // Cloudflare tunnel domain for API access
