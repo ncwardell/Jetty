@@ -2377,6 +2377,13 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	a.updateHosts()
 	a.saveState()
 
+	// Create IPIP tunnel to this peer (for receiving their traffic)
+	if peer.IP != "" {
+		if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
+			log.Printf("Warning: failed to create tunnel to %s: %v", peer.Name, err)
+		}
+	}
+
 	// Notify other peers
 	go a.announcePeer(peer)
 
@@ -3059,9 +3066,17 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	a.updateHosts()
 	a.saveState()
 
-	// If peer IP changed, update IPIP tunnel
+	// Always ensure we have an IPIP tunnel to this peer (for receiving their traffic)
+	// IPIP requires both sides to have matching tunnels
+	if req.Peer.IP != "" {
+		if err := a.ensurePeerTunnel(req.Peer.ID, req.Peer.IP); err != nil {
+			log.Printf("Warning: failed to create tunnel to %s: %v", req.Peer.Name, err)
+		}
+	}
+
+	// If peer IP changed, also update workload routes
 	if ipChanged {
-		log.Printf("Peer %s IP changed: %s -> %s, updating tunnel", req.Peer.Name, oldIP, req.Peer.IP)
+		log.Printf("Peer %s IP changed: %s -> %s", req.Peer.Name, oldIP, req.Peer.IP)
 		a.stateMu.Lock()
 		a.updateWorkloadRoutes()
 		a.stateMu.Unlock()
