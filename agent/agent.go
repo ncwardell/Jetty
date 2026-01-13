@@ -2293,7 +2293,8 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 	var mu sync.Mutex
 
 	// Check if we should include this node
-	includeLocal := nodeFilter == "" || nodeFilter == a.hwid || nodeFilter == a.hostname
+	// "local" is a special filter meaning "only this node"
+	includeLocal := nodeFilter == "" || nodeFilter == "local" || nodeFilter == a.hwid || nodeFilter == a.hostname
 
 	// Get local node health
 	if includeLocal {
