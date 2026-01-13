@@ -42,9 +42,8 @@ Node 1 (node1)            Node 2 (node2)            Node 3 (node3)
 
 Before starting, you need to set up Cloudflare WARP and Tunnel:
 
-1. **WARP Connector Token**: Create a WARP Connector in your Cloudflare Zero Trust dashboard (required for all nodes)
-2. **Tunnel Token**: Create a Cloudflare Tunnel for external API access (bootstrap node only)
-3. **Tunnel Domain**: Configure a domain pointing to your tunnel (e.g., `jetty.example.com`)
+1. **WARP Connector Token**: Create a WARP Connector in your Cloudflare Zero Trust dashboard
+2. **Tunnel Token**: Create a Cloudflare Tunnel for external API access
 
 ### First Node (Bootstrap)
 
@@ -58,7 +57,6 @@ docker run -d \
   -e JETTY_SECRET=my-cluster-password \
   -e JETTY_WARP_CONNECTOR_TOKEN=your-warp-connector-token \
   -e JETTY_CF_TOKEN=your-cloudflare-tunnel-token \
-  -e JETTY_TUNNEL_DOMAIN=jetty.example.com \
   jetty:latest
 ```
 
@@ -72,12 +70,11 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v jetty-data:/data \
   -e JETTY_SECRET=my-cluster-password \
-  -e JETTY_WARP_CONNECTOR_TOKEN=your-warp-connector-token \
-  -e JETTY_JOIN=https://jetty.example.com \
+  -e JETTY_JOIN=https://your-tunnel-domain.com \
   jetty:latest
 ```
 
-> **Note**: The WARP Connector token is required for all nodes (needed to establish mesh connectivity before joining). The tunnel token and domain are automatically received from the cluster during join, so additional nodes only need the secret and join URL.
+> **Note**: Additional nodes only need the cluster secret and join URL. The WARP connector token and tunnel token are automatically received from the cluster during join and configured at runtime.
 
 ## API
 
@@ -227,9 +224,8 @@ No coordination needed - all nodes reach same conclusion independently.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `JETTY_SECRET` | Shared cluster password (required for all nodes) | - |
-| `JETTY_WARP_CONNECTOR_TOKEN` | WARP Connector token (required for all nodes) | - |
+| `JETTY_WARP_CONNECTOR_TOKEN` | WARP Connector token (bootstrap only, synced to joining nodes) | - |
 | `JETTY_CF_TOKEN` | Cloudflare tunnel token (bootstrap only, synced to joining nodes) | - |
-| `JETTY_TUNNEL_DOMAIN` | Tunnel domain (bootstrap only, synced to joining nodes) | - |
 | `JETTY_JOIN` | URL to join existing cluster | - |
 | `JETTY_DATA_DIR` | Data directory | `/data` |
 | `JETTY_API_PORT` | API port | `8080` |

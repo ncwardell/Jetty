@@ -120,10 +120,42 @@ configure_warp() {
     log "Warning: WARP connection may not be fully established"
 }
 
+# Extract WARP token from state file if it exists
+get_warp_token_from_state() {
+    local data_dir="${JETTY_DATA_DIR:-/data}"
+    local state_file="$data_dir/state.json"
+
+    if [ -f "$state_file" ]; then
+        # Extract warp_token from JSON using grep/sed (no jq dependency)
+        local token=$(grep -o '"warp_token"[[:space:]]*:[[:space:]]*"[^"]*"' "$state_file" 2>/dev/null | sed 's/.*:.*"\([^"]*\)".*/\1/' || true)
+        if [ -n "$token" ] && [ "$token" != "null" ]; then
+            echo "$token"
+        fi
+    fi
+}
+
 # Main entrypoint logic
 main() {
+    local warp_token=""
+
+    # Determine WARP token source:
+    # 1. Environment variable (explicit override or bootstrap node)
+    # 2. State file (existing node restart)
+    # 3. None - will be fetched from cluster during join
+
+    if [ -n "$JETTY_WARP_CONNECTOR_TOKEN" ]; then
+        warp_token="$JETTY_WARP_CONNECTOR_TOKEN"
+        log "Using WARP token from environment"
+    else
+        warp_token=$(get_warp_token_from_state)
+        if [ -n "$warp_token" ]; then
+            log "Using WARP token from state file"
+            export JETTY_WARP_CONNECTOR_TOKEN="$warp_token"
+        fi
+    fi
+
     # Check if WARP should be enabled
-    if [ "$JETTY_WARP_ENABLED" = "true" ] || [ -n "$JETTY_WARP_CONNECTOR_TOKEN" ] || [ -n "$JETTY_WARP_ORGANIZATION" ]; then
+    if [ "$JETTY_WARP_ENABLED" = "true" ] || [ -n "$warp_token" ] || [ -n "$JETTY_WARP_ORGANIZATION" ]; then
         log "WARP mode enabled"
 
         setup_tun
@@ -132,6 +164,9 @@ main() {
         configure_warp
 
         log "WARP initialization complete"
+    elif [ -n "$JETTY_JOIN" ]; then
+        log "WARP token not available - will be fetched from cluster during join"
+        log "Starting Jetty without WARP (will configure after join)"
     else
         log "WARP mode disabled (set JETTY_WARP_ENABLED=true or provide JETTY_WARP_CONNECTOR_TOKEN)"
     fi
