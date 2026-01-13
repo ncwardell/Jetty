@@ -402,14 +402,9 @@ func (a *Agent) cleanupNetwork() {
 					}
 				}
 			}
-			// Remove WARP nft rule for this workload
-			a.removeWarpRule(wl.MeshIP)
 		}
 	}
 	a.stateMu.RUnlock()
-
-	// Remove WARP nft rule for our own mesh IP
-	a.removeWarpRule(a.meshIP)
 
 	// Remove jetty0 interface (this also removes all IPs bound to it)
 	if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
@@ -515,83 +510,8 @@ func (a *Agent) initWarpRules() error {
 		}
 	}
 
-	// Remove WARP's aggressive routing that sends ALL internet traffic through tunnel
-	// We only need 100.96.0.0/12 routed through WARP for mesh connectivity
-	a.cleanupWarpRoutes()
-
 	log.Printf("WARP nft rules initialized")
 	return nil
-}
-
-// addWarpRule adds an nft accept rule for a mesh IP in the cloudflare-warp table.
-// This allows traffic from the specified IP to pass through WARP's firewall rules.
-func (a *Agent) addWarpRule(meshIP string) error {
-	// Insert rule at the beginning of the tun chain to allow traffic from this mesh IP
-	// The cloudflare-warp table restricts traffic to only WARP source IPs by default
-	return exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "tun",
-		"ip", "saddr", meshIP, "accept").Run()
-}
-
-// removeWarpRule removes an nft accept rule for a mesh IP.
-func (a *Agent) removeWarpRule(meshIP string) error {
-	// List rules with handles to find the one for this mesh IP
-	out, err := exec.Command("nft", "-a", "list", "chain", "inet", "cloudflare-warp", "tun").Output()
-	if err != nil {
-		return fmt.Errorf("failed to list nft rules: %w", err)
-	}
-
-	// Parse output to find the rule handle for this mesh IP
-	// Format: "ip saddr 10.100.0.x accept # handle N"
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, meshIP) && strings.Contains(line, "accept") {
-			// Extract handle number from "# handle N"
-			if idx := strings.Index(line, "# handle "); idx != -1 {
-				handleStr := strings.TrimSpace(line[idx+9:])
-				// Delete by handle
-				if err := exec.Command("nft", "delete", "rule", "inet", "cloudflare-warp", "tun", "handle", handleStr).Run(); err != nil {
-					return fmt.Errorf("failed to delete nft rule handle %s: %w", handleStr, err)
-				}
-				return nil
-			}
-		}
-	}
-
-	// Rule not found - not an error, may have been already removed
-	return nil
-}
-
-// cleanupWarpRoutes removes WARP's aggressive split tunnel routes that route
-// almost all internet traffic through the CloudflareWARP interface.
-// We only need 100.96.0.0/12 for mesh connectivity.
-func (a *Agent) cleanupWarpRoutes() {
-	out, err := exec.Command("ip", "route", "show", "dev", "CloudflareWARP").Output()
-	if err != nil {
-		return
-	}
-
-	routes := strings.Split(string(out), "\n")
-	removedCount := 0
-	for _, route := range routes {
-		route = strings.TrimSpace(route)
-		if route == "" {
-			continue
-		}
-		// Keep only the mesh CIDR route (100.96.0.0/12)
-		if strings.HasPrefix(route, "100.96.0.0/12") {
-			continue
-		}
-		// Extract just the network part (first field)
-		fields := strings.Fields(route)
-		if len(fields) > 0 {
-			if err := exec.Command("ip", "route", "del", fields[0], "dev", "CloudflareWARP").Run(); err == nil {
-				removedCount++
-			}
-		}
-	}
-	if removedCount > 0 {
-		log.Printf("Removed %d WARP split tunnel routes (keeping only mesh CIDR)", removedCount)
-	}
 }
 
 func (a *Agent) deriveMeshIP(id string) string {
@@ -1341,13 +1261,6 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	a.saveState()
 	a.broadcastState()
 
-	// Add WARP nft rule for this workload's mesh IP
-	if a.warpEnabled {
-		if err := a.addWarpRule(wl.MeshIP); err != nil {
-			log.Printf("Warning: failed to add WARP rule for %s: %v", wl.MeshIP, err)
-		}
-	}
-
 	// Build response with enriched owner info
 	response := map[string]interface{}{
 		"name":          wl.Name,
@@ -1647,11 +1560,6 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 			a.stateMu.Unlock()
 			http.Error(w, fmt.Sprintf("redeploy failed: %v", err), 500)
 			return
-		}
-
-		// Register new WARP route
-		if a.warpEnabled {
-			a.addWarpRule(newMeshIP)
 		}
 	}
 
@@ -3582,12 +3490,6 @@ func (a *Agent) checkFailover() {
 					return
 				}
 				a.updateHosts()
-				// Add WARP nft rule for this workload
-				if a.warpEnabled {
-					if err := a.addWarpRule(w.MeshIP); err != nil {
-						log.Printf("Warning: failed to add WARP rule for %s: %v", w.MeshIP, err)
-					}
-				}
 				a.saveState()
 				a.broadcastState()
 			}(wl, oldOwner, oldVersion)
@@ -3661,19 +3563,6 @@ func (a *Agent) loadState() {
 		a.state.CFToken = envCFToken
 	}
 	a.stateMu.Unlock()
-
-	// Add WARP nft rules for owned workloads
-	if a.warpEnabled {
-		a.stateMu.RLock()
-		for _, w := range a.state.Workloads {
-			if w.Owner == a.hwid {
-				if err := a.addWarpRule(w.MeshIP); err != nil {
-					log.Printf("Warning: failed to add WARP rule for %s: %v", w.MeshIP, err)
-				}
-			}
-		}
-		a.stateMu.RUnlock()
-	}
 
 	log.Printf("Loaded: %d peers, %d workloads", len(a.state.Peers), len(a.state.Workloads))
 }
