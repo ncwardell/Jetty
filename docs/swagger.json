@@ -1,8 +1,25 @@
 {
+    "schemes": [
+        "https",
+        "http"
+    ],
     "swagger": "2.0",
     "info": {
-        "contact": {}
+        "description": "P2P Docker Compose orchestration with Cloudflare WARP mesh networking",
+        "title": "Jetty API",
+        "termsOfService": "http://swagger.io/terms/",
+        "contact": {
+            "name": "Jetty Support",
+            "url": "https://github.com/ncwardell/jetty"
+        },
+        "license": {
+            "name": "MIT",
+            "url": "https://opensource.org/licenses/MIT"
+        },
+        "version": "2.0"
     },
+    "host": "localhost:6880",
+    "basePath": "/api",
     "paths": {
         "/health": {
             "get": {
@@ -928,5 +945,18 @@
                 }
             }
         }
-    }
+    },
+    "securityDefinitions": {
+        "ApiKeyAuth": {
+            "description": "API key for authentication (JETTY_SECRET)",
+            "type": "apiKey",
+            "name": "X-API-Key",
+            "in": "header"
+        }
+    },
+    "security": [
+        {
+            "ApiKeyAuth": []
+        }
+    ]
 }
