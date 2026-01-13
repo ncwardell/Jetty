@@ -29,6 +29,14 @@ var httpClient = &http.Client{
 	Timeout: 30 * time.Second,
 }
 
+// Shorter timeout clients for peer health checks
+var peerClient = &http.Client{
+	Timeout: 5 * time.Second, // Normal peer query timeout
+}
+var unhealthyPeerClient = &http.Client{
+	Timeout: 1 * time.Second, // Very short timeout for known-unhealthy peers
+}
+
 // Valid workload name pattern (alphanumeric, dash, underscore only)
 var validNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
@@ -37,12 +45,11 @@ var validNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 // =============================================================================
 
 type Peer struct {
-	ID         string    `json:"id"`          // HWID
-	Name       string    `json:"name"`        // Hostname
-	IP         string    `json:"ip"`          // WARP IP (100.96.x.x) - primary address for node communication
-	TunnelHost string    `json:"tunnel_host"` // Peer-specific tunnel hostname (e.g., "node1.cluster.example.com")
-	Healthy    bool      `json:"healthy"`
-	LastSeen   time.Time `json:"last_seen"`
+	ID       string    `json:"id"`        // HWID
+	Name     string    `json:"name"`      // Hostname
+	IP       string    `json:"ip"`        // WARP IP (100.96.x.x) - primary address for node communication
+	Healthy  bool      `json:"healthy"`
+	LastSeen time.Time `json:"last_seen"`
 }
 
 type Workload struct {
@@ -791,11 +798,10 @@ func (a *Agent) joinCluster() error {
 	// Join request - IP may be empty if WARP not yet configured
 	// (will be set after we receive WARP token and connect)
 	req := map[string]string{
-		"secret":      a.clusterSecret, // Cluster secret for authentication
-		"id":          a.hwid,
-		"name":        a.hostname,
-		"ip":          a.ip,         // WARP IP (may be empty, set after WARP connect)
-		"tunnel_host": a.tunnelHost, // Our specific subdomain for direct API routing
+		"secret": a.clusterSecret, // Cluster secret for authentication
+		"id":     a.hwid,
+		"name":   a.hostname,
+		"ip":     a.ip, // WARP IP (may be empty, set after WARP connect)
 	}
 
 	data, _ := json.Marshal(req)
@@ -941,7 +947,6 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/workloads/{name}/stop", a.apiStopWorkload).Methods("POST")
 	r.HandleFunc("/api/join", a.apiJoin).Methods("POST")
 	r.HandleFunc("/api/health", a.apiHealth).Methods("GET")
-	r.HandleFunc("/api/cluster/health", a.apiClusterHealth).Methods("GET")
 	r.HandleFunc("/api/sync", a.apiSync).Methods("GET")
 	r.HandleFunc("/api/tunnel", a.apiGetTunnel).Methods("GET")
 	r.HandleFunc("/api/tunnel", a.apiSetTunnel).Methods("POST")
@@ -2041,11 +2046,10 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 // @Router /join [post]
 func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Secret     string `json:"secret"` // Cluster secret for authentication
-		ID         string `json:"id"`
-		Name       string `json:"name"`
-		IP         string `json:"ip"`
-		TunnelHost string `json:"tunnel_host"`
+		Secret string `json:"secret"` // Cluster secret for authentication
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		IP     string `json:"ip"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
@@ -2085,12 +2089,11 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 
 	// Create peer
 	peer := &Peer{
-		ID:         req.ID,
-		Name:       req.Name,
-		IP:         req.IP,
-		TunnelHost: req.TunnelHost,
-		Healthy:    true,
-		LastSeen:   time.Now(),
+		ID:       req.ID,
+		Name:     req.Name,
+		IP:       req.IP,
+		Healthy:  true,
+		LastSeen: time.Now(),
 	}
 
 	a.stateMu.Lock()
@@ -2098,11 +2101,10 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 
 	// Build response with all peers (including self)
 	allPeers := []*Peer{{
-		ID:         a.hwid,
-		Name:       a.hostname,
-		IP:         a.ip,
-		TunnelHost: a.tunnelHost,
-		Healthy:    true,
+		ID:      a.hwid,
+		Name:    a.hostname,
+		IP:      a.ip,
+		Healthy: true,
 	}}
 	for _, p := range a.state.Peers {
 		if p.ID != req.ID {
@@ -2159,50 +2161,6 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} HealthResponse
 // @Router /health [get]
 func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
-	// Count workloads
-	a.stateMu.RLock()
-	var localWorkloads []string
-	var totalWorkloads int
-	for _, wl := range a.state.Workloads {
-		totalWorkloads++
-		if wl.Owner == a.hwid {
-			// Check if container is running
-			out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
-			status := "stopped"
-			if len(strings.TrimSpace(string(out))) > 0 {
-				status = "running"
-			}
-			localWorkloads = append(localWorkloads, fmt.Sprintf("%s:%s:%s", wl.Name, wl.IP, status))
-		}
-	}
-	a.stateMu.RUnlock()
-
-	// Get system stats
-	systemStats := a.getSystemStats()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":          getHealthStatus(),
-		"id":              a.hwid,
-		"name":            a.hostname,
-		"ip":              a.ip,
-		"public_ip":       a.publicIP,
-		"timestamp":       time.Now().UTC().Format(time.RFC3339),
-		"workloads_local": localWorkloads,
-		"workloads_total": totalWorkloads,
-		"system":          systemStats,
-	})
-}
-
-// apiClusterHealth godoc
-// @Summary Aggregate cluster health
-// @Description Returns health status from all nodes in the cluster
-// @Tags cluster
-// @Produce json
-// @Param node query string false "Filter by specific node name or ID"
-// @Success 200 {object} ClusterHealthResponse
-// @Router /cluster/health [get]
-func (a *Agent) apiClusterHealth(w http.ResponseWriter, r *http.Request) {
 	nodeFilter := r.URL.Query().Get("node")
 
 	// Get list of peers
@@ -2217,6 +2175,7 @@ func (a *Agent) apiClusterHealth(w http.ResponseWriter, r *http.Request) {
 		ID        string                 `json:"id"`
 		Name      string                 `json:"name"`
 		IP        string                 `json:"ip"`
+		PublicIP  string                 `json:"public_ip,omitempty"`
 		Healthy   bool                   `json:"healthy"`
 		Status    string                 `json:"status"`
 		Workloads []string               `json:"workloads"`
@@ -2250,7 +2209,8 @@ func (a *Agent) apiClusterHealth(w http.ResponseWriter, r *http.Request) {
 		localHealth := NodeHealth{
 			ID:        a.hwid,
 			Name:      a.hostname,
-			IP:    a.ip,
+			IP:        a.ip,
+			PublicIP:  a.publicIP,
 			Healthy:   true,
 			Status:    getHealthStatus(),
 			Workloads: localWorkloads,
@@ -2273,13 +2233,23 @@ func (a *Agent) apiClusterHealth(w http.ResponseWriter, r *http.Request) {
 			health := NodeHealth{
 				ID:      p.ID,
 				Name:    p.Name,
-				IP:  p.IP,
+				IP:      p.IP,
 				Healthy: p.Healthy,
 			}
 
+			// Use shorter timeout for unhealthy peers
+			client := peerClient
 			if !p.Healthy {
+				client = unhealthyPeerClient
 				health.Status = "unreachable"
 				health.Error = "peer marked unhealthy"
+			}
+
+			// Skip if peer has no IP
+			url := a.getPeerAPIURL(p, "/api/health?node=local")
+			if url == "" {
+				health.Status = "unreachable"
+				health.Error = "no route to peer"
 				mu.Lock()
 				results = append(results, health)
 				mu.Unlock()
@@ -2287,11 +2257,11 @@ func (a *Agent) apiClusterHealth(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Fetch health from peer
-			url := a.getPeerAPIURL(p, "/api/health")
-			resp, err := httpClient.Get(url)
+			resp, err := client.Get(url)
 			if err != nil {
-				health.Status = "error"
+				health.Status = "unreachable"
 				health.Error = err.Error()
+				health.Healthy = false
 				mu.Lock()
 				results = append(results, health)
 				mu.Unlock()
@@ -2318,14 +2288,24 @@ func (a *Agent) apiClusterHealth(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			// Extract data from peer's local health response
+			health.Healthy = true
 			health.Status = fmt.Sprintf("%v", peerHealth["status"])
-			if wls, ok := peerHealth["workloads_local"].([]interface{}); ok {
-				for _, wl := range wls {
-					health.Workloads = append(health.Workloads, fmt.Sprintf("%v", wl))
-				}
+			if pubIP, ok := peerHealth["public_ip"].(string); ok {
+				health.PublicIP = pubIP
 			}
-			if sys, ok := peerHealth["system"].(map[string]interface{}); ok {
-				health.System = sys
+			if nodes, ok := peerHealth["nodes"].([]interface{}); ok && len(nodes) > 0 {
+				// Peer returned cluster format, extract first node
+				if node, ok := nodes[0].(map[string]interface{}); ok {
+					if wls, ok := node["workloads"].([]interface{}); ok {
+						for _, wl := range wls {
+							health.Workloads = append(health.Workloads, fmt.Sprintf("%v", wl))
+						}
+					}
+					if sys, ok := node["system"].(map[string]interface{}); ok {
+						health.System = sys
+					}
+				}
 			}
 
 			mu.Lock()
@@ -2358,12 +2338,12 @@ func (a *Agent) apiClusterHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"cluster_status":   clusterStatus,
-		"total_nodes":      totalNodes,
-		"healthy_nodes":    healthyNodes,
-		"total_workloads":  totalWorkloads,
-		"timestamp":        time.Now().UTC().Format(time.RFC3339),
-		"nodes":            results,
+		"cluster_status":  clusterStatus,
+		"total_nodes":     totalNodes,
+		"healthy_nodes":   healthyNodes,
+		"total_workloads": totalWorkloads,
+		"timestamp":       time.Now().UTC().Format(time.RFC3339),
+		"nodes":           results,
 	})
 }
 
@@ -3395,12 +3375,11 @@ func (a *Agent) announceOurIP() {
 	}
 
 	self := &Peer{
-		ID:         a.hwid,
-		Name:       a.hostname,
-		IP:         a.ip,
-		TunnelHost: a.tunnelHost,
-		Healthy:    true,
-		LastSeen:   time.Now(),
+		ID:       a.hwid,
+		Name:     a.hostname,
+		IP:       a.ip,
+		Healthy:  true,
+		LastSeen: time.Now(),
 	}
 
 	log.Printf("Announcing our IP (%s) to cluster...", a.ip)
@@ -3775,11 +3754,8 @@ func (a *Agent) getPeerAPIURL(peer *Peer, path string) string {
 	if peer.IP != "" {
 		return fmt.Sprintf("http://%s:%d%s", peer.IP, a.apiPort, path)
 	}
-	// Fall back to tunnel if peer IP unknown
+	// Fall back to tunnel domain if peer IP unknown (WARP not yet connected)
 	if a.tunnelDomain != "" {
-		if peer.TunnelHost != "" {
-			return fmt.Sprintf("https://%s%s", peer.TunnelHost, path)
-		}
 		return fmt.Sprintf("https://%s%s", a.tunnelDomain, path)
 	}
 	return ""
