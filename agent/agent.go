@@ -106,6 +106,7 @@ type Agent struct {
 	// Runtime
 	startTime            time.Time // When Jetty started (for uptime tracking)
 	lastHeartbeatErrLog  time.Time // Last time we logged a heartbeat error (to reduce spam)
+	publicIP             string    // Cached public IP (set at startup to avoid slow lookups)
 
 	stopCh chan struct{}
 }
@@ -146,6 +147,9 @@ func New() (*Agent, error) {
 func (a *Agent) Start() error {
 	// Record start time for uptime tracking
 	a.startTime = time.Now()
+
+	// Cache public IP at startup (avoid slow lookups on every health check)
+	a.publicIP = getPublicIP()
 
 	// Detect WARP IP if WARP is enabled
 	a.detectWarpIP()
@@ -2242,7 +2246,7 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 		"id":              a.hwid,
 		"name":            a.hostname,
 		"mesh_ip":         a.meshIP,
-		"public_ip":       getPublicIP(),
+		"public_ip":       a.publicIP,
 		"timestamp":       time.Now().UTC().Format(time.RFC3339),
 		"workloads_local": localWorkloads,
 		"workloads_total": totalWorkloads,
@@ -3866,8 +3870,9 @@ func getPublicIP() string {
 		return ip
 	}
 
-	// Try to determine IP by dialing out
-	c, err := net.Dial("udp", "8.8.8.8:80")
+	// Try to determine IP by dialing out (with timeout to prevent hangs)
+	dialer := net.Dialer{Timeout: 2 * time.Second}
+	c, err := dialer.Dial("udp", "8.8.8.8:80")
 	if err == nil {
 		defer c.Close()
 		if addr, ok := c.LocalAddr().(*net.UDPAddr); ok && !addr.IP.IsLoopback() {
