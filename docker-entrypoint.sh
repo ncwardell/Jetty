@@ -197,8 +197,11 @@ main() {
 }
 
 # Handle signals for graceful shutdown
+# NOTE: This trap only runs if the container is stopped BEFORE `exec jetty` runs.
+# Once Jetty starts, it handles signals directly via Go's signal.Notify.
+# The Jetty agent has its own cleanup in agent.Stop() -> cleanupNetwork().
 cleanup() {
-    log "Shutting down..."
+    log "Shutting down (entrypoint cleanup)..."
 
     # Stop cloudflared tunnel
     if [ -n "$TUNNEL_PID" ]; then

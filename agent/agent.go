@@ -151,9 +151,37 @@ func New() (*Agent, error) {
 	return a, nil
 }
 
+// cleanupOrphanedState cleans up any leftover state from previous unclean shutdowns.
+// This prevents accumulation of orphaned WARP devices in Cloudflare dashboard.
+func (a *Agent) cleanupOrphanedState() {
+	// Check if there's orphaned jetty0 interface from previous run
+	if err := exec.Command("ip", "link", "show", "jetty0").Run(); err == nil {
+		log.Printf("Found orphaned jetty0 interface from previous run, cleaning up...")
+		exec.Command("ip", "link", "del", "jetty0").Run()
+	}
+
+	// Clean up any orphaned workload routes (routes to service CIDR via CloudflareWARP)
+	// These would be routes like "10.100.x.x via 100.96.x.x dev CloudflareWARP"
+	output, _ := exec.Command("ip", "route", "show", "dev", "CloudflareWARP").CombinedOutput()
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "10.") && strings.Contains(line, "/32") {
+			// This looks like a workload route, extract the IP
+			parts := strings.Fields(line)
+			if len(parts) > 0 {
+				exec.Command("ip", "route", "del", parts[0]).Run()
+				log.Printf("Cleaned up orphaned route: %s", parts[0])
+			}
+		}
+	}
+}
+
 func (a *Agent) Start() error {
 	// Record start time for uptime tracking
 	a.startTime = time.Now()
+
+	// Clean up any orphaned state from previous unclean shutdown
+	a.cleanupOrphanedState()
 
 	// Cache public IP at startup (avoid slow lookups on every health check)
 	a.publicIP = getPublicIP()
@@ -402,6 +430,15 @@ func (a *Agent) Stop() {
 func (a *Agent) cleanupNetwork() {
 	log.Printf("Cleaning up network resources...")
 
+	// Clean up workload routes first
+	a.workloadRoutesMu.Lock()
+	for wlIP := range a.workloadRoutes {
+		exec.Command("ip", "route", "del", wlIP+"/32").Run()
+		log.Printf("Removed route for %s", wlIP)
+	}
+	a.workloadRoutes = make(map[string]string)
+	a.workloadRoutesMu.Unlock()
+
 	// Clean up iptables rules for all workloads
 	a.stateMu.RLock()
 	for _, wl := range a.state.Workloads {
@@ -433,8 +470,16 @@ func (a *Agent) cleanupNetwork() {
 
 	// Unregister WARP device from Cloudflare to prevent orphaned devices
 	log.Printf("Unregistering WARP device from Cloudflare...")
-	exec.Command("warp-cli", "--accept-tos", "disconnect").Run()
-	exec.Command("warp-cli", "--accept-tos", "registration", "delete").Run()
+	if output, err := exec.Command("warp-cli", "--accept-tos", "disconnect").CombinedOutput(); err != nil {
+		log.Printf("WARP disconnect: %v (%s)", err, strings.TrimSpace(string(output)))
+	} else {
+		log.Printf("WARP disconnected")
+	}
+	if output, err := exec.Command("warp-cli", "--accept-tos", "registration", "delete").CombinedOutput(); err != nil {
+		log.Printf("WARP registration delete: %v (%s)", err, strings.TrimSpace(string(output)))
+	} else {
+		log.Printf("WARP registration deleted - device should be removed from Cloudflare dashboard")
+	}
 
 	// Clean up WARP network modifications (important for --net host mode)
 	// These persist on the host after container stops, breaking SSH/git
@@ -807,8 +852,8 @@ func (a *Agent) updateWorkloadRoutes() {
 			// Local workload - no route needed (handled by local iptables)
 			continue
 		}
-		// Find owner's WARP IP
-		if peer, ok := a.state.Peers[wl.Owner]; ok && peer.IP != "" {
+		// Find owner's WARP IP - only route through healthy peers
+		if peer, ok := a.state.Peers[wl.Owner]; ok && peer.IP != "" && peer.Healthy {
 			desiredRoutes[wl.IP] = peer.IP
 		}
 	}
@@ -822,6 +867,7 @@ func (a *Agent) updateWorkloadRoutes() {
 			// Route no longer needed or owner changed - remove it
 			exec.Command("ip", "route", "del", wlIP+"/32").Run()
 			delete(a.workloadRoutes, wlIP)
+			log.Printf("Removed route for %s (was via %s)", wlIP, ownerIP)
 		}
 	}
 
