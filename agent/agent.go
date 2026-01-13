@@ -110,6 +110,10 @@ type Agent struct {
 	lastHeartbeatErrLog  time.Time // Last time we logged a heartbeat error (to reduce spam)
 	publicIP             string    // Cached public IP (set at startup to avoid slow lookups)
 
+	// Route management
+	workloadRoutes   map[string]string // workload IP -> owner WARP IP (for remote workloads)
+	workloadRoutesMu sync.Mutex
+
 	stopCh chan struct{}
 }
 
@@ -118,17 +122,18 @@ func New() (*Agent, error) {
 	os.MkdirAll(dataDir, 0755)
 
 	a := &Agent{
-		hostname:      getHostname(),
-		dataDir:       dataDir,
-		apiPort:       getEnvInt("JETTY_API_PORT", 6880),
-		serviceCIDR:   getEnv("JETTY_SERVICE_CIDR", "10.100.0.0/16"), // CIDR for workload IPs
-		joinURL:       getEnv("JETTY_JOIN", ""),
-		clusterSecret: getEnv("JETTY_SECRET", ""),
-		tunnelDomain:  getEnv("JETTY_TUNNEL_DOMAIN", ""),            // e.g., "cluster.example.com" - Cloudflare tunnel for API access
-		tunnelHost:    getEnv("JETTY_TUNNEL_HOST", ""),              // e.g., "node1.cluster.example.com" - this node's specific subdomain
-		cfTunnelID:    getEnv("JETTY_CF_TUNNEL_ID", ""),             // WARP connector tunnel ID for route management
-		composeDir:    filepath.Join(dataDir, "compose"),
-		hostsFile:     "/etc/hosts",
+		hostname:       getHostname(),
+		dataDir:        dataDir,
+		apiPort:        getEnvInt("JETTY_API_PORT", 6880),
+		serviceCIDR:    getEnv("JETTY_SERVICE_CIDR", "10.100.0.0/16"), // CIDR for workload IPs
+		joinURL:        getEnv("JETTY_JOIN", ""),
+		clusterSecret:  getEnv("JETTY_SECRET", ""),
+		tunnelDomain:   getEnv("JETTY_TUNNEL_DOMAIN", ""),            // e.g., "cluster.example.com" - Cloudflare tunnel for API access
+		tunnelHost:     getEnv("JETTY_TUNNEL_HOST", ""),              // e.g., "node1.cluster.example.com" - this node's specific subdomain
+		cfTunnelID:     getEnv("JETTY_CF_TUNNEL_ID", ""),             // WARP connector tunnel ID for route management
+		composeDir:     filepath.Join(dataDir, "compose"),
+		hostsFile:      "/etc/hosts",
+		workloadRoutes: make(map[string]string),
 		state: &State{
 			Peers:     make(map[string]*Peer),
 			Workloads: make(map[string]*Workload),
@@ -146,9 +151,37 @@ func New() (*Agent, error) {
 	return a, nil
 }
 
+// cleanupOrphanedState cleans up any leftover state from previous unclean shutdowns.
+// This prevents accumulation of orphaned WARP devices in Cloudflare dashboard.
+func (a *Agent) cleanupOrphanedState() {
+	// Check if there's orphaned jetty0 interface from previous run
+	if err := exec.Command("ip", "link", "show", "jetty0").Run(); err == nil {
+		log.Printf("Found orphaned jetty0 interface from previous run, cleaning up...")
+		exec.Command("ip", "link", "del", "jetty0").Run()
+	}
+
+	// Clean up any orphaned workload routes (routes to service CIDR via CloudflareWARP)
+	// These would be routes like "10.100.x.x via 100.96.x.x dev CloudflareWARP"
+	output, _ := exec.Command("ip", "route", "show", "dev", "CloudflareWARP").CombinedOutput()
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "10.") && strings.Contains(line, "/32") {
+			// This looks like a workload route, extract the IP
+			parts := strings.Fields(line)
+			if len(parts) > 0 {
+				exec.Command("ip", "route", "del", parts[0]).Run()
+				log.Printf("Cleaned up orphaned route: %s", parts[0])
+			}
+		}
+	}
+}
+
 func (a *Agent) Start() error {
 	// Record start time for uptime tracking
 	a.startTime = time.Now()
+
+	// Clean up any orphaned state from previous unclean shutdown
+	a.cleanupOrphanedState()
 
 	// Cache public IP at startup (avoid slow lookups on every health check)
 	a.publicIP = getPublicIP()
@@ -276,10 +309,11 @@ func (a *Agent) configureWarpRuntime(token string) error {
 	if err := exec.Command("warp-cli", "--accept-tos", "status").Run(); err != nil {
 		log.Printf("Starting WARP service...")
 
-		// Start warp-svc in background
+		// Start warp-svc in background with suppressed output
+		// RUST_LOG=error reduces verbose debug output that floods logs on some distros (e.g., Arch)
 		cmd := exec.Command("warp-svc", "--accept-tos")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		cmd.Env = append(os.Environ(), "RUST_LOG=error")
+		// Discard stdout/stderr to prevent log flooding
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("failed to start warp-svc: %w", err)
 		}
@@ -397,6 +431,15 @@ func (a *Agent) Stop() {
 func (a *Agent) cleanupNetwork() {
 	log.Printf("Cleaning up network resources...")
 
+	// Clean up workload routes first
+	a.workloadRoutesMu.Lock()
+	for wlIP := range a.workloadRoutes {
+		exec.Command("ip", "route", "del", wlIP+"/32").Run()
+		log.Printf("Removed route for %s", wlIP)
+	}
+	a.workloadRoutes = make(map[string]string)
+	a.workloadRoutesMu.Unlock()
+
 	// Clean up iptables rules for all workloads
 	a.stateMu.RLock()
 	for _, wl := range a.state.Workloads {
@@ -428,8 +471,16 @@ func (a *Agent) cleanupNetwork() {
 
 	// Unregister WARP device from Cloudflare to prevent orphaned devices
 	log.Printf("Unregistering WARP device from Cloudflare...")
-	exec.Command("warp-cli", "--accept-tos", "disconnect").Run()
-	exec.Command("warp-cli", "--accept-tos", "registration", "delete").Run()
+	if output, err := exec.Command("warp-cli", "--accept-tos", "disconnect").CombinedOutput(); err != nil {
+		log.Printf("WARP disconnect: %v (%s)", err, strings.TrimSpace(string(output)))
+	} else {
+		log.Printf("WARP disconnected")
+	}
+	if output, err := exec.Command("warp-cli", "--accept-tos", "registration", "delete").CombinedOutput(); err != nil {
+		log.Printf("WARP registration delete: %v (%s)", err, strings.TrimSpace(string(output)))
+	} else {
+		log.Printf("WARP registration deleted - device should be removed from Cloudflare dashboard")
+	}
 
 	// Clean up WARP network modifications (important for --net host mode)
 	// These persist on the host after container stops, breaking SSH/git
@@ -781,6 +832,58 @@ func (a *Agent) updateHosts() {
 
 	// Write
 	os.WriteFile(a.hostsFile, []byte(strings.Join(newLines, "\n")), 0644)
+
+	// Update routes for remote workloads
+	a.updateWorkloadRoutes()
+}
+
+// updateWorkloadRoutes adds/removes routes for remote workloads.
+// For each remote workload, we add a route through the owner's WARP IP.
+// This must be called with stateMu held (at least RLock).
+func (a *Agent) updateWorkloadRoutes() {
+	// Skip if WARP is not connected (no CloudflareWARP interface)
+	if a.ip == "" {
+		return
+	}
+
+	// Build map of desired routes: workload IP -> owner WARP IP
+	desiredRoutes := make(map[string]string)
+	for _, wl := range a.state.Workloads {
+		if wl.Owner == a.hwid {
+			// Local workload - no route needed (handled by local iptables)
+			continue
+		}
+		// Find owner's WARP IP - only route through healthy peers
+		if peer, ok := a.state.Peers[wl.Owner]; ok && peer.IP != "" && peer.Healthy {
+			desiredRoutes[wl.IP] = peer.IP
+		}
+	}
+
+	a.workloadRoutesMu.Lock()
+	defer a.workloadRoutesMu.Unlock()
+
+	// Remove stale routes (routes that are no longer needed)
+	for wlIP, ownerIP := range a.workloadRoutes {
+		if desiredOwnerIP, ok := desiredRoutes[wlIP]; !ok || desiredOwnerIP != ownerIP {
+			// Route no longer needed or owner changed - remove it
+			exec.Command("ip", "route", "del", wlIP+"/32").Run()
+			delete(a.workloadRoutes, wlIP)
+			log.Printf("Removed route for %s (was via %s)", wlIP, ownerIP)
+		}
+	}
+
+	// Add new routes
+	for wlIP, ownerIP := range desiredRoutes {
+		if existingOwner, ok := a.workloadRoutes[wlIP]; ok && existingOwner == ownerIP {
+			// Route already exists with correct owner
+			continue
+		}
+		// Add route via owner's WARP IP
+		if err := exec.Command("ip", "route", "add", wlIP+"/32", "via", ownerIP, "dev", "CloudflareWARP").Run(); err == nil {
+			a.workloadRoutes[wlIP] = ownerIP
+			log.Printf("Added route for %s via %s (CloudflareWARP)", wlIP, ownerIP)
+		}
+	}
 }
 
 // =============================================================================
@@ -2449,13 +2552,15 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 
 			// Extract data from peer's local health response
 			health.Healthy = true
-			health.Status = fmt.Sprintf("%v", peerHealth["status"])
-			if pubIP, ok := peerHealth["public_ip"].(string); ok {
-				health.PublicIP = pubIP
-			}
 			if nodes, ok := peerHealth["nodes"].([]interface{}); ok && len(nodes) > 0 {
-				// Peer returned cluster format, extract first node
+				// Peer returned cluster format, extract first node's data
 				if node, ok := nodes[0].(map[string]interface{}); ok {
+					if status, ok := node["status"].(string); ok {
+						health.Status = status
+					}
+					if pubIP, ok := node["public_ip"].(string); ok {
+						health.PublicIP = pubIP
+					}
 					if wls, ok := node["workloads"].([]interface{}); ok {
 						for _, wl := range wls {
 							health.Workloads = append(health.Workloads, fmt.Sprintf("%v", wl))
