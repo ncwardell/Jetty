@@ -3651,8 +3651,9 @@ func (a *Agent) startCloudflared() error {
 	// Start cloudflared tunnel - pass token via environment to avoid exposing in process list
 	a.cfCmd = exec.Command("cloudflared", "tunnel", "run")
 	a.cfCmd.Env = append(os.Environ(), "TUNNEL_TOKEN="+token)
-	a.cfCmd.Stdout = os.Stdout
-	a.cfCmd.Stderr = os.Stderr
+	// Discard cloudflared verbose output to avoid log flooding
+	a.cfCmd.Stdout = io.Discard
+	a.cfCmd.Stderr = io.Discard
 
 	if err := a.cfCmd.Start(); err != nil {
 		return fmt.Errorf("cloudflared start: %w", err)
@@ -3696,7 +3697,18 @@ func (a *Agent) stopCloudflared() {
 }
 
 // monitorCloudflared watches the cloudflared process and restarts it if it dies.
+// Uses exponential backoff with a maximum of 10 consecutive failures before giving up.
 func (a *Agent) monitorCloudflared() {
+	const (
+		initialBackoff  = 5 * time.Second
+		maxBackoff      = 2 * time.Minute
+		maxFailures     = 10
+		successReset    = 30 * time.Second // Reset failure count if running for this long
+	)
+
+	backoff := initialBackoff
+	failures := 0
+
 	for {
 		a.cfMu.Lock()
 		cmd := a.cfCmd
@@ -3706,6 +3718,8 @@ func (a *Agent) monitorCloudflared() {
 		if cmd == nil {
 			return
 		}
+
+		startTime := time.Now()
 
 		// Wait for process to exit
 		err := cmd.Wait()
@@ -3717,13 +3731,33 @@ func (a *Agent) monitorCloudflared() {
 		default:
 		}
 
-		if err != nil {
-			log.Printf("Cloudflare tunnel exited: %v, restarting in 5s...", err)
+		// If process ran for a while, reset the failure counter and backoff
+		if time.Since(startTime) >= successReset {
+			failures = 0
+			backoff = initialBackoff
 		} else {
-			log.Printf("Cloudflare tunnel exited, restarting in 5s...")
+			failures++
 		}
 
-		time.Sleep(5 * time.Second)
+		// Check if we've exceeded max failures
+		if failures >= maxFailures {
+			log.Printf("Cloudflare tunnel failed %d times consecutively, giving up. Check your JETTY_CF_TOKEN.", failures)
+			return
+		}
+
+		if err != nil {
+			log.Printf("Cloudflare tunnel exited: %v (attempt %d/%d), restarting in %v...", err, failures, maxFailures, backoff)
+		} else {
+			log.Printf("Cloudflare tunnel exited (attempt %d/%d), restarting in %v...", failures, maxFailures, backoff)
+		}
+
+		time.Sleep(backoff)
+
+		// Exponential backoff: double the wait time for next failure, up to max
+		backoff = backoff * 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
 
 		// Check again if we should stop
 		select {
@@ -3746,8 +3780,9 @@ func (a *Agent) monitorCloudflared() {
 		// Pass token via environment to avoid exposing in process list
 		a.cfCmd = exec.Command("cloudflared", "tunnel", "run")
 		a.cfCmd.Env = append(os.Environ(), "TUNNEL_TOKEN="+token)
-		a.cfCmd.Stdout = os.Stdout
-		a.cfCmd.Stderr = os.Stderr
+		// Discard cloudflared verbose output to avoid log flooding
+		a.cfCmd.Stdout = io.Discard
+		a.cfCmd.Stderr = io.Discard
 
 		if err := a.cfCmd.Start(); err != nil {
 			log.Printf("Cloudflare tunnel restart failed: %v", err)
