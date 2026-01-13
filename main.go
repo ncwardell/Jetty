@@ -32,6 +32,8 @@ import (
 // @name X-API-Key
 // @description API key for authentication (JETTY_SECRET)
 
+// @Security ApiKeyAuth
+
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 

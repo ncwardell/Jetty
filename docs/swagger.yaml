@@ -642,6 +642,8 @@ paths:
 schemes:
 - http
 - https
+security:
+- ApiKeyAuth: []
 securityDefinitions:
   ApiKeyAuth:
     description: API key for authentication (JETTY_SECRET)
