@@ -382,49 +382,19 @@ func (a *Agent) configureWarpRuntime(token string) error {
 }
 
 // =============================================================================
-// WARP Private Network Routes (via cloudflared CLI)
+// WARP Private Network Routes
 // =============================================================================
+// NOTE: These functions are no longer used. Workload routing now uses IPIP
+// tunnels between nodes instead of Cloudflare private network routes.
+// Keeping the functions as no-ops to avoid breaking callers.
 
-// registerWarpRoute adds a private network route for a mesh IP using cloudflared CLI.
-// This allows WARP clients to reach the workload through the tunnel.
+// registerWarpRoute is a no-op - IPIP tunnels handle routing now.
 func (a *Agent) registerWarpRoute(meshIP string) error {
-	if a.cfTunnelID == "" {
-		return nil // WARP route management not configured
-	}
-
-	// Use cloudflared tunnel route command
-	cmd := exec.Command("cloudflared", "tunnel", "route", "ip", "add", meshIP+"/32", a.cfTunnelID)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// Ignore "already exists" errors
-		if strings.Contains(string(output), "already exists") {
-			log.Printf("WARP route for %s already exists", meshIP)
-			return nil
-		}
-		return fmt.Errorf("cloudflared route add: %s", output)
-	}
-
-	log.Printf("WARP route registered: %s -> tunnel %s", meshIP, a.cfTunnelID[:8])
 	return nil
 }
 
-// unregisterWarpRoute removes a private network route for a mesh IP.
+// unregisterWarpRoute is a no-op - IPIP tunnels handle routing now.
 func (a *Agent) unregisterWarpRoute(meshIP string) error {
-	if a.cfTunnelID == "" {
-		return nil // WARP route management not configured
-	}
-
-	cmd := exec.Command("cloudflared", "tunnel", "route", "ip", "delete", meshIP+"/32")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// Ignore "not found" errors
-		if strings.Contains(string(output), "not found") {
-			return nil
-		}
-		return fmt.Errorf("cloudflared route delete: %s", output)
-	}
-
-	log.Printf("WARP route unregistered: %s", meshIP)
 	return nil
 }
 
@@ -3936,29 +3906,12 @@ func (a *Agent) loadState() {
 // errors, connection status, and other important information.
 type cloudflaredLogFilter struct {
 	prefix string
-	agent  *Agent // Reference to agent to capture tunnel ID
 }
 
 func (f *cloudflaredLogFilter) Write(p []byte) (n int, err error) {
 	line := strings.TrimSpace(string(p))
 	if line == "" {
 		return len(p), nil
-	}
-
-	// Extract tunnel ID from "Starting tunnel" log line
-	// Example: "2026-01-13T22:24:19Z INF Starting tunnel tunnelID=81f15f65-05ae-4e1b-931d-8866f058dd1d"
-	if strings.Contains(line, "Starting tunnel") && strings.Contains(line, "tunnelID=") {
-		if idx := strings.Index(line, "tunnelID="); idx != -1 {
-			tunnelID := line[idx+9:] // Skip "tunnelID="
-			// Trim any trailing content after the UUID
-			if spaceIdx := strings.IndexAny(tunnelID, " \t\n"); spaceIdx != -1 {
-				tunnelID = tunnelID[:spaceIdx]
-			}
-			if f.agent != nil && f.agent.cfTunnelID == "" && len(tunnelID) > 0 {
-				f.agent.cfTunnelID = tunnelID
-				log.Printf("Captured tunnel ID: %s (WARP route registration enabled)", tunnelID[:8])
-			}
-		}
 	}
 
 	// Only log important messages: errors, warnings, connection status
@@ -4005,8 +3958,7 @@ func (a *Agent) startCloudflared() error {
 	a.cfCmd = exec.Command("cloudflared", "--no-autoupdate", "tunnel", "run", "--token", token)
 
 	// Use filtered log writer to capture important messages while suppressing verbose output
-	// The filter also captures tunnel ID for WARP route registration
-	logFilter := &cloudflaredLogFilter{prefix: "cloudflared", agent: a}
+	logFilter := &cloudflaredLogFilter{prefix: "cloudflared"}
 	a.cfCmd.Stdout = logFilter
 	a.cfCmd.Stderr = logFilter
 
