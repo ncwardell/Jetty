@@ -3644,23 +3644,9 @@ func (f *cloudflaredLogFilter) Write(p []byte) (n int, err error) {
 		return len(p), nil
 	}
 
-	// Convert to lowercase for matching
-	lower := strings.ToLower(line)
-
-	// Always log errors and important status messages
-	important := strings.Contains(lower, "error") ||
-		strings.Contains(lower, "failed") ||
-		strings.Contains(lower, "unable") ||
-		strings.Contains(lower, "cannot") ||
-		strings.Contains(lower, "connection") ||
-		strings.Contains(lower, "registered") ||
-		strings.Contains(lower, "unregistered") ||
-		strings.Contains(lower, "reconnect") ||
-		strings.Contains(lower, "tunnel") && (strings.Contains(lower, "start") || strings.Contains(lower, "stop"))
-
-	if important {
-		log.Printf("[cloudflared] %s", line)
-	}
+	// Log all cloudflared output for debugging
+	// TODO: Re-enable filtering once tunnel is working
+	log.Printf("[cloudflared] %s", line)
 
 	return len(p), nil
 }
