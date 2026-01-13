@@ -640,8 +640,8 @@ paths:
       tags:
       - workloads
 schemes:
-- http
 - https
+- http
 security:
 - ApiKeyAuth: []
 securityDefinitions:

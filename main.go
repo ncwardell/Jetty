@@ -25,7 +25,7 @@ import (
 // @host localhost:6880
 // @BasePath /api
 
-// @schemes http https
+// @schemes https http
 
 // @securityDefinitions.apikey ApiKeyAuth
 // @in header
