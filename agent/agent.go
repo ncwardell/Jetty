@@ -970,6 +970,8 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/workloads/{name}/start", a.apiStartWorkload).Methods("POST")
 	r.HandleFunc("/api/workloads/{name}/stop", a.apiStopWorkload).Methods("POST")
 	r.HandleFunc("/api/join", a.apiJoin).Methods("POST")
+	r.HandleFunc("/api/nodes", a.apiListNodes).Methods("GET")
+	r.HandleFunc("/api/nodes/{id}", a.apiRemoveNode).Methods("DELETE")
 	r.HandleFunc("/api/health", a.apiHealth).Methods("GET")
 	r.HandleFunc("/api/sync", a.apiSync).Methods("GET")
 	r.HandleFunc("/api/tunnel", a.apiGetTunnel).Methods("GET")
@@ -1017,8 +1019,9 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 			"name": a.hostname,
 			"ip":   a.ip,
 		},
-		"peers":     peers,
-		"workloads": workloads,
+		"peers":        peers,
+		"workloads":    workloads,
+		"service_cidr": a.serviceCIDR,
 		"tunnel": map[string]interface{}{
 			"configured": hasTunnel,
 			"running":    a.isTunnelRunning(),
@@ -1248,6 +1251,11 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		a.stateMu.Unlock()
 		http.Error(w, err.Error(), 500)
 		return
+	}
+
+	// Register WARP route so workload is reachable via WARP
+	if err := a.registerWarpRoute(wl.IP); err != nil {
+		log.Printf("Warning: failed to register WARP route for %s: %v", wl.IP, err)
 	}
 
 	a.updateHosts()
@@ -2177,6 +2185,107 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Peer joined: %s (%s)", peer.Name, peer.IP)
 }
 
+// apiListNodes godoc
+// @Summary List all nodes
+// @Description Returns all nodes in the cluster (self + peers)
+// @Tags nodes
+// @Produce json
+// @Success 200 {array} Peer
+// @Router /nodes [get]
+func (a *Agent) apiListNodes(w http.ResponseWriter, r *http.Request) {
+	a.stateMu.RLock()
+	nodes := []map[string]interface{}{
+		{
+			"id":        a.hwid,
+			"name":      a.hostname,
+			"ip":        a.ip,
+			"healthy":   true,
+			"last_seen": time.Now(),
+			"is_self":   true,
+		},
+	}
+	for _, p := range a.state.Peers {
+		nodes = append(nodes, map[string]interface{}{
+			"id":        p.ID,
+			"name":      p.Name,
+			"ip":        p.IP,
+			"healthy":   p.Healthy,
+			"last_seen": p.LastSeen,
+			"is_self":   false,
+		})
+	}
+	a.stateMu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(nodes)
+}
+
+// apiRemoveNode godoc
+// @Summary Remove a node from the cluster
+// @Description Removes a peer node from the cluster. Workloads owned by that node will be orphaned and eligible for failover if revive is enabled.
+// @Tags nodes
+// @Produce json
+// @Param id path string true "Node ID (HWID) or name"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} ErrorResponse "Cannot remove self"
+// @Failure 404 {object} ErrorResponse "Node not found"
+// @Router /nodes/{id} [delete]
+func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	nodeID := vars["id"]
+
+	// Can't remove self
+	if nodeID == a.hwid || nodeID == a.hostname {
+		http.Error(w, "cannot remove self from cluster", 400)
+		return
+	}
+
+	a.stateMu.Lock()
+
+	// Find peer by ID or name
+	var found *Peer
+	var foundID string
+	for id, p := range a.state.Peers {
+		if p.ID == nodeID || p.Name == nodeID {
+			found = p
+			foundID = id
+			break
+		}
+	}
+
+	if found == nil {
+		a.stateMu.Unlock()
+		http.Error(w, "node not found", 404)
+		return
+	}
+
+	// Count workloads owned by this node
+	var orphanedWorkloads []string
+	for _, wl := range a.state.Workloads {
+		if wl.Owner == found.ID {
+			orphanedWorkloads = append(orphanedWorkloads, wl.Name)
+		}
+	}
+
+	// Remove the peer
+	delete(a.state.Peers, foundID)
+	a.stateMu.Unlock()
+
+	a.updateHosts()
+	a.saveState()
+	a.broadcastState()
+
+	log.Printf("Removed node: %s (%s), orphaned workloads: %v", found.Name, found.ID, orphanedWorkloads)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"removed":            found.Name,
+		"id":                 found.ID,
+		"orphaned_workloads": orphanedWorkloads,
+		"message":            "node removed; orphaned workloads will failover if revive is enabled",
+	})
+}
+
 // apiHealth godoc
 // @Summary Health check
 // @Description Returns health status of this node
@@ -3009,41 +3118,60 @@ func (a *Agent) cleanupWorkloadIP(wl *Workload) {
 
 func (a *Agent) setupWorkloadIP(wl *Workload) {
 	// Add IP to interface
-	exec.Command("ip", "addr", "add", wl.IP+"/32", "dev", "jetty0").Run()
+	if err := exec.Command("ip", "addr", "add", wl.IP+"/32", "dev", "jetty0").Run(); err != nil {
+		// Ignore "already exists" errors
+		log.Printf("Note: adding %s to jetty0: %v (may already exist)", wl.IP, err)
+	}
 
-	// Get container IP - use docker ps to find containers in the project
-	// This handles any service name in the compose file
-	out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
-	if err != nil || len(out) == 0 {
-		log.Printf("Warning: no containers found for project jetty_%s", wl.Name)
+	// Wait for container to be ready with retry logic
+	var containerIP string
+	maxRetries := 10
+	for i := 0; i < maxRetries; i++ {
+		containerIP = a.getWorkloadContainerIP(wl.Name)
+		if containerIP != "" {
+			break
+		}
+		if i < maxRetries-1 {
+			time.Sleep(time.Duration(500*(i+1)) * time.Millisecond) // 500ms, 1s, 1.5s, ...
+		}
+	}
+
+	if containerIP == "" {
+		log.Printf("Error: couldn't get container IP for %s after %d retries", wl.Name, maxRetries)
 		return
 	}
 
-	// Get first container ID
+	// Set up DNAT rules
+	if err := exec.Command("iptables", "-t", "nat", "-A", "PREROUTING", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run(); err != nil {
+		log.Printf("Error: PREROUTING DNAT for %s: %v", wl.Name, err)
+	}
+	if err := exec.Command("iptables", "-t", "nat", "-A", "OUTPUT", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run(); err != nil {
+		log.Printf("Error: OUTPUT DNAT for %s: %v", wl.Name, err)
+	}
+
+	log.Printf("Routed: %s -> %s", wl.IP, containerIP)
+}
+
+// getWorkloadContainerIP returns the container IP for a workload, or empty string if not found.
+func (a *Agent) getWorkloadContainerIP(name string) string {
+	// Get container ID
+	out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+name).Output()
+	if err != nil || len(out) == 0 {
+		return ""
+	}
+
 	containerID := strings.Split(strings.TrimSpace(string(out)), "\n")[0]
 	if containerID == "" {
-		log.Printf("Warning: couldn't get container ID for %s", wl.Name)
-		return
+		return ""
 	}
 
 	// Get container IP
 	out, err = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID).Output()
 	if err != nil {
-		log.Printf("Warning: couldn't inspect container %s: %v", containerID, err)
-		return
+		return ""
 	}
 
-	containerIP := strings.TrimSpace(string(out))
-	if containerIP == "" {
-		log.Printf("Warning: couldn't get container IP for %s", wl.Name)
-		return
-	}
-
-	// DNAT
-	exec.Command("iptables", "-t", "nat", "-A", "PREROUTING", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run()
-	exec.Command("iptables", "-t", "nat", "-A", "OUTPUT", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run()
-
-	log.Printf("Routed: %s -> %s", wl.IP, containerIP)
+	return strings.TrimSpace(string(out))
 }
 
 func (a *Agent) composeCmd(name string, args ...string) (string, error) {
@@ -3470,6 +3598,10 @@ func (a *Agent) checkFailover() {
 					}
 					a.stateMu.Unlock()
 					return
+				}
+				// Register WARP route so workload is reachable via WARP
+				if err := a.registerWarpRoute(w.IP); err != nil {
+					log.Printf("Warning: failed to register WARP route for failover workload %s: %v", w.IP, err)
 				}
 				a.updateHosts()
 				a.saveState()
