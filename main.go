@@ -12,8 +12,8 @@ import (
 )
 
 // @title Jetty API
-// @version 1.0
-// @description P2P Docker Compose orchestration with WireGuard mesh networking
+// @version 2.0
+// @description P2P Docker Compose orchestration with Cloudflare WARP mesh networking
 // @termsOfService http://swagger.io/terms/
 
 // @contact.name Jetty Support
