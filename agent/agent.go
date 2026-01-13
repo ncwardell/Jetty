@@ -1226,6 +1226,11 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Register WARP route so workload is reachable via WARP
+	if err := a.registerWarpRoute(wl.IP); err != nil {
+		log.Printf("Warning: failed to register WARP route for %s: %v", wl.IP, err)
+	}
+
 	a.updateHosts()
 	a.saveState()
 	a.broadcastState()
@@ -2985,41 +2990,60 @@ func (a *Agent) cleanupWorkloadIP(wl *Workload) {
 
 func (a *Agent) setupWorkloadIP(wl *Workload) {
 	// Add IP to interface
-	exec.Command("ip", "addr", "add", wl.IP+"/32", "dev", "jetty0").Run()
+	if err := exec.Command("ip", "addr", "add", wl.IP+"/32", "dev", "jetty0").Run(); err != nil {
+		// Ignore "already exists" errors
+		log.Printf("Note: adding %s to jetty0: %v (may already exist)", wl.IP, err)
+	}
 
-	// Get container IP - use docker ps to find containers in the project
-	// This handles any service name in the compose file
-	out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
-	if err != nil || len(out) == 0 {
-		log.Printf("Warning: no containers found for project jetty_%s", wl.Name)
+	// Wait for container to be ready with retry logic
+	var containerIP string
+	maxRetries := 10
+	for i := 0; i < maxRetries; i++ {
+		containerIP = a.getWorkloadContainerIP(wl.Name)
+		if containerIP != "" {
+			break
+		}
+		if i < maxRetries-1 {
+			time.Sleep(time.Duration(500*(i+1)) * time.Millisecond) // 500ms, 1s, 1.5s, ...
+		}
+	}
+
+	if containerIP == "" {
+		log.Printf("Error: couldn't get container IP for %s after %d retries", wl.Name, maxRetries)
 		return
 	}
 
-	// Get first container ID
+	// Set up DNAT rules
+	if err := exec.Command("iptables", "-t", "nat", "-A", "PREROUTING", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run(); err != nil {
+		log.Printf("Error: PREROUTING DNAT for %s: %v", wl.Name, err)
+	}
+	if err := exec.Command("iptables", "-t", "nat", "-A", "OUTPUT", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run(); err != nil {
+		log.Printf("Error: OUTPUT DNAT for %s: %v", wl.Name, err)
+	}
+
+	log.Printf("Routed: %s -> %s", wl.IP, containerIP)
+}
+
+// getWorkloadContainerIP returns the container IP for a workload, or empty string if not found.
+func (a *Agent) getWorkloadContainerIP(name string) string {
+	// Get container ID
+	out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+name).Output()
+	if err != nil || len(out) == 0 {
+		return ""
+	}
+
 	containerID := strings.Split(strings.TrimSpace(string(out)), "\n")[0]
 	if containerID == "" {
-		log.Printf("Warning: couldn't get container ID for %s", wl.Name)
-		return
+		return ""
 	}
 
 	// Get container IP
 	out, err = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID).Output()
 	if err != nil {
-		log.Printf("Warning: couldn't inspect container %s: %v", containerID, err)
-		return
+		return ""
 	}
 
-	containerIP := strings.TrimSpace(string(out))
-	if containerIP == "" {
-		log.Printf("Warning: couldn't get container IP for %s", wl.Name)
-		return
-	}
-
-	// DNAT
-	exec.Command("iptables", "-t", "nat", "-A", "PREROUTING", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run()
-	exec.Command("iptables", "-t", "nat", "-A", "OUTPUT", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run()
-
-	log.Printf("Routed: %s -> %s", wl.IP, containerIP)
+	return strings.TrimSpace(string(out))
 }
 
 func (a *Agent) composeCmd(name string, args ...string) (string, error) {
@@ -3446,6 +3470,10 @@ func (a *Agent) checkFailover() {
 					}
 					a.stateMu.Unlock()
 					return
+				}
+				// Register WARP route so workload is reachable via WARP
+				if err := a.registerWarpRoute(w.IP); err != nil {
+					log.Printf("Warning: failed to register WARP route for failover workload %s: %v", w.IP, err)
 				}
 				a.updateHosts()
 				a.saveState()
