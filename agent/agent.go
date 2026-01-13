@@ -3247,22 +3247,49 @@ func (a *Agent) checkPeers() {
 	}
 
 	// Direct mode: check each peer individually via mesh IP
+	// Copy peer info outside the lock to avoid holding mutex during network calls
+	type peerCheck struct {
+		id string
+		ip string
+	}
+	a.stateMu.RLock()
+	peers := make([]peerCheck, 0, len(a.state.Peers))
+	for _, p := range a.state.Peers {
+		peers = append(peers, peerCheck{id: p.ID, ip: p.IP})
+	}
+	a.stateMu.RUnlock()
+
+	// Check each peer without holding the mutex
+	type peerResult struct {
+		id      string
+		healthy bool
+	}
+	results := make([]peerResult, 0, len(peers))
+
+	for _, peer := range peers {
+		// Use ?node=local to get only the peer's local health, avoiding recursive peer queries
+		url := fmt.Sprintf("http://%s:%d/api/health?node=local", peer.ip, a.apiPort)
+		resp, err := httpClient.Get(url)
+
+		result := peerResult{id: peer.id, healthy: false}
+		if err == nil {
+			result.healthy = resp.StatusCode == 200
+			resp.Body.Close()
+		}
+		results = append(results, result)
+	}
+
+	// Update peer status under the lock
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
 
-	for _, peer := range a.state.Peers {
-		url := fmt.Sprintf("http://%s:%d/api/health", peer.IP, a.apiPort)
-		resp, err := httpClient.Get(url)
-
-		if err != nil {
-			peer.Healthy = false
-			continue
-		}
-		resp.Body.Close()
-
-		peer.Healthy = resp.StatusCode == 200
-		if peer.Healthy {
-			peer.LastSeen = time.Now()
+	now := time.Now()
+	for _, result := range results {
+		if peer, ok := a.state.Peers[result.id]; ok {
+			peer.Healthy = result.healthy
+			if result.healthy {
+				peer.LastSeen = now
+			}
 		}
 	}
 }
