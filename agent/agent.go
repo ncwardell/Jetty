@@ -673,13 +673,17 @@ func (a *Agent) joinCluster() error {
 	maxRetries := 5
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		req := map[string]string{
-			"token":       a.joinTok,
-			"secret":      a.clusterSecret,
+			"secret":      a.clusterSecret, // Primary auth - cluster secret
 			"id":          a.hwid,
 			"name":        a.hostname,
 			"mesh_ip":     a.meshIP,
 			"tunnel_host": a.tunnelHost, // Our specific subdomain for direct API routing
 			"warp_ip":     a.warpIP,     // Cloudflare WARP IP for L3 connectivity
+		}
+
+		// Include token if provided (for backwards compatibility)
+		if a.joinTok != "" {
+			req["token"] = a.joinTok
 		}
 
 		data, _ := json.Marshal(req)
@@ -725,16 +729,43 @@ func (a *Agent) joinCluster() error {
 
 		// Success - process response
 		var result struct {
-			Peers     []*Peer     `json:"peers"`
-			Workloads []*Workload `json:"workloads"`
-			CFToken   string      `json:"cf_token,omitempty"`
-			WarpToken string      `json:"warp_token,omitempty"`
+			Peers        []*Peer     `json:"peers"`
+			Workloads    []*Workload `json:"workloads"`
+			CFToken      string      `json:"cf_token,omitempty"`
+			WarpToken    string      `json:"warp_token,omitempty"`
+			MeshCIDR     string      `json:"mesh_cidr,omitempty"`
+			TunnelDomain string      `json:"tunnel_domain,omitempty"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 			resp.Body.Close()
 			return fmt.Errorf("decode join response: %w", err)
 		}
 		resp.Body.Close()
+
+		// Update mesh CIDR if received and different (cluster's CIDR takes precedence)
+		if result.MeshCIDR != "" && result.MeshCIDR != a.meshCIDR {
+			log.Printf("Adopting cluster mesh CIDR: %s (was %s)", result.MeshCIDR, a.meshCIDR)
+			a.meshCIDR = result.MeshCIDR
+			// Re-derive our mesh IP for the new CIDR
+			a.stateMu.Lock()
+			oldIP := a.meshIP
+			a.meshIP = a.deriveMeshIPWithCollisionCheck(a.hwid)
+			a.stateMu.Unlock()
+			if oldIP != a.meshIP {
+				// Update network interface with new IP
+				_, network, _ := net.ParseCIDR(a.meshCIDR)
+				pfx, _ := network.Mask.Size()
+				exec.Command("ip", "addr", "flush", "dev", "jetty0").Run()
+				exec.Command("ip", "addr", "add", fmt.Sprintf("%s/%d", a.meshIP, pfx), "dev", "jetty0").Run()
+				log.Printf("Updated mesh IP to %s for new CIDR", a.meshIP)
+			}
+		}
+
+		// Update tunnel domain if received and not set locally
+		if result.TunnelDomain != "" && a.tunnelDomain == "" {
+			a.tunnelDomain = result.TunnelDomain
+			log.Printf("Adopting cluster tunnel domain: %s", a.tunnelDomain)
+		}
 
 		a.stateMu.Lock()
 		for _, p := range result.Peers {
@@ -761,8 +792,8 @@ func (a *Agent) joinCluster() error {
 			}
 		}
 
-		log.Printf("Joined: %d peers, %d workloads, tunnel=%v, warp=%v",
-			len(result.Peers), len(result.Workloads), result.CFToken != "", result.WarpToken != "")
+		log.Printf("Joined: %d peers, %d workloads, tunnel=%v, warp=%v, cidr=%s",
+			len(result.Peers), len(result.Workloads), result.CFToken != "", result.WarpToken != "", a.meshCIDR)
 		return nil
 	}
 
@@ -1507,8 +1538,8 @@ func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 // @Router /join [post]
 func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Token      string `json:"token"`
-		Secret     string `json:"secret"`
+		Token      string `json:"token"`       // Optional if secret is provided
+		Secret     string `json:"secret"`      // Cluster secret - sufficient for auth
 		ID         string `json:"id"`
 		Name       string `json:"name"`
 		MeshIP     string `json:"mesh_ip"`
@@ -1519,26 +1550,31 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
-	// Validate cluster secret first
-	if a.clusterSecret != "" && req.Secret != a.clusterSecret {
-		http.Error(w, "invalid cluster secret", 401)
-		return
-	}
+	// Authentication: either valid secret OR valid token required
+	hasValidSecret := a.clusterSecret != "" && req.Secret == a.clusterSecret
 
-	// Validate and consume token (single-use)
-	a.stateMu.Lock()
-	tok := a.state.Tokens[req.Token]
-	if tok == nil || time.Now().After(tok.ExpiresAt) {
+	if !hasValidSecret {
+		// No valid secret - check for token
+		if req.Token == "" {
+			http.Error(w, "secret or token required", 401)
+			return
+		}
+
+		a.stateMu.Lock()
+		tok := a.state.Tokens[req.Token]
+		if tok == nil || time.Now().After(tok.ExpiresAt) {
+			a.stateMu.Unlock()
+			http.Error(w, "invalid token", 401)
+			return
+		}
+		// Delete token after use (single-use tokens)
+		delete(a.state.Tokens, req.Token)
 		a.stateMu.Unlock()
-		http.Error(w, "invalid token", 401)
-		return
-	}
-	// Delete token after use (single-use tokens)
-	delete(a.state.Tokens, req.Token)
-	a.stateMu.Unlock()
 
-	// Broadcast token deletion to other nodes
-	go a.broadcastTokenDeletion(req.Token)
+		// Broadcast token deletion to other nodes
+		go a.broadcastTokenDeletion(req.Token)
+	}
+	// If hasValidSecret, we skip token validation entirely
 
 	// Check for mesh IP collision before creating peer
 	a.stateMu.RLock()
@@ -1612,6 +1648,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]interface{}{
 		"peers":     allPeers,
 		"workloads": allWorkloads,
+		"mesh_cidr": a.meshCIDR, // So joining node uses same CIDR
 	}
 
 	// Include CF token so new peer can start its tunnel
@@ -1622,6 +1659,11 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	// Include WARP connector token so new peer can join WARP network
 	if warpToken != "" {
 		resp["warp_token"] = warpToken
+	}
+
+	// Include tunnel domain if configured
+	if a.tunnelDomain != "" {
+		resp["tunnel_domain"] = a.tunnelDomain
 	}
 
 	w.Header().Set("Content-Type", "application/json")
