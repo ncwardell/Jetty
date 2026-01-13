@@ -3855,12 +3855,29 @@ func (a *Agent) loadState() {
 // errors, connection status, and other important information.
 type cloudflaredLogFilter struct {
 	prefix string
+	agent  *Agent // Reference to agent to capture tunnel ID
 }
 
 func (f *cloudflaredLogFilter) Write(p []byte) (n int, err error) {
 	line := strings.TrimSpace(string(p))
 	if line == "" {
 		return len(p), nil
+	}
+
+	// Extract tunnel ID from "Starting tunnel" log line
+	// Example: "2026-01-13T22:24:19Z INF Starting tunnel tunnelID=81f15f65-05ae-4e1b-931d-8866f058dd1d"
+	if strings.Contains(line, "Starting tunnel") && strings.Contains(line, "tunnelID=") {
+		if idx := strings.Index(line, "tunnelID="); idx != -1 {
+			tunnelID := line[idx+9:] // Skip "tunnelID="
+			// Trim any trailing content after the UUID
+			if spaceIdx := strings.IndexAny(tunnelID, " \t\n"); spaceIdx != -1 {
+				tunnelID = tunnelID[:spaceIdx]
+			}
+			if f.agent != nil && f.agent.cfTunnelID == "" && len(tunnelID) > 0 {
+				f.agent.cfTunnelID = tunnelID
+				log.Printf("Captured tunnel ID: %s (WARP route registration enabled)", tunnelID[:8])
+			}
+		}
 	}
 
 	// Only log important messages: errors, warnings, connection status
@@ -3873,7 +3890,7 @@ func (f *cloudflaredLogFilter) Write(p []byte) (n int, err error) {
 		strings.Contains(line, "Unregistered") ||
 		strings.Contains(line, "connected") ||
 		strings.Contains(line, "Starting tunnel") {
-		log.Printf("[cloudflared] %s", line)
+		log.Printf("[%s] %s", f.prefix, line)
 	}
 
 	return len(p), nil
@@ -3907,7 +3924,8 @@ func (a *Agent) startCloudflared() error {
 	a.cfCmd = exec.Command("cloudflared", "--no-autoupdate", "tunnel", "run", "--token", token)
 
 	// Use filtered log writer to capture important messages while suppressing verbose output
-	logFilter := &cloudflaredLogFilter{prefix: "cloudflared"}
+	// The filter also captures tunnel ID for WARP route registration
+	logFilter := &cloudflaredLogFilter{prefix: "cloudflared", agent: a}
 	a.cfCmd.Stdout = logFilter
 	a.cfCmd.Stderr = logFilter
 
