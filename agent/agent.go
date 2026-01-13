@@ -160,13 +160,24 @@ func (a *Agent) cleanupOrphanedState() {
 		exec.Command("ip", "link", "del", "jetty0").Run()
 	}
 
-	// Clean up any orphaned workload routes (routes to service CIDR via CloudflareWARP)
-	// These would be routes like "10.100.x.x via 100.96.x.x dev CloudflareWARP"
-	output, _ := exec.Command("ip", "route", "show", "dev", "CloudflareWARP").CombinedOutput()
+	// Clean up any orphaned IPIP tunnels (named tun_*)
+	output, _ := exec.Command("ip", "tunnel", "show").CombinedOutput()
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.HasPrefix(line, "tun_") {
+			parts := strings.Fields(line)
+			if len(parts) > 0 {
+				tunName := strings.TrimSuffix(parts[0], ":")
+				exec.Command("ip", "tunnel", "del", tunName).Run()
+				log.Printf("Cleaned up orphaned tunnel: %s", tunName)
+			}
+		}
+	}
+
+	// Clean up any orphaned workload routes (routes to 10.x.x.x/32)
+	output, _ = exec.Command("ip", "route", "show").CombinedOutput()
 	for _, line := range strings.Split(string(output), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "10.") && strings.Contains(line, "/32") {
-			// This looks like a workload route, extract the IP
 			parts := strings.Fields(line)
 			if len(parts) > 0 {
 				exec.Command("ip", "route", "del", parts[0]).Run()
@@ -440,8 +451,16 @@ func (a *Agent) cleanupNetwork() {
 	a.workloadRoutes = make(map[string]string)
 	a.workloadRoutesMu.Unlock()
 
-	// Clean up iptables rules for all workloads
+	// Clean up IPIP tunnels to peers
 	a.stateMu.RLock()
+	for _, peer := range a.state.Peers {
+		tunName := a.getTunnelName(peer.ID)
+		if err := exec.Command("ip", "tunnel", "del", tunName).Run(); err == nil {
+			log.Printf("Removed tunnel %s", tunName)
+		}
+	}
+
+	// Clean up iptables rules for all workloads
 	for _, wl := range a.state.Workloads {
 		if wl.Owner == a.hwid {
 			// Find container IP and remove DNAT rules
@@ -576,6 +595,59 @@ func (a *Agent) initWarpRules() error {
 
 	log.Printf("WARP nft rules initialized")
 	return nil
+}
+
+// =============================================================================
+// IPIP Tunnels (for workload routing between nodes)
+// =============================================================================
+
+// ensurePeerTunnel creates an IPIP tunnel to a peer if it doesn't exist.
+// This allows routing workload IPs (10.100.x.x) through WARP by encapsulating
+// them in packets addressed to the peer's WARP IP (100.96.x.x).
+func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
+	if a.ip == "" || peerIP == "" {
+		return nil // Can't create tunnel without IPs
+	}
+
+	// Tunnel name based on peer ID (truncated for interface name limit)
+	tunName := "tun_" + peerID[:8]
+
+	// Check if tunnel already exists with correct config
+	out, _ := exec.Command("ip", "tunnel", "show", tunName).CombinedOutput()
+	if strings.Contains(string(out), peerIP) {
+		return nil // Tunnel exists with correct remote
+	}
+
+	// Delete existing tunnel if it has wrong config
+	exec.Command("ip", "tunnel", "del", tunName).Run()
+
+	// Create IPIP tunnel: local=our WARP IP, remote=peer's WARP IP
+	if err := exec.Command("ip", "tunnel", "add", tunName, "mode", "ipip",
+		"local", a.ip, "remote", peerIP).Run(); err != nil {
+		return fmt.Errorf("create tunnel to %s: %w", peerIP, err)
+	}
+
+	// Bring up the tunnel interface
+	if err := exec.Command("ip", "link", "set", "up", "dev", tunName).Run(); err != nil {
+		exec.Command("ip", "tunnel", "del", tunName).Run()
+		return fmt.Errorf("bring up tunnel %s: %w", tunName, err)
+	}
+
+	log.Printf("Created IPIP tunnel %s to peer %s (%s)", tunName, peerID[:8], peerIP)
+	return nil
+}
+
+// removePeerTunnel removes the IPIP tunnel to a peer.
+func (a *Agent) removePeerTunnel(peerID string) {
+	tunName := "tun_" + peerID[:8]
+	if err := exec.Command("ip", "tunnel", "del", tunName).Run(); err == nil {
+		log.Printf("Removed tunnel %s", tunName)
+	}
+}
+
+// getTunnelName returns the tunnel interface name for a peer.
+func (a *Agent) getTunnelName(peerID string) string {
+	return "tun_" + peerID[:8]
 }
 
 func (a *Agent) deriveMeshIP(id string) string {
@@ -838,24 +910,30 @@ func (a *Agent) updateHosts() {
 }
 
 // updateWorkloadRoutes adds/removes routes for remote workloads.
-// For each remote workload, we add a route through the owner's WARP IP.
+// Routes go through IPIP tunnels to the owner node, which then DNATs to the container.
 // This must be called with stateMu held (at least RLock).
 func (a *Agent) updateWorkloadRoutes() {
-	// Skip if WARP is not connected (no CloudflareWARP interface)
+	// Skip if WARP is not connected
 	if a.ip == "" {
 		return
 	}
 
-	// Build map of desired routes: workload IP -> owner WARP IP
-	desiredRoutes := make(map[string]string)
+	// Build map of desired routes: workload IP -> owner ID
+	// Also ensure tunnels exist to owners
+	desiredRoutes := make(map[string]string) // wlIP -> ownerID
 	for _, wl := range a.state.Workloads {
 		if wl.Owner == a.hwid {
 			// Local workload - no route needed (handled by local iptables)
 			continue
 		}
-		// Find owner's WARP IP - only route through healthy peers
+		// Find owner peer - only route through healthy peers with IPs
 		if peer, ok := a.state.Peers[wl.Owner]; ok && peer.IP != "" && peer.Healthy {
-			desiredRoutes[wl.IP] = peer.IP
+			// Ensure tunnel exists to this peer
+			if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
+				log.Printf("Warning: failed to create tunnel to %s: %v", peer.Name, err)
+				continue
+			}
+			desiredRoutes[wl.IP] = peer.ID
 		}
 	}
 
@@ -863,25 +941,28 @@ func (a *Agent) updateWorkloadRoutes() {
 	defer a.workloadRoutesMu.Unlock()
 
 	// Remove stale routes (routes that are no longer needed)
-	for wlIP, ownerIP := range a.workloadRoutes {
-		if desiredOwnerIP, ok := desiredRoutes[wlIP]; !ok || desiredOwnerIP != ownerIP {
+	for wlIP, ownerID := range a.workloadRoutes {
+		if desiredOwnerID, ok := desiredRoutes[wlIP]; !ok || desiredOwnerID != ownerID {
 			// Route no longer needed or owner changed - remove it
 			exec.Command("ip", "route", "del", wlIP+"/32").Run()
 			delete(a.workloadRoutes, wlIP)
-			log.Printf("Removed route for %s (was via %s)", wlIP, ownerIP)
+			log.Printf("Removed route for %s (was via tunnel to %s)", wlIP, ownerID[:8])
 		}
 	}
 
-	// Add new routes
-	for wlIP, ownerIP := range desiredRoutes {
-		if existingOwner, ok := a.workloadRoutes[wlIP]; ok && existingOwner == ownerIP {
+	// Add new routes through IPIP tunnels
+	for wlIP, ownerID := range desiredRoutes {
+		if existingOwner, ok := a.workloadRoutes[wlIP]; ok && existingOwner == ownerID {
 			// Route already exists with correct owner
 			continue
 		}
-		// Add route via owner's WARP IP
-		if err := exec.Command("ip", "route", "add", wlIP+"/32", "via", ownerIP, "dev", "CloudflareWARP").Run(); err == nil {
-			a.workloadRoutes[wlIP] = ownerIP
-			log.Printf("Added route for %s via %s (CloudflareWARP)", wlIP, ownerIP)
+		// Route workload IP through the tunnel to owner
+		tunName := a.getTunnelName(ownerID)
+		if err := exec.Command("ip", "route", "add", wlIP+"/32", "dev", tunName).Run(); err == nil {
+			a.workloadRoutes[wlIP] = ownerID
+			log.Printf("Added route for %s via tunnel %s", wlIP, tunName)
+		} else {
+			log.Printf("Warning: failed to add route for %s via %s: %v", wlIP, tunName, err)
 		}
 	}
 }
