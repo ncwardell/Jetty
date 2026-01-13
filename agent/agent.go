@@ -48,13 +48,14 @@ type Peer struct {
 }
 
 type Workload struct {
-	Name      string `json:"name"`      // DNS hostname
-	MeshIP    string `json:"mesh_ip"`   // Unique lock
-	Compose   string `json:"compose"`
-	Revive    bool   `json:"revive"`    // Auto-failover to another node if owner dies
-	Autostart bool   `json:"autostart"` // Auto-start when Jetty starts up
-	Owner     string `json:"owner"`     // Node HWID
-	Version   int64  `json:"version"`   // Unix timestamp
+	Name         string   `json:"name"`                    // DNS hostname
+	MeshIP       string   `json:"mesh_ip"`                 // Unique lock
+	Compose      string   `json:"compose"`
+	Revive       bool     `json:"revive"`                  // Auto-failover to another node if owner dies
+	Autostart    bool     `json:"autostart"`               // Auto-start when Jetty starts up
+	AllowedNodes []string `json:"allowed_nodes,omitempty"` // Node whitelist: empty/["*"] = all, otherwise node names/IDs
+	Owner        string   `json:"owner"`                   // Node HWID
+	Version      int64    `json:"version"`                 // Unix timestamp
 }
 
 type State struct {
@@ -508,6 +509,44 @@ func (a *Agent) isIPTaken(ipStr string) bool {
 	return false
 }
 
+// isNodeAllowed checks if a node (by ID or name) is allowed to run a workload.
+// Empty or ["*"] allowed_nodes means all nodes are allowed.
+func (a *Agent) isNodeAllowed(wl *Workload, nodeID, nodeName string) bool {
+	// Empty list or nil means all nodes allowed
+	if len(wl.AllowedNodes) == 0 {
+		return true
+	}
+
+	for _, allowed := range wl.AllowedNodes {
+		// Wildcard means all nodes allowed
+		if allowed == "*" || allowed == "all" {
+			return true
+		}
+		// Check by ID or name
+		if allowed == nodeID || allowed == nodeName {
+			return true
+		}
+	}
+	return false
+}
+
+// isThisNodeAllowed checks if this node is allowed to run a workload.
+func (a *Agent) isThisNodeAllowed(wl *Workload) bool {
+	return a.isNodeAllowed(wl, a.hwid, a.hostname)
+}
+
+// findAllowedNode finds a healthy peer that is allowed to run this workload.
+// Returns nil if no suitable node is found.
+// Caller must hold stateMu lock (read).
+func (a *Agent) findAllowedNode(wl *Workload) *Peer {
+	for _, p := range a.state.Peers {
+		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name) {
+			return p
+		}
+	}
+	return nil
+}
+
 // allocateMeshIP finds the next available IP in the mesh CIDR for a workload.
 // Returns empty string if no IPs are available.
 // Caller must hold stateMu lock (read or write).
@@ -949,13 +988,14 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type WorkloadResponse struct {
-		Name      string            `json:"name"`
-		MeshIP    string            `json:"mesh_ip"`
-		Compose   string            `json:"compose"`
-		Revive    bool              `json:"revive"`
-		Autostart bool              `json:"autostart"`
-		Owner     map[string]string `json:"owner"`
-		Version   int64             `json:"version"`
+		Name         string            `json:"name"`
+		MeshIP       string            `json:"mesh_ip"`
+		Compose      string            `json:"compose"`
+		Revive       bool              `json:"revive"`
+		Autostart    bool              `json:"autostart"`
+		AllowedNodes []string          `json:"allowed_nodes,omitempty"`
+		Owner        map[string]string `json:"owner"`
+		Version      int64             `json:"version"`
 	}
 
 	var workloads []WorkloadResponse
@@ -995,13 +1035,14 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 		}
 
 		workloads = append(workloads, WorkloadResponse{
-			Name:      wl.Name,
-			MeshIP:    wl.MeshIP,
-			Compose:   wl.Compose,
-			Revive:    wl.Revive,
-			Autostart: wl.Autostart,
-			Owner:     ownerInfo,
-			Version:   wl.Version,
+			Name:         wl.Name,
+			MeshIP:       wl.MeshIP,
+			Compose:      wl.Compose,
+			Revive:       wl.Revive,
+			Autostart:    wl.Autostart,
+			AllowedNodes: wl.AllowedNodes,
+			Owner:        ownerInfo,
+			Version:      wl.Version,
 		})
 	}
 	a.stateMu.RUnlock()
@@ -1037,6 +1078,35 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	// Validate workload name (prevent path traversal attacks)
 	if !validNamePattern.MatchString(wl.Name) {
 		http.Error(w, "invalid name: must be alphanumeric with dash/underscore only", 400)
+		return
+	}
+
+	// Check if this node is allowed to run this workload
+	if !a.isThisNodeAllowed(&wl) {
+		// Find an allowed node and proxy the deployment
+		a.stateMu.RLock()
+		targetPeer := a.findAllowedNode(&wl)
+		a.stateMu.RUnlock()
+
+		if targetPeer == nil {
+			http.Error(w, "no allowed nodes available for this workload", 503)
+			return
+		}
+
+		// Proxy deployment to allowed node
+		data, _ := json.Marshal(wl)
+		url := a.getPeerAPIURL(targetPeer, "/api/workloads")
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to proxy to allowed node: %v", err), 502)
+			return
+		}
+		defer resp.Body.Close()
+
+		// Forward the response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
 		return
 	}
 
@@ -1102,11 +1172,12 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 
 	// Build response with enriched owner info
 	response := map[string]interface{}{
-		"name":      wl.Name,
-		"mesh_ip":   wl.MeshIP,
-		"compose":   wl.Compose,
-		"revive":    wl.Revive,
-		"autostart": wl.Autostart,
+		"name":          wl.Name,
+		"mesh_ip":       wl.MeshIP,
+		"compose":       wl.Compose,
+		"revive":        wl.Revive,
+		"autostart":     wl.Autostart,
+		"allowed_nodes": wl.AllowedNodes,
 		"owner": map[string]string{
 			"id":      a.hwid,
 			"name":    a.hostname,
@@ -1170,15 +1241,16 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"name":      found.Name,
-				"mesh_ip":   found.MeshIP,
-				"compose":   found.Compose,
-				"revive":    found.Revive,
-				"autostart": found.Autostart,
-				"owner":     ownerInfo,
-				"version":   found.Version,
-				"is_local":  false,
-				"error":     "owner node unreachable",
+				"name":          found.Name,
+				"mesh_ip":       found.MeshIP,
+				"compose":       found.Compose,
+				"revive":        found.Revive,
+				"autostart":     found.Autostart,
+				"allowed_nodes": found.AllowedNodes,
+				"owner":         ownerInfo,
+				"version":       found.Version,
+				"is_local":      false,
+				"error":         "owner node unreachable",
 			})
 			return
 		}
@@ -1190,15 +1262,16 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 			ownerInfo := buildOwnerInfo(ownerPeer.ID, ownerPeer.Name, ownerPeer.MeshIP)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"name":      found.Name,
-				"mesh_ip":   found.MeshIP,
-				"compose":   found.Compose,
-				"revive":    found.Revive,
-				"autostart": found.Autostart,
-				"owner":     ownerInfo,
-				"version":   found.Version,
-				"is_local":  false,
-				"error":     fmt.Sprintf("failed to reach owner: %v", err),
+				"name":          found.Name,
+				"mesh_ip":       found.MeshIP,
+				"compose":       found.Compose,
+				"revive":        found.Revive,
+				"autostart":     found.Autostart,
+				"allowed_nodes": found.AllowedNodes,
+				"owner":         ownerInfo,
+				"version":       found.Version,
+				"is_local":      false,
+				"error":         fmt.Sprintf("failed to reach owner: %v", err),
 			})
 			return
 		}
@@ -1222,14 +1295,15 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 	// Build enriched response with Docker info for local workload
 	ownerInfo := buildOwnerInfo(a.hwid, a.hostname, a.meshIP)
 	response := map[string]interface{}{
-		"name":      found.Name,
-		"mesh_ip":   found.MeshIP,
-		"compose":   found.Compose,
-		"revive":    found.Revive,
-		"autostart": found.Autostart,
-		"owner":     ownerInfo,
-		"version":   found.Version,
-		"is_local":  true,
+		"name":          found.Name,
+		"mesh_ip":       found.MeshIP,
+		"compose":       found.Compose,
+		"revive":        found.Revive,
+		"autostart":     found.Autostart,
+		"allowed_nodes": found.AllowedNodes,
+		"owner":         ownerInfo,
+		"version":       found.Version,
+		"is_local":      true,
 	}
 
 	containerInfo := a.getContainerInfo(found.Name)
@@ -3116,10 +3190,20 @@ func (a *Agent) checkFailover() {
 // shouldClaim determines if this node should claim an orphaned workload.
 // NOTE: Caller must already hold stateMu lock.
 func (a *Agent) shouldClaim(wl *Workload) bool {
-	// Deterministic: lowest healthy node ID wins
-	candidates := []string{a.hwid}
+	// First check if this node is even allowed to run the workload
+	if !a.isThisNodeAllowed(wl) {
+		return false
+	}
+
+	// Deterministic: lowest healthy node ID that is allowed wins
+	var candidates []string
+
+	// Add ourselves if allowed (we already checked above)
+	candidates = append(candidates, a.hwid)
+
+	// Add healthy peers that are allowed
 	for _, p := range a.state.Peers {
-		if p.Healthy {
+		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name) {
 			candidates = append(candidates, p.ID)
 		}
 	}
