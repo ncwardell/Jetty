@@ -167,12 +167,14 @@ main() {
 
         # Add nftables rules to allow cloudflared traffic through WARP firewall
         # WARP creates a restrictive firewall that blocks cloudflared's QUIC connections
+        # cloudflared uses Cloudflare edge IPs (198.41.0.0/16) which WARP doesn't allow by default
         if nft list table inet cloudflare-warp >/dev/null 2>&1; then
             log "Adding firewall rules for cloudflared..."
-            # Allow outbound UDP port 7844 (cloudflared QUIC tunnel)
-            nft insert rule inet cloudflare-warp output udp dport 7844 accept 2>/dev/null || true
-            # Allow inbound UDP from port 7844 (responses)
-            nft insert rule inet cloudflare-warp input udp sport 7844 accept 2>/dev/null || true
+            # Allow all traffic to/from Cloudflare edge IPs (used by cloudflared)
+            nft insert rule inet cloudflare-warp output ip daddr 198.41.192.0/24 accept 2>/dev/null || true
+            nft insert rule inet cloudflare-warp output ip daddr 198.41.200.0/24 accept 2>/dev/null || true
+            nft insert rule inet cloudflare-warp input ip saddr 198.41.192.0/24 accept 2>/dev/null || true
+            nft insert rule inet cloudflare-warp input ip saddr 198.41.200.0/24 accept 2>/dev/null || true
         fi
 
         log "WARP initialization complete"
