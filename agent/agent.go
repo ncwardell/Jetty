@@ -2449,13 +2449,15 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 
 			// Extract data from peer's local health response
 			health.Healthy = true
-			health.Status = fmt.Sprintf("%v", peerHealth["status"])
-			if pubIP, ok := peerHealth["public_ip"].(string); ok {
-				health.PublicIP = pubIP
-			}
 			if nodes, ok := peerHealth["nodes"].([]interface{}); ok && len(nodes) > 0 {
-				// Peer returned cluster format, extract first node
+				// Peer returned cluster format, extract first node's data
 				if node, ok := nodes[0].(map[string]interface{}); ok {
+					if status, ok := node["status"].(string); ok {
+						health.Status = status
+					}
+					if pubIP, ok := node["public_ip"].(string); ok {
+						health.PublicIP = pubIP
+					}
 					if wls, ok := node["workloads"].([]interface{}); ok {
 						for _, wl := range wls {
 							health.Workloads = append(health.Workloads, fmt.Sprintf("%v", wl))
