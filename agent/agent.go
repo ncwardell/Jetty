@@ -3812,16 +3812,20 @@ func (a *Agent) isTunnelRunning() bool {
 // =============================================================================
 
 // getPeerAPIURL returns the URL to reach a peer's API.
-// In tunnel-only mode, uses the peer's specific TunnelHost if available,
-// otherwise falls back to the general Cloudflare tunnel domain.
-// In direct mode, uses the peer's mesh IP.
+// Priority:
+// 1. WARP IP (if both nodes are WARP-enabled) - fast direct mesh connection
+// 2. Tunnel (if configured) - slow but works through firewalls
+// 3. Mesh IP - direct connection for local networks
 func (a *Agent) getPeerAPIURL(peer *Peer, path string) string {
+	// Prefer WARP for direct node-to-node communication (much faster than tunnel)
+	if a.warpEnabled && peer.WarpIP != "" {
+		return fmt.Sprintf("http://%s:%d%s", peer.WarpIP, a.apiPort, path)
+	}
+	// Fall back to tunnel if configured
 	if a.tunnelDomain != "" {
-		// Tunnel-only mode: prefer peer's specific subdomain for direct routing
 		if peer.TunnelHost != "" {
 			return fmt.Sprintf("https://%s%s", peer.TunnelHost, path)
 		}
-		// Fall back to general tunnel domain (random routing)
 		return fmt.Sprintf("https://%s%s", a.tunnelDomain, path)
 	}
 	// Direct mode: use peer's mesh IP
