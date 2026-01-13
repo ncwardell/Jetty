@@ -511,7 +511,9 @@ func (a *Agent) initWarpRules() error {
 
 	// Add rules to allow cloudflared traffic through WARP's firewall
 	// WARP creates a restrictive nftables table that blocks cloudflared's connections
-	// cloudflared uses Cloudflare edge IPs (198.41.x.x) which WARP doesn't allow by default
+	// Allow all UDP port 7844 (cloudflared QUIC) and Cloudflare edge IPs
+	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "output", "udp", "dport", "7844", "accept").Run()
+	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "input", "udp", "sport", "7844", "accept").Run()
 	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "output", "ip", "daddr", "198.41.192.0/24", "accept").Run()
 	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "output", "ip", "daddr", "198.41.200.0/24", "accept").Run()
 	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "input", "ip", "saddr", "198.41.192.0/24", "accept").Run()
