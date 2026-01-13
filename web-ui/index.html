@@ -532,6 +532,14 @@
             background: var(--accent-red);
         }
 
+        .workload-chip .status-indicator.remote {
+            background: var(--accent-blue);
+        }
+
+        .workload-chip .status-indicator.unknown {
+            background: var(--text-muted);
+        }
+
         /* Workloads Table */
         .table-container {
             overflow-x: auto;
@@ -584,6 +592,16 @@
         .status-badge.error {
             background: rgba(248, 81, 73, 0.2);
             color: var(--accent-red);
+        }
+
+        .status-badge.remote {
+            background: rgba(88, 166, 255, 0.2);
+            color: var(--accent-blue);
+        }
+
+        .status-badge.unknown {
+            background: rgba(110, 118, 129, 0.2);
+            color: var(--text-muted);
         }
 
         .actions-cell {
@@ -1272,6 +1290,30 @@
 
         let draggedWorkload = null;
 
+        // Helper function to get CSS class for workload status
+        function getStatusClass(status) {
+            switch (status) {
+                case 'running': return 'running';
+                case 'stopped': return 'stopped';
+                case 'remote': return 'remote';
+                case 'error': return 'error';
+                case 'unknown': return 'unknown';
+                default: return 'unknown';
+            }
+        }
+
+        // Helper function to get display text for workload status
+        function getStatusText(status) {
+            switch (status) {
+                case 'running': return 'Running';
+                case 'stopped': return 'Stopped';
+                case 'remote': return 'Remote';
+                case 'error': return 'Error';
+                case 'unknown': return 'Unknown';
+                default: return 'Unknown';
+            }
+        }
+
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
             loadSavedConnection();
@@ -1477,8 +1519,7 @@
                             <div class="node-workloads-title">Workloads (${nodeWorkloads.length})</div>
                             <div class="node-workloads-list">
                                 ${nodeWorkloads.map(w => {
-                                    const isRunning = w.status === 'running';
-                                    const statusClass = isRunning ? 'running' : 'stopped';
+                                    const statusClass = getStatusClass(w.status);
                                     return `
                                         <div class="workload-chip" onclick="showWorkloadDetail('${w.name}')">
                                             <span class="status-indicator ${statusClass}"></span>
@@ -1509,10 +1550,11 @@
             }
 
             tbody.innerHTML = state.workloads.map(w => {
-                const isRunning = w.status === 'running';
-                const statusClass = isRunning ? 'running' : 'stopped';
-                const statusText = isRunning ? 'Running' : 'Stopped';
+                const statusClass = getStatusClass(w.status);
+                const statusText = getStatusText(w.status);
                 const ownerName = w.owner?.name || w.owner?.id?.substring(0, 8) || 'Unknown';
+                const isLocal = w.status !== 'remote';
+                const isRunning = w.status === 'running';
 
                 return `
                     <tr>
@@ -1531,7 +1573,7 @@
                         <td>${ownerName}</td>
                         <td>${w.revive ? 'Yes' : 'No'}</td>
                         <td class="actions-cell">
-                            ${isRunning ? `
+                            ${isLocal ? (isRunning ? `
                                 <button class="btn btn-sm" onclick="stopWorkload('${w.name}')" title="Stop">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                         <rect x="6" y="6" width="12" height="12"/>
@@ -1543,7 +1585,7 @@
                                         <polygon points="5 3 19 12 5 21 5 3"/>
                                     </svg>
                                 </button>
-                            `}
+                            `) : ''}
                             <button class="btn btn-sm" onclick="openMoveModal('${w.name}')" title="Move">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <polyline points="5 9 2 12 5 15"/>
@@ -1621,8 +1663,7 @@
                             <div class="node-workloads-title">Drag workloads here (${nodeWorkloads.length})</div>
                             <div class="node-workloads-list">
                                 ${nodeWorkloads.map(w => {
-                                    const isRunning = w.status === 'running';
-                                    const statusClass = isRunning ? 'running' : 'stopped';
+                                    const statusClass = getStatusClass(w.status);
                                     return `
                                         <div class="workload-chip"
                                              draggable="true"
@@ -1671,13 +1712,13 @@
                         </thead>
                         <tbody>
                             ${state.workloads.slice(0, 5).map(w => {
-                                const isRunning = w.status === 'running';
-                                const statusClass = isRunning ? 'running' : 'stopped';
+                                const statusClass = getStatusClass(w.status);
+                                const statusText = getStatusText(w.status);
                                 const ownerName = w.owner?.name || w.owner?.id?.substring(0, 8) || 'Unknown';
                                 return `
                                     <tr onclick="showWorkloadDetail('${w.name}')" style="cursor: pointer;">
                                         <td>${w.name}</td>
-                                        <td><span class="status-badge ${statusClass}">${isRunning ? 'Running' : 'Stopped'}</span></td>
+                                        <td><span class="status-badge ${statusClass}">${statusText}</span></td>
                                         <td><code>${w.ip}</code></td>
                                         <td>${ownerName}</td>
                                     </tr>
@@ -1894,9 +1935,16 @@
             try {
                 const workload = await apiCall(`/workloads/${name}`);
                 const ownerName = workload.owner?.name || workload.owner?.id?.substring(0, 8) || 'Unknown';
+                const isLocal = workload.is_local !== false;
                 const isRunning = workload.containers?.some(c => c.running);
+                const hasError = workload.error;
 
                 body.innerHTML = `
+                    ${hasError ? `
+                    <div style="background: rgba(248, 81, 73, 0.1); border: 1px solid var(--accent-red); border-radius: 6px; padding: 12px; margin-bottom: 16px; color: var(--accent-red); font-size: 13px;">
+                        <strong>Note:</strong> ${escapeHtml(workload.error)}
+                    </div>
+                    ` : ''}
                     <div class="detail-section">
                         <div class="detail-section-title">Configuration</div>
                         <div class="detail-row">
@@ -1909,7 +1957,7 @@
                         </div>
                         <div class="detail-row">
                             <span class="detail-label">Owner Node</span>
-                            <span class="detail-value">${ownerName}</span>
+                            <span class="detail-value">${ownerName}${isLocal ? ' <span class="node-badge">Local</span>' : ''}</span>
                         </div>
                         <div class="detail-row">
                             <span class="detail-label">Revive</span>
@@ -1943,7 +1991,7 @@
                                     ${c.uptime ? `<span><strong>Uptime:</strong> ${c.uptime}</span>` : ''}
                                 </div>
                             </div>
-                        `).join('') || '<p style="color: var(--text-muted);">No containers</p>'}
+                        `).join('') || '<p style="color: var(--text-muted);">No container information available</p>'}
                     </div>
 
                     <div class="detail-section">
@@ -1952,12 +2000,13 @@
                     </div>
 
                     <div class="detail-actions">
-                        ${isRunning ? `
+                        ${isLocal ? (isRunning ? `
                             <button class="btn" onclick="stopWorkload('${name}')">Stop</button>
                         ` : `
                             <button class="btn btn-success" onclick="startWorkload('${name}')">Start</button>
-                        `}
-                        <button class="btn" onclick="viewLogs('${name}')">View Logs</button>
+                        `) : ''}
+                        ${isLocal ? `<button class="btn" onclick="viewLogs('${name}')">View Logs</button>` : ''}
+                        <button class="btn" onclick="openMoveModal('${name}')">Move</button>
                         <button class="btn btn-danger" onclick="deleteWorkload('${name}'); closeDetailPanel();">Delete</button>
                     </div>
                 `;
