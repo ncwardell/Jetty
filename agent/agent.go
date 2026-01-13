@@ -417,6 +417,13 @@ func (a *Agent) cleanupNetwork() {
 	} else {
 		log.Printf("Removed jetty0 interface")
 	}
+
+	// Clean up WARP network modifications (important for --net host mode)
+	// These persist on the host after container stops, breaking SSH/git
+	exec.Command("ip", "link", "delete", "CloudflareWARP").Run()
+	exec.Command("nft", "delete", "table", "inet", "cloudflare-warp").Run()
+	exec.Command("ip", "route", "del", "100.96.0.0/12").Run()
+	log.Printf("Removed WARP network modifications")
 }
 
 // =============================================================================
