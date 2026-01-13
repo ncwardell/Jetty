@@ -6,10 +6,8 @@ toolchain go1.24.7
 
 require (
 	github.com/gorilla/mux v1.8.1
-	github.com/gorilla/websocket v1.5.3
 	github.com/swaggo/http-swagger v1.3.4
 	github.com/swaggo/swag v1.16.6
-	golang.org/x/crypto v0.46.0
 )
 
 require (
