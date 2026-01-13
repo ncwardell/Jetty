@@ -1,3 +1,4 @@
+basePath: /api
 definitions:
   agent.ErrorResponse:
     properties:
@@ -241,8 +242,18 @@ definitions:
         example: true
         type: boolean
     type: object
+host: localhost:6880
 info:
-  contact: {}
+  contact:
+    name: Jetty Support
+    url: https://github.com/ncwardell/jetty
+  description: P2P Docker Compose orchestration with Cloudflare WARP mesh networking
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  termsOfService: http://swagger.io/terms/
+  title: Jetty API
+  version: "2.0"
 paths:
   /health:
     get:
@@ -628,4 +639,15 @@ paths:
       summary: Stop a running workload
       tags:
       - workloads
+schemes:
+- https
+- http
+security:
+- ApiKeyAuth: []
+securityDefinitions:
+  ApiKeyAuth:
+    description: API key for authentication (JETTY_SECRET)
+    in: header
+    name: X-API-Key
+    type: apiKey
 swagger: "2.0"

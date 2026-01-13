@@ -9,7 +9,15 @@ const docTemplate = `{
     "info": {
         "description": "{{escape .Description}}",
         "title": "{{.Title}}",
-        "contact": {},
+        "termsOfService": "http://swagger.io/terms/",
+        "contact": {
+            "name": "Jetty Support",
+            "url": "https://github.com/ncwardell/jetty"
+        },
+        "license": {
+            "name": "MIT",
+            "url": "https://opensource.org/licenses/MIT"
+        },
         "version": "{{.Version}}"
     },
     "host": "{{.Host}}",
@@ -939,17 +947,30 @@ const docTemplate = `{
                 }
             }
         }
-    }
+    },
+    "securityDefinitions": {
+        "ApiKeyAuth": {
+            "description": "API key for authentication (JETTY_SECRET)",
+            "type": "apiKey",
+            "name": "X-API-Key",
+            "in": "header"
+        }
+    },
+    "security": [
+        {
+            "ApiKeyAuth": []
+        }
+    ]
 }`
 
 // SwaggerInfo holds exported Swagger Info so clients can modify it
 var SwaggerInfo = &swag.Spec{
-	Version:          "",
-	Host:             "",
-	BasePath:         "",
-	Schemes:          []string{},
-	Title:            "",
-	Description:      "",
+	Version:          "2.0",
+	Host:             "localhost:6880",
+	BasePath:         "/api",
+	Schemes:          []string{"https", "http"},
+	Title:            "Jetty API",
+	Description:      "P2P Docker Compose orchestration with Cloudflare WARP mesh networking",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 	LeftDelim:        "{{",
