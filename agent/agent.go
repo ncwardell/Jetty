@@ -852,6 +852,7 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/workloads/{name}/stop", a.apiStopWorkload).Methods("POST")
 	r.HandleFunc("/api/join", a.apiJoin).Methods("POST")
 	r.HandleFunc("/api/health", a.apiHealth).Methods("GET")
+	r.HandleFunc("/api/cluster/health", a.apiClusterHealth).Methods("GET")
 	r.HandleFunc("/api/sync", a.apiSync).Methods("GET")
 	r.HandleFunc("/api/tunnel", a.apiGetTunnel).Methods("GET")
 	r.HandleFunc("/api/tunnel", a.apiSetTunnel).Methods("POST")
@@ -917,15 +918,51 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 
 // apiListWorkloads godoc
 // @Summary List all workloads
-// @Description Returns all workloads in the cluster
+// @Description Returns all workloads in the cluster, optionally filtered by node
 // @Tags workloads
 // @Produce json
+// @Param node query string false "Filter by node name or ID (use 'local' for this node only)"
 // @Success 200 {array} Workload
 // @Router /workloads [get]
 func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
+	nodeFilter := r.URL.Query().Get("node")
+
 	a.stateMu.RLock()
 	workloads := make([]*Workload, 0, len(a.state.Workloads))
+
+	// Build a map of peer names to IDs for filtering
+	peerNameToID := make(map[string]string)
+	for _, p := range a.state.Peers {
+		peerNameToID[p.Name] = p.ID
+	}
+
 	for _, wl := range a.state.Workloads {
+		// Apply node filter if specified
+		if nodeFilter != "" {
+			// Handle special "local" filter
+			if nodeFilter == "local" {
+				if wl.Owner != a.hwid {
+					continue
+				}
+			} else if nodeFilter == a.hwid || nodeFilter == a.hostname {
+				// Filter for this node by ID or name
+				if wl.Owner != a.hwid {
+					continue
+				}
+			} else {
+				// Filter for a specific peer by ID or name
+				matchesFilter := wl.Owner == nodeFilter
+				if !matchesFilter {
+					// Check if filter matches a peer name
+					if peerID, ok := peerNameToID[nodeFilter]; ok {
+						matchesFilter = wl.Owner == peerID
+					}
+				}
+				if !matchesFilter {
+					continue
+				}
+			}
+		}
 		workloads = append(workloads, wl)
 	}
 	a.stateMu.RUnlock()
@@ -1249,33 +1286,58 @@ func (a *Agent) getContainerInfo(workloadName string) []map[string]interface{} {
 func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 
-	a.stateMu.Lock()
+	a.stateMu.RLock()
 	var found *Workload
 	var foundIP string
+	var ownerPeer *Peer
 	for ip, wl := range a.state.Workloads {
 		if wl.Name == name {
 			found = wl
 			foundIP = ip
+			if wl.Owner != a.hwid {
+				ownerPeer = a.state.Peers[wl.Owner]
+			}
 			break
 		}
 	}
+	a.stateMu.RUnlock()
 
 	if found == nil {
-		a.stateMu.Unlock()
 		http.Error(w, "not found", 404)
 		return
 	}
 
-	// Only owner can delete (or anyone if owner is dead)
+	// If workload is remote and owner is healthy, proxy the delete request
 	if found.Owner != a.hwid {
-		peer := a.state.Peers[found.Owner]
-		if peer != nil && peer.Healthy {
-			a.stateMu.Unlock()
-			http.Error(w, "workload owned by another node", 403)
+		if ownerPeer != nil && ownerPeer.Healthy {
+			// Proxy delete to owner node
+			url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
+			req, err := http.NewRequest("DELETE", url, nil)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("failed to create request: %v", err), 500)
+				return
+			}
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+				return
+			}
+			defer resp.Body.Close()
+
+			// Forward response from owner
+			w.WriteHeader(resp.StatusCode)
+			if resp.StatusCode != 204 {
+				body, _ := io.ReadAll(resp.Body)
+				w.Write(body)
+			}
 			return
 		}
+		// Owner is dead - allow cleanup of orphaned workload from our state
+		log.Printf("Cleaning up orphaned workload %s (owner %s unreachable)", name, found.Owner)
 	}
 
+	// Local workload or orphaned cleanup - delete from state
+	a.stateMu.Lock()
 	delete(a.state.Workloads, foundIP)
 	a.stateMu.Unlock()
 
@@ -1387,16 +1449,41 @@ func (a *Agent) apiWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 
 	a.stateMu.RLock()
 	var found *Workload
+	var ownerPeer *Peer
 	for _, wl := range a.state.Workloads {
-		if wl.Name == name && wl.Owner == a.hwid {
+		if wl.Name == name {
 			found = wl
+			if wl.Owner != a.hwid {
+				ownerPeer = a.state.Peers[wl.Owner]
+			}
 			break
 		}
 	}
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found or not local", 404)
+		http.Error(w, "not found", 404)
+		return
+	}
+
+	// If workload is remote, proxy to owner
+	if found.Owner != a.hwid {
+		if ownerPeer == nil || !ownerPeer.Healthy {
+			http.Error(w, "owner node unreachable", 502)
+			return
+		}
+		// Proxy logs request to owner
+		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/logs")
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			return
+		}
+		defer resp.Body.Close()
+
+		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
 		return
 	}
 
@@ -1419,16 +1506,41 @@ func (a *Agent) apiStartWorkload(w http.ResponseWriter, r *http.Request) {
 
 	a.stateMu.RLock()
 	var found *Workload
+	var ownerPeer *Peer
 	for _, wl := range a.state.Workloads {
-		if wl.Name == name && wl.Owner == a.hwid {
+		if wl.Name == name {
 			found = wl
+			if wl.Owner != a.hwid {
+				ownerPeer = a.state.Peers[wl.Owner]
+			}
 			break
 		}
 	}
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found or not local", 404)
+		http.Error(w, "not found", 404)
+		return
+	}
+
+	// If workload is remote, proxy to owner
+	if found.Owner != a.hwid {
+		if ownerPeer == nil || !ownerPeer.Healthy {
+			http.Error(w, "owner node unreachable", 502)
+			return
+		}
+		// Proxy start request to owner
+		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/start")
+		resp, err := httpClient.Post(url, "application/json", nil)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			return
+		}
+		defer resp.Body.Close()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
 		return
 	}
 
@@ -1459,16 +1571,41 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 
 	a.stateMu.RLock()
 	var found *Workload
+	var ownerPeer *Peer
 	for _, wl := range a.state.Workloads {
-		if wl.Name == name && wl.Owner == a.hwid {
+		if wl.Name == name {
 			found = wl
+			if wl.Owner != a.hwid {
+				ownerPeer = a.state.Peers[wl.Owner]
+			}
 			break
 		}
 	}
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found or not local", 404)
+		http.Error(w, "not found", 404)
+		return
+	}
+
+	// If workload is remote, proxy to owner
+	if found.Owner != a.hwid {
+		if ownerPeer == nil || !ownerPeer.Healthy {
+			http.Error(w, "owner node unreachable", 502)
+			return
+		}
+		// Proxy stop request to owner
+		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/stop")
+		resp, err := httpClient.Post(url, "application/json", nil)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			return
+		}
+		defer resp.Body.Close()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
 		return
 	}
 
@@ -1653,6 +1790,179 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 		"warp_enabled":    a.warpEnabled,
 		"warp_ip":         a.warpIP,
 		"system":          systemStats,
+	})
+}
+
+// apiClusterHealth godoc
+// @Summary Aggregate cluster health
+// @Description Returns health status from all nodes in the cluster
+// @Tags cluster
+// @Produce json
+// @Param node query string false "Filter by specific node name or ID"
+// @Success 200 {object} ClusterHealthResponse
+// @Router /cluster/health [get]
+func (a *Agent) apiClusterHealth(w http.ResponseWriter, r *http.Request) {
+	nodeFilter := r.URL.Query().Get("node")
+
+	// Get list of peers
+	a.stateMu.RLock()
+	peers := make([]*Peer, 0, len(a.state.Peers))
+	for _, p := range a.state.Peers {
+		peers = append(peers, p)
+	}
+	a.stateMu.RUnlock()
+
+	type NodeHealth struct {
+		ID        string                 `json:"id"`
+		Name      string                 `json:"name"`
+		MeshIP    string                 `json:"mesh_ip"`
+		Healthy   bool                   `json:"healthy"`
+		Status    string                 `json:"status"`
+		Workloads []string               `json:"workloads"`
+		System    map[string]interface{} `json:"system,omitempty"`
+		Error     string                 `json:"error,omitempty"`
+	}
+
+	var results []NodeHealth
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	// Check if we should include this node
+	includeLocal := nodeFilter == "" || nodeFilter == a.hwid || nodeFilter == a.hostname
+
+	// Get local node health
+	if includeLocal {
+		a.stateMu.RLock()
+		var localWorkloads []string
+		for _, wl := range a.state.Workloads {
+			if wl.Owner == a.hwid {
+				out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
+				status := "stopped"
+				if len(strings.TrimSpace(string(out))) > 0 {
+					status = "running"
+				}
+				localWorkloads = append(localWorkloads, fmt.Sprintf("%s:%s:%s", wl.Name, wl.MeshIP, status))
+			}
+		}
+		a.stateMu.RUnlock()
+
+		localHealth := NodeHealth{
+			ID:        a.hwid,
+			Name:      a.hostname,
+			MeshIP:    a.meshIP,
+			Healthy:   true,
+			Status:    getHealthStatus(),
+			Workloads: localWorkloads,
+			System:    a.getSystemStats(),
+		}
+		results = append(results, localHealth)
+	}
+
+	// Fetch health from peers concurrently
+	for _, peer := range peers {
+		// Check node filter
+		if nodeFilter != "" && nodeFilter != peer.ID && nodeFilter != peer.Name {
+			continue
+		}
+
+		wg.Add(1)
+		go func(p *Peer) {
+			defer wg.Done()
+
+			health := NodeHealth{
+				ID:      p.ID,
+				Name:    p.Name,
+				MeshIP:  p.MeshIP,
+				Healthy: p.Healthy,
+			}
+
+			if !p.Healthy {
+				health.Status = "unreachable"
+				health.Error = "peer marked unhealthy"
+				mu.Lock()
+				results = append(results, health)
+				mu.Unlock()
+				return
+			}
+
+			// Fetch health from peer
+			url := a.getPeerAPIURL(p, "/api/health")
+			resp, err := httpClient.Get(url)
+			if err != nil {
+				health.Status = "error"
+				health.Error = err.Error()
+				mu.Lock()
+				results = append(results, health)
+				mu.Unlock()
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != 200 {
+				health.Status = "error"
+				health.Error = fmt.Sprintf("status %d", resp.StatusCode)
+				mu.Lock()
+				results = append(results, health)
+				mu.Unlock()
+				return
+			}
+
+			var peerHealth map[string]interface{}
+			if err := json.NewDecoder(resp.Body).Decode(&peerHealth); err != nil {
+				health.Status = "error"
+				health.Error = "failed to decode response"
+				mu.Lock()
+				results = append(results, health)
+				mu.Unlock()
+				return
+			}
+
+			health.Status = fmt.Sprintf("%v", peerHealth["status"])
+			if wls, ok := peerHealth["workloads_local"].([]interface{}); ok {
+				for _, wl := range wls {
+					health.Workloads = append(health.Workloads, fmt.Sprintf("%v", wl))
+				}
+			}
+			if sys, ok := peerHealth["system"].(map[string]interface{}); ok {
+				health.System = sys
+			}
+
+			mu.Lock()
+			results = append(results, health)
+			mu.Unlock()
+		}(peer)
+	}
+
+	wg.Wait()
+
+	// Calculate cluster summary
+	totalNodes := len(results)
+	healthyNodes := 0
+	totalWorkloads := 0
+	for _, h := range results {
+		if h.Healthy && h.Status != "error" && h.Status != "unreachable" {
+			healthyNodes++
+		}
+		totalWorkloads += len(h.Workloads)
+	}
+
+	clusterStatus := "healthy"
+	if healthyNodes < totalNodes {
+		if healthyNodes == 0 {
+			clusterStatus = "degraded"
+		} else {
+			clusterStatus = "partial"
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"cluster_status":   clusterStatus,
+		"total_nodes":      totalNodes,
+		"healthy_nodes":    healthyNodes,
+		"total_workloads":  totalWorkloads,
+		"timestamp":        time.Now().UTC().Format(time.RFC3339),
+		"nodes":            results,
 	})
 }
 
