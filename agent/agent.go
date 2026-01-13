@@ -2316,19 +2316,30 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 
 	// Get local node health
 	if includeLocal {
+		// Gather workload info under lock, but run docker commands outside
 		a.stateMu.RLock()
-		var localWorkloads []string
+		type workloadInfo struct {
+			name string
+			ip   string
+		}
+		var localWLInfo []workloadInfo
 		for _, wl := range a.state.Workloads {
 			if wl.Owner == a.hwid {
-				out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
-				status := "stopped"
-				if len(strings.TrimSpace(string(out))) > 0 {
-					status = "running"
-				}
-				localWorkloads = append(localWorkloads, fmt.Sprintf("%s:%s:%s", wl.Name, wl.IP, status))
+				localWLInfo = append(localWLInfo, workloadInfo{name: wl.Name, ip: wl.IP})
 			}
 		}
 		a.stateMu.RUnlock()
+
+		// Check docker status outside the lock to avoid blocking
+		var localWorkloads []string
+		for _, wl := range localWLInfo {
+			out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.name).Output()
+			status := "stopped"
+			if len(strings.TrimSpace(string(out))) > 0 {
+				status = "running"
+			}
+			localWorkloads = append(localWorkloads, fmt.Sprintf("%s:%s:%s", wl.name, wl.ip, status))
+		}
 
 		localHealth := NodeHealth{
 			ID:        a.hwid,
@@ -2786,6 +2797,13 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	// Validate cluster secret
 	if a.clusterSecret != "" && req.Secret != a.clusterSecret {
 		http.Error(w, "invalid cluster secret", 401)
+		return
+	}
+
+	// Don't add ourselves as a peer
+	if req.Peer.ID == a.hwid {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ignored", "reason": "self"})
 		return
 	}
 
