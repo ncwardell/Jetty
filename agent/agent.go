@@ -515,6 +515,10 @@ func (a *Agent) initWarpRules() error {
 		}
 	}
 
+	// Remove WARP's aggressive routing that sends ALL internet traffic through tunnel
+	// We only need 100.96.0.0/12 routed through WARP for mesh connectivity
+	a.cleanupWarpRoutes()
+
 	log.Printf("WARP nft rules initialized")
 	return nil
 }
@@ -555,6 +559,39 @@ func (a *Agent) removeWarpRule(meshIP string) error {
 
 	// Rule not found - not an error, may have been already removed
 	return nil
+}
+
+// cleanupWarpRoutes removes WARP's aggressive split tunnel routes that route
+// almost all internet traffic through the CloudflareWARP interface.
+// We only need 100.96.0.0/12 for mesh connectivity.
+func (a *Agent) cleanupWarpRoutes() {
+	out, err := exec.Command("ip", "route", "show", "dev", "CloudflareWARP").Output()
+	if err != nil {
+		return
+	}
+
+	routes := strings.Split(string(out), "\n")
+	removedCount := 0
+	for _, route := range routes {
+		route = strings.TrimSpace(route)
+		if route == "" {
+			continue
+		}
+		// Keep only the mesh CIDR route (100.96.0.0/12)
+		if strings.HasPrefix(route, "100.96.0.0/12") {
+			continue
+		}
+		// Extract just the network part (first field)
+		fields := strings.Fields(route)
+		if len(fields) > 0 {
+			if err := exec.Command("ip", "route", "del", fields[0], "dev", "CloudflareWARP").Run(); err == nil {
+				removedCount++
+			}
+		}
+	}
+	if removedCount > 0 {
+		log.Printf("Removed %d WARP split tunnel routes (keeping only mesh CIDR)", removedCount)
+	}
 }
 
 func (a *Agent) deriveMeshIP(id string) string {

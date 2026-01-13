@@ -173,6 +173,17 @@ main() {
             nft delete table inet cloudflare-warp
         fi
 
+        # Remove WARP's aggressive routing that sends ALL internet traffic through tunnel
+        # We only need 100.96.0.0/12 routed through WARP for mesh connectivity
+        log "Removing WARP split tunnel routes (keeping only mesh CIDR)..."
+        ip route show dev CloudflareWARP | while read route; do
+            # Keep only the mesh CIDR route
+            case "$route" in
+                "100.96.0.0/12"*) ;;
+                *) ip route del $route dev CloudflareWARP 2>/dev/null || true ;;
+            esac
+        done
+
         log "WARP initialization complete"
     elif [ -n "$JETTY_JOIN" ]; then
         log "WARP token not available - will be fetched from cluster during join"
