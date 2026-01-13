@@ -455,10 +455,19 @@ func (a *Agent) initNetwork() error {
 		return fmt.Errorf("WARP IP not detected - ensure WARP is connected")
 	}
 
+	// Create dummy interface for workload IPs
+	// Workloads get IPs from serviceCIDR (10.100.x.x) that are routed via WARP
+	// This interface is where those IPs are bound so traffic can be DNATed to containers
+	exec.Command("ip", "link", "del", "jetty0").Run() // Clean up any existing
+	if err := exec.Command("ip", "link", "add", "dev", "jetty0", "type", "dummy").Run(); err != nil {
+		return fmt.Errorf("create dummy interface for workload IPs: %w", err)
+	}
+	exec.Command("ip", "link", "set", "up", "dev", "jetty0").Run()
+
 	// Enable forwarding for workload traffic
 	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
 
-	log.Printf("Network ready: %s (WARP)", a.ip)
+	log.Printf("Network ready: %s (WARP), workload interface: jetty0", a.ip)
 	return nil
 }
 
