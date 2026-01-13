@@ -925,6 +925,25 @@ func (a *Agent) joinCluster() error {
 // API
 // =============================================================================
 
+// corsMiddleware adds CORS headers to allow cross-origin requests from the web UI.
+func (a *Agent) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Allow requests from any origin (web UI can be opened from file:// or any domain)
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		// Handle preflight requests
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // apiKeyMiddleware checks for valid API key on protected endpoints.
 // The API key is the cluster secret (JETTY_SECRET).
 func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
@@ -1001,8 +1020,8 @@ func (a *Agent) runAPI() {
 	// Swagger UI
 	r.PathPrefix("/swagger/").Handler(httpSwagger.WrapHandler)
 
-	// Wrap router with API key middleware
-	handler := a.apiKeyMiddleware(r)
+	// Wrap router with API key middleware and CORS middleware
+	handler := a.corsMiddleware(a.apiKeyMiddleware(r))
 
 	addr := fmt.Sprintf(":%d", a.apiPort)
 	log.Printf("API on %s (auth=%v)", addr, a.clusterSecret != "")
