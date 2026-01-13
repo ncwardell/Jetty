@@ -946,6 +946,8 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/workloads/{name}/start", a.apiStartWorkload).Methods("POST")
 	r.HandleFunc("/api/workloads/{name}/stop", a.apiStopWorkload).Methods("POST")
 	r.HandleFunc("/api/join", a.apiJoin).Methods("POST")
+	r.HandleFunc("/api/nodes", a.apiListNodes).Methods("GET")
+	r.HandleFunc("/api/nodes/{id}", a.apiRemoveNode).Methods("DELETE")
 	r.HandleFunc("/api/health", a.apiHealth).Methods("GET")
 	r.HandleFunc("/api/sync", a.apiSync).Methods("GET")
 	r.HandleFunc("/api/tunnel", a.apiGetTunnel).Methods("GET")
@@ -993,15 +995,12 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 			"name": a.hostname,
 			"ip":   a.ip,
 		},
-		"peers":     peers,
-		"workloads": workloads,
+		"peers":        peers,
+		"workloads":    workloads,
+		"service_cidr": a.serviceCIDR,
 		"tunnel": map[string]interface{}{
 			"configured": hasTunnel,
 			"running":    a.isTunnelRunning(),
-		},
-		"warp": map[string]interface{}{
-			"enabled": true,
-			"ip":      a.ip,
 		},
 	}
 
@@ -2156,6 +2155,107 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 
 	log.Printf("Peer joined: %s (%s)", peer.Name, peer.IP)
+}
+
+// apiListNodes godoc
+// @Summary List all nodes
+// @Description Returns all nodes in the cluster (self + peers)
+// @Tags nodes
+// @Produce json
+// @Success 200 {array} Peer
+// @Router /nodes [get]
+func (a *Agent) apiListNodes(w http.ResponseWriter, r *http.Request) {
+	a.stateMu.RLock()
+	nodes := []map[string]interface{}{
+		{
+			"id":        a.hwid,
+			"name":      a.hostname,
+			"ip":        a.ip,
+			"healthy":   true,
+			"last_seen": time.Now(),
+			"is_self":   true,
+		},
+	}
+	for _, p := range a.state.Peers {
+		nodes = append(nodes, map[string]interface{}{
+			"id":        p.ID,
+			"name":      p.Name,
+			"ip":        p.IP,
+			"healthy":   p.Healthy,
+			"last_seen": p.LastSeen,
+			"is_self":   false,
+		})
+	}
+	a.stateMu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(nodes)
+}
+
+// apiRemoveNode godoc
+// @Summary Remove a node from the cluster
+// @Description Removes a peer node from the cluster. Workloads owned by that node will be orphaned and eligible for failover if revive is enabled.
+// @Tags nodes
+// @Produce json
+// @Param id path string true "Node ID (HWID) or name"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} ErrorResponse "Cannot remove self"
+// @Failure 404 {object} ErrorResponse "Node not found"
+// @Router /nodes/{id} [delete]
+func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	nodeID := vars["id"]
+
+	// Can't remove self
+	if nodeID == a.hwid || nodeID == a.hostname {
+		http.Error(w, "cannot remove self from cluster", 400)
+		return
+	}
+
+	a.stateMu.Lock()
+
+	// Find peer by ID or name
+	var found *Peer
+	var foundID string
+	for id, p := range a.state.Peers {
+		if p.ID == nodeID || p.Name == nodeID {
+			found = p
+			foundID = id
+			break
+		}
+	}
+
+	if found == nil {
+		a.stateMu.Unlock()
+		http.Error(w, "node not found", 404)
+		return
+	}
+
+	// Count workloads owned by this node
+	var orphanedWorkloads []string
+	for _, wl := range a.state.Workloads {
+		if wl.Owner == found.ID {
+			orphanedWorkloads = append(orphanedWorkloads, wl.Name)
+		}
+	}
+
+	// Remove the peer
+	delete(a.state.Peers, foundID)
+	a.stateMu.Unlock()
+
+	a.updateHosts()
+	a.saveState()
+	a.broadcastState()
+
+	log.Printf("Removed node: %s (%s), orphaned workloads: %v", found.Name, found.ID, orphanedWorkloads)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"removed":            found.Name,
+		"id":                 found.ID,
+		"orphaned_workloads": orphanedWorkloads,
+		"message":            "node removed; orphaned workloads will failover if revive is enabled",
+	})
 }
 
 // apiHealth godoc
