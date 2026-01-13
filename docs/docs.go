@@ -9,48 +9,12 @@ const docTemplate = `{
     "info": {
         "description": "{{escape .Description}}",
         "title": "{{.Title}}",
-        "termsOfService": "http://swagger.io/terms/",
-        "contact": {
-            "name": "Jetty Support",
-            "url": "https://github.com/ncwardell/jetty"
-        },
-        "license": {
-            "name": "MIT",
-            "url": "https://opensource.org/licenses/MIT"
-        },
+        "contact": {},
         "version": "{{.Version}}"
     },
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
-        "/cluster/health": {
-            "get": {
-                "description": "Returns health status from all nodes in the cluster",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "cluster"
-                ],
-                "summary": "Aggregate cluster health",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Filter by specific node name or ID",
-                        "name": "node",
-                        "in": "query"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/agent.ClusterHealthResponse"
-                        }
-                    }
-                }
-            }
-        },
         "/health": {
             "get": {
                 "description": "Returns health status of this node",
@@ -110,6 +74,73 @@ const docTemplate = `{
                     },
                     "409": {
                         "description": "Mesh IP collision",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/nodes": {
+            "get": {
+                "description": "Returns all nodes in the cluster (self + peers)",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "nodes"
+                ],
+                "summary": "List all nodes",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/agent.Peer"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/nodes/{id}": {
+            "delete": {
+                "description": "Removes a peer node from the cluster. Workloads owned by that node will be orphaned and eligible for failover if revive is enabled.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "nodes"
+                ],
+                "summary": "Remove a node from the cluster",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Node ID (HWID) or name",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Cannot remove self",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Node not found",
                         "schema": {
                             "$ref": "#/definitions/agent.ErrorResponse"
                         }
@@ -567,37 +598,6 @@ const docTemplate = `{
         }
     },
     "definitions": {
-        "agent.ClusterHealthResponse": {
-            "type": "object",
-            "properties": {
-                "cluster_status": {
-                    "type": "string",
-                    "example": "healthy"
-                },
-                "healthy_nodes": {
-                    "type": "integer",
-                    "example": 3
-                },
-                "nodes": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/agent.NodeHealth"
-                    }
-                },
-                "timestamp": {
-                    "type": "string",
-                    "example": "2024-01-02T15:04:05Z"
-                },
-                "total_nodes": {
-                    "type": "integer",
-                    "example": 3
-                },
-                "total_workloads": {
-                    "type": "integer",
-                    "example": 10
-                }
-            }
-        },
         "agent.ErrorResponse": {
             "type": "object",
             "properties": {
@@ -610,23 +610,39 @@ const docTemplate = `{
         "agent.HealthResponse": {
             "type": "object",
             "properties": {
+                "cluster_status": {
+                    "description": "Cluster health fields (when no filter or multiple nodes)",
+                    "type": "string",
+                    "example": "healthy"
+                },
+                "healthy_nodes": {
+                    "type": "integer",
+                    "example": 3
+                },
                 "id": {
                     "type": "string",
                     "example": "abc123def456"
                 },
-                "mesh_ip": {
+                "ip": {
                     "type": "string",
-                    "example": "10.100.0.1"
+                    "example": "100.96.0.1"
                 },
                 "name": {
                     "type": "string",
                     "example": "node1"
+                },
+                "nodes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/agent.NodeHealthStatus"
+                    }
                 },
                 "public_ip": {
                     "type": "string",
                     "example": "203.0.113.1"
                 },
                 "status": {
+                    "description": "Local health fields (when ?node=local or single node response)",
                     "type": "string",
                     "example": "healthy"
                 },
@@ -638,13 +654,13 @@ const docTemplate = `{
                     "type": "string",
                     "example": "2024-01-02T15:04:05Z"
                 },
-                "warp_enabled": {
-                    "type": "boolean",
-                    "example": true
+                "total_nodes": {
+                    "type": "integer",
+                    "example": 3
                 },
-                "warp_ip": {
-                    "type": "string",
-                    "example": "100.96.0.5"
+                "total_workloads": {
+                    "type": "integer",
+                    "example": 10
                 },
                 "workloads_local": {
                     "type": "array",
@@ -652,7 +668,7 @@ const docTemplate = `{
                         "type": "string"
                     },
                     "example": [
-                        "nginx:10.100.50.1:running"
+                        "nginx:10.100.0.50:running"
                     ]
                 },
                 "workloads_total": {
@@ -667,19 +683,14 @@ const docTemplate = `{
                 "id": {
                     "type": "string"
                 },
-                "mesh_ip": {
-                    "type": "string"
+                "ip": {
+                    "type": "string",
+                    "example": "100.96.0.5"
                 },
                 "name": {
                     "type": "string"
                 },
                 "secret": {
-                    "type": "string"
-                },
-                "tunnel_host": {
-                    "type": "string"
-                },
-                "warp_ip": {
                     "type": "string"
                 }
             }
@@ -690,15 +701,15 @@ const docTemplate = `{
                 "cf_token": {
                     "type": "string"
                 },
-                "mesh_cidr": {
-                    "type": "string",
-                    "example": "10.100.0.0/16"
-                },
                 "peers": {
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/agent.Peer"
                     }
+                },
+                "service_cidr": {
+                    "type": "string",
+                    "example": "10.100.0.0/16"
                 },
                 "tunnel_domain": {
                     "type": "string"
@@ -723,7 +734,7 @@ const docTemplate = `{
                 }
             }
         },
-        "agent.NodeHealth": {
+        "agent.NodeHealthStatus": {
             "type": "object",
             "properties": {
                 "error": {
@@ -737,13 +748,17 @@ const docTemplate = `{
                     "type": "string",
                     "example": "abc123def456"
                 },
-                "mesh_ip": {
+                "ip": {
                     "type": "string",
-                    "example": "10.100.0.1"
+                    "example": "100.96.0.1"
                 },
                 "name": {
                     "type": "string",
                     "example": "node1"
+                },
+                "public_ip": {
+                    "type": "string",
+                    "example": "203.0.113.1"
                 },
                 "status": {
                     "type": "string",
@@ -768,17 +783,13 @@ const docTemplate = `{
                     "type": "string",
                     "example": "abc123def456"
                 },
-                "mesh_ip": {
+                "ip": {
                     "type": "string",
-                    "example": "10.100.0.1"
+                    "example": "100.96.0.1"
                 },
                 "name": {
                     "type": "string",
                     "example": "node1"
-                },
-                "warp_ip": {
-                    "type": "string",
-                    "example": "100.96.0.5"
                 }
             }
         },
@@ -792,23 +803,15 @@ const docTemplate = `{
                     "description": "HWID",
                     "type": "string"
                 },
-                "last_seen": {
+                "ip": {
+                    "description": "WARP IP (100.96.x.x) - primary address for node communication",
                     "type": "string"
                 },
-                "mesh_ip": {
-                    "description": "Mesh network IP",
+                "last_seen": {
                     "type": "string"
                 },
                 "name": {
                     "description": "Hostname",
-                    "type": "string"
-                },
-                "tunnel_host": {
-                    "description": "Peer-specific tunnel hostname (e.g., \"node1.cluster.example.com\")",
-                    "type": "string"
-                },
-                "warp_ip": {
-                    "description": "Cloudflare WARP IP (CGNAT range, e.g., \"100.96.x.x\")",
                     "type": "string"
                 }
             }
@@ -825,11 +828,12 @@ const docTemplate = `{
                         "$ref": "#/definitions/agent.Peer"
                     }
                 },
+                "service_cidr": {
+                    "type": "string",
+                    "example": "10.100.0.0/16"
+                },
                 "tunnel": {
                     "$ref": "#/definitions/agent.TunnelStatus"
-                },
-                "warp": {
-                    "$ref": "#/definitions/agent.WarpStatus"
                 },
                 "workloads": {
                     "type": "array",
@@ -861,19 +865,6 @@ const docTemplate = `{
                 }
             }
         },
-        "agent.WarpStatus": {
-            "type": "object",
-            "properties": {
-                "enabled": {
-                    "type": "boolean",
-                    "example": true
-                },
-                "ip": {
-                    "type": "string",
-                    "example": "100.96.0.5"
-                }
-            }
-        },
         "agent.Workload": {
             "type": "object",
             "properties": {
@@ -891,8 +882,8 @@ const docTemplate = `{
                 "compose": {
                     "type": "string"
                 },
-                "mesh_ip": {
-                    "description": "Unique lock",
+                "ip": {
+                    "description": "Service IP (routed via WARP)",
                     "type": "string"
                 },
                 "name": {
@@ -934,9 +925,9 @@ const docTemplate = `{
                     "type": "string",
                     "example": "services:\n  web:\n    image: nginx"
                 },
-                "mesh_ip": {
+                "ip": {
                     "type": "string",
-                    "example": "10.100.50.1"
+                    "example": "10.100.0.50"
                 },
                 "name": {
                     "type": "string",
@@ -948,30 +939,17 @@ const docTemplate = `{
                 }
             }
         }
-    },
-    "securityDefinitions": {
-        "ApiKeyAuth": {
-            "description": "API key for authentication (JETTY_SECRET)",
-            "type": "apiKey",
-            "name": "X-API-Key",
-            "in": "header"
-        }
-    },
-    "security": [
-        {
-            "ApiKeyAuth": []
-        }
-    ]
+    }
 }`
 
 // SwaggerInfo holds exported Swagger Info so clients can modify it
 var SwaggerInfo = &swag.Spec{
-	Version:          "2.0",
-	Host:             "localhost:6880",
-	BasePath:         "/api",
-	Schemes:          []string{"https", "http"},
-	Title:            "Jetty API",
-	Description:      "P2P Docker Compose orchestration with Cloudflare WARP mesh networking",
+	Version:          "",
+	Host:             "",
+	BasePath:         "",
+	Schemes:          []string{},
+	Title:            "",
+	Description:      "",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 	LeftDelim:        "{{",
