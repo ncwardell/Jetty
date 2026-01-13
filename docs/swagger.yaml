@@ -1,5 +1,27 @@
 basePath: /api
 definitions:
+  agent.ClusterHealthResponse:
+    properties:
+      cluster_status:
+        example: healthy
+        type: string
+      healthy_nodes:
+        example: 3
+        type: integer
+      nodes:
+        items:
+          $ref: '#/definitions/agent.NodeHealth'
+        type: array
+      timestamp:
+        example: "2024-01-02T15:04:05Z"
+        type: string
+      total_nodes:
+        example: 3
+        type: integer
+      total_workloads:
+        example: 10
+        type: integer
+    type: object
   agent.ErrorResponse:
     properties:
       error:
@@ -8,14 +30,11 @@ definitions:
     type: object
   agent.HealthResponse:
     properties:
-      healthy:
-        example: true
-        type: boolean
       id:
         example: abc123def456
         type: string
       mesh_ip:
-        example: 10.100.42.1
+        example: 10.100.0.1
         type: string
       name:
         example: node1
@@ -23,19 +42,24 @@ definitions:
       public_ip:
         example: 203.0.113.1
         type: string
+      status:
+        example: healthy
+        type: string
+      system:
+        additionalProperties: true
+        type: object
       timestamp:
         example: "2024-01-02T15:04:05Z"
         type: string
+      warp_enabled:
+        example: true
+        type: boolean
       warp_ip:
         example: 100.96.0.5
-        type: string
-      wireguard_mode:
-        example: kernel
         type: string
       workloads_local:
         example:
         - nginx:10.100.50.1:running
-        - redis:10.100.50.2:stopped
         items:
           type: string
         type: array
@@ -45,29 +69,34 @@ definitions:
     type: object
   agent.JoinRequest:
     properties:
-      endpoint:
-        type: string
       id:
         type: string
       mesh_ip:
         type: string
       name:
         type: string
-      public_key:
-        type: string
       secret:
         type: string
-      token:
+      tunnel_host:
+        type: string
+      warp_ip:
         type: string
     type: object
   agent.JoinResponse:
     properties:
       cf_token:
         type: string
+      mesh_cidr:
+        example: 10.100.0.0/16
+        type: string
       peers:
         items:
           $ref: '#/definitions/agent.Peer'
         type: array
+      tunnel_domain:
+        type: string
+      warp_token:
+        type: string
       workloads:
         items:
           $ref: '#/definitions/agent.Workload'
@@ -79,19 +108,43 @@ definitions:
         example: node2
         type: string
     type: object
+  agent.NodeHealth:
+    properties:
+      error:
+        type: string
+      healthy:
+        example: true
+        type: boolean
+      id:
+        example: abc123def456
+        type: string
+      mesh_ip:
+        example: 10.100.0.1
+        type: string
+      name:
+        example: node1
+        type: string
+      status:
+        example: healthy
+        type: string
+      system:
+        additionalProperties: true
+        type: object
+      workloads:
+        items:
+          type: string
+        type: array
+    type: object
   agent.NodeInfo:
     properties:
       id:
         example: abc123def456
         type: string
       mesh_ip:
-        example: 10.100.42.1
+        example: 10.100.0.1
         type: string
       name:
         example: node1
-        type: string
-      public_key:
-        example: '...'
         type: string
       warp_ip:
         example: 100.96.0.5
@@ -99,9 +152,6 @@ definitions:
     type: object
   agent.Peer:
     properties:
-      endpoint:
-        description: public:wg_port
-        type: string
       healthy:
         type: boolean
       id:
@@ -110,11 +160,10 @@ definitions:
       last_seen:
         type: string
       mesh_ip:
+        description: Mesh network IP
         type: string
       name:
         description: Hostname
-        type: string
-      public_key:
         type: string
       tunnel_host:
         description: Peer-specific tunnel hostname (e.g., "node1.cluster.example.com")
@@ -135,21 +184,10 @@ definitions:
         $ref: '#/definitions/agent.TunnelStatus'
       warp:
         $ref: '#/definitions/agent.WarpStatus'
-      wireguard:
-        $ref: '#/definitions/agent.WireGuardStatus'
       workloads:
         items:
           $ref: '#/definitions/agent.Workload'
         type: array
-    type: object
-  agent.TokenResponse:
-    properties:
-      expires_at:
-        example: "2024-01-02T15:04:05Z"
-        type: string
-      token:
-        example: abc123...
-        type: string
     type: object
   agent.TunnelRequest:
     properties:
@@ -169,24 +207,19 @@ definitions:
   agent.WarpStatus:
     properties:
       enabled:
-        example: false
+        example: true
         type: boolean
       ip:
         example: 100.96.0.5
         type: string
     type: object
-  agent.WireGuardStatus:
-    properties:
-      enabled:
-        example: true
-        type: boolean
-      mode:
-        description: '"kernel" or "dummy"'
-        example: kernel
-        type: string
-    type: object
   agent.Workload:
     properties:
+      allowed_nodes:
+        description: 'Node whitelist: empty/["*"] = all, otherwise node names/IDs'
+        items:
+          type: string
+        type: array
       autostart:
         description: Auto-start when Jetty starts up
         type: boolean
@@ -210,12 +243,18 @@ definitions:
     type: object
   agent.WorkloadRequest:
     properties:
+      allowed_nodes:
+        example:
+        - node1
+        - node2
+        items:
+          type: string
+        type: array
       autostart:
         example: true
         type: boolean
       compose:
         example: |-
-          version: '3'
           services:
             web:
               image: nginx
@@ -235,14 +274,32 @@ info:
   contact:
     name: Jetty Support
     url: https://github.com/ncwardell/jetty
-  description: P2P Docker Compose orchestration with WireGuard mesh networking
+  description: P2P Docker Compose orchestration with Cloudflare WARP mesh networking
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
   termsOfService: http://swagger.io/terms/
   title: Jetty API
-  version: "1.0"
+  version: "2.0"
 paths:
+  /cluster/health:
+    get:
+      description: Returns health status from all nodes in the cluster
+      parameters:
+      - description: Filter by specific node name or ID
+        in: query
+        name: node
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.ClusterHealthResponse'
+      summary: Aggregate cluster health
+      tags:
+      - cluster
   /health:
     get:
       description: Returns health status of this node
@@ -260,7 +317,7 @@ paths:
     post:
       consumes:
       - application/json
-      description: Allows a new node to join the cluster using a token
+      description: Allows a new node to join the cluster using the cluster secret
       parameters:
       - description: Join request
         in: body
@@ -276,7 +333,7 @@ paths:
           schema:
             $ref: '#/definitions/agent.JoinResponse'
         "401":
-          description: Invalid token or secret
+          description: Invalid secret
           schema:
             $ref: '#/definitions/agent.ErrorResponse'
         "409":
@@ -298,20 +355,6 @@ paths:
           schema:
             $ref: '#/definitions/agent.StatusResponse'
       summary: Get cluster status
-      tags:
-      - cluster
-  /token:
-    post:
-      description: Generates a new single-use token for joining the cluster (expires
-        in 24h)
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/agent.TokenResponse'
-      summary: Create join token
       tags:
       - cluster
   /tunnel:
@@ -358,7 +401,12 @@ paths:
       - tunnel
   /workloads:
     get:
-      description: Returns all workloads in the cluster
+      description: Returns all workloads in the cluster, optionally filtered by node
+      parameters:
+      - description: Filter by node name or ID (use 'local' for this node only)
+        in: query
+        name: node
+        type: string
       produces:
       - application/json
       responses:
@@ -443,6 +491,44 @@ paths:
           schema:
             $ref: '#/definitions/agent.ErrorResponse'
       summary: Get workload details
+      tags:
+      - workloads
+    patch:
+      consumes:
+      - application/json
+      description: Updates workload configuration. Some fields require redeploy.
+      parameters:
+      - description: Workload name
+        in: path
+        name: name
+        required: true
+        type: string
+      - description: Fields to update
+        in: body
+        name: update
+        required: true
+        schema:
+          type: object
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.Workload'
+        "404":
+          description: Workload not found
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "409":
+          description: Mesh IP conflict
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "500":
+          description: Update failed
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Update a workload
       tags:
       - workloads
   /workloads/{name}/logs:

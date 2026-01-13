@@ -5,7 +5,7 @@
     ],
     "swagger": "2.0",
     "info": {
-        "description": "P2P Docker Compose orchestration with WireGuard mesh networking",
+        "description": "P2P Docker Compose orchestration with Cloudflare WARP mesh networking",
         "title": "Jetty API",
         "termsOfService": "http://swagger.io/terms/",
         "contact": {
@@ -16,11 +16,39 @@
             "name": "MIT",
             "url": "https://opensource.org/licenses/MIT"
         },
-        "version": "1.0"
+        "version": "2.0"
     },
     "host": "localhost:8080",
     "basePath": "/api",
     "paths": {
+        "/cluster/health": {
+            "get": {
+                "description": "Returns health status from all nodes in the cluster",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "cluster"
+                ],
+                "summary": "Aggregate cluster health",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Filter by specific node name or ID",
+                        "name": "node",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ClusterHealthResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/health": {
             "get": {
                 "description": "Returns health status of this node",
@@ -43,7 +71,7 @@
         },
         "/join": {
             "post": {
-                "description": "Allows a new node to join the cluster using a token",
+                "description": "Allows a new node to join the cluster using the cluster secret",
                 "consumes": [
                     "application/json"
                 ],
@@ -73,7 +101,7 @@
                         }
                     },
                     "401": {
-                        "description": "Invalid token or secret",
+                        "description": "Invalid secret",
                         "schema": {
                             "$ref": "#/definitions/agent.ErrorResponse"
                         }
@@ -102,26 +130,6 @@
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/agent.StatusResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/token": {
-            "post": {
-                "description": "Generates a new single-use token for joining the cluster (expires in 24h)",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "cluster"
-                ],
-                "summary": "Create join token",
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/agent.TokenResponse"
                         }
                     }
                 }
@@ -193,7 +201,7 @@
         },
         "/workloads": {
             "get": {
-                "description": "Returns all workloads in the cluster",
+                "description": "Returns all workloads in the cluster, optionally filtered by node",
                 "produces": [
                     "application/json"
                 ],
@@ -201,6 +209,14 @@
                     "workloads"
                 ],
                 "summary": "List all workloads",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Filter by node name or ID (use 'local' for this node only)",
+                        "name": "node",
+                        "in": "query"
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -319,6 +335,63 @@
                     },
                     "404": {
                         "description": "Workload not found",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "patch": {
+                "description": "Updates workload configuration. Some fields require redeploy.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "workloads"
+                ],
+                "summary": "Update a workload",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Workload name",
+                        "name": "name",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Fields to update",
+                        "name": "update",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "type": "object"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.Workload"
+                        }
+                    },
+                    "404": {
+                        "description": "Workload not found",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Mesh IP conflict",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Update failed",
                         "schema": {
                             "$ref": "#/definitions/agent.ErrorResponse"
                         }
@@ -492,6 +565,37 @@
         }
     },
     "definitions": {
+        "agent.ClusterHealthResponse": {
+            "type": "object",
+            "properties": {
+                "cluster_status": {
+                    "type": "string",
+                    "example": "healthy"
+                },
+                "healthy_nodes": {
+                    "type": "integer",
+                    "example": 3
+                },
+                "nodes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/agent.NodeHealth"
+                    }
+                },
+                "timestamp": {
+                    "type": "string",
+                    "example": "2024-01-02T15:04:05Z"
+                },
+                "total_nodes": {
+                    "type": "integer",
+                    "example": 3
+                },
+                "total_workloads": {
+                    "type": "integer",
+                    "example": 10
+                }
+            }
+        },
         "agent.ErrorResponse": {
             "type": "object",
             "properties": {
@@ -504,17 +608,13 @@
         "agent.HealthResponse": {
             "type": "object",
             "properties": {
-                "healthy": {
-                    "type": "boolean",
-                    "example": true
-                },
                 "id": {
                     "type": "string",
                     "example": "abc123def456"
                 },
                 "mesh_ip": {
                     "type": "string",
-                    "example": "10.100.42.1"
+                    "example": "10.100.0.1"
                 },
                 "name": {
                     "type": "string",
@@ -524,17 +624,25 @@
                     "type": "string",
                     "example": "203.0.113.1"
                 },
+                "status": {
+                    "type": "string",
+                    "example": "healthy"
+                },
+                "system": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
                 "timestamp": {
                     "type": "string",
                     "example": "2024-01-02T15:04:05Z"
                 },
+                "warp_enabled": {
+                    "type": "boolean",
+                    "example": true
+                },
                 "warp_ip": {
                     "type": "string",
                     "example": "100.96.0.5"
-                },
-                "wireguard_mode": {
-                    "type": "string",
-                    "example": "kernel"
                 },
                 "workloads_local": {
                     "type": "array",
@@ -542,8 +650,7 @@
                         "type": "string"
                     },
                     "example": [
-                        "nginx:10.100.50.1:running",
-                        "redis:10.100.50.2:stopped"
+                        "nginx:10.100.50.1:running"
                     ]
                 },
                 "workloads_total": {
@@ -555,9 +662,6 @@
         "agent.JoinRequest": {
             "type": "object",
             "properties": {
-                "endpoint": {
-                    "type": "string"
-                },
                 "id": {
                     "type": "string"
                 },
@@ -567,13 +671,13 @@
                 "name": {
                     "type": "string"
                 },
-                "public_key": {
-                    "type": "string"
-                },
                 "secret": {
                     "type": "string"
                 },
-                "token": {
+                "tunnel_host": {
+                    "type": "string"
+                },
+                "warp_ip": {
                     "type": "string"
                 }
             }
@@ -584,11 +688,21 @@
                 "cf_token": {
                     "type": "string"
                 },
+                "mesh_cidr": {
+                    "type": "string",
+                    "example": "10.100.0.0/16"
+                },
                 "peers": {
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/agent.Peer"
                     }
+                },
+                "tunnel_domain": {
+                    "type": "string"
+                },
+                "warp_token": {
+                    "type": "string"
                 },
                 "workloads": {
                     "type": "array",
@@ -607,6 +721,44 @@
                 }
             }
         },
+        "agent.NodeHealth": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                },
+                "healthy": {
+                    "type": "boolean",
+                    "example": true
+                },
+                "id": {
+                    "type": "string",
+                    "example": "abc123def456"
+                },
+                "mesh_ip": {
+                    "type": "string",
+                    "example": "10.100.0.1"
+                },
+                "name": {
+                    "type": "string",
+                    "example": "node1"
+                },
+                "status": {
+                    "type": "string",
+                    "example": "healthy"
+                },
+                "system": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "workloads": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
         "agent.NodeInfo": {
             "type": "object",
             "properties": {
@@ -616,15 +768,11 @@
                 },
                 "mesh_ip": {
                     "type": "string",
-                    "example": "10.100.42.1"
+                    "example": "10.100.0.1"
                 },
                 "name": {
                     "type": "string",
                     "example": "node1"
-                },
-                "public_key": {
-                    "type": "string",
-                    "example": "..."
                 },
                 "warp_ip": {
                     "type": "string",
@@ -635,10 +783,6 @@
         "agent.Peer": {
             "type": "object",
             "properties": {
-                "endpoint": {
-                    "description": "public:wg_port",
-                    "type": "string"
-                },
                 "healthy": {
                     "type": "boolean"
                 },
@@ -650,13 +794,11 @@
                     "type": "string"
                 },
                 "mesh_ip": {
+                    "description": "Mesh network IP",
                     "type": "string"
                 },
                 "name": {
                     "description": "Hostname",
-                    "type": "string"
-                },
-                "public_key": {
                     "type": "string"
                 },
                 "tunnel_host": {
@@ -687,27 +829,11 @@
                 "warp": {
                     "$ref": "#/definitions/agent.WarpStatus"
                 },
-                "wireguard": {
-                    "$ref": "#/definitions/agent.WireGuardStatus"
-                },
                 "workloads": {
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/agent.Workload"
                     }
-                }
-            }
-        },
-        "agent.TokenResponse": {
-            "type": "object",
-            "properties": {
-                "expires_at": {
-                    "type": "string",
-                    "example": "2024-01-02T15:04:05Z"
-                },
-                "token": {
-                    "type": "string",
-                    "example": "abc123..."
                 }
             }
         },
@@ -738,7 +864,7 @@
             "properties": {
                 "enabled": {
                     "type": "boolean",
-                    "example": false
+                    "example": true
                 },
                 "ip": {
                     "type": "string",
@@ -746,23 +872,16 @@
                 }
             }
         },
-        "agent.WireGuardStatus": {
-            "type": "object",
-            "properties": {
-                "enabled": {
-                    "type": "boolean",
-                    "example": true
-                },
-                "mode": {
-                    "description": "\"kernel\" or \"dummy\"",
-                    "type": "string",
-                    "example": "kernel"
-                }
-            }
-        },
         "agent.Workload": {
             "type": "object",
             "properties": {
+                "allowed_nodes": {
+                    "description": "Node whitelist: empty/[\"*\"] = all, otherwise node names/IDs",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "autostart": {
                     "description": "Auto-start when Jetty starts up",
                     "type": "boolean"
@@ -795,13 +914,23 @@
         "agent.WorkloadRequest": {
             "type": "object",
             "properties": {
+                "allowed_nodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "node1",
+                        "node2"
+                    ]
+                },
                 "autostart": {
                     "type": "boolean",
                     "example": true
                 },
                 "compose": {
                     "type": "string",
-                    "example": "version: '3'\nservices:\n  web:\n    image: nginx"
+                    "example": "services:\n  web:\n    image: nginx"
                 },
                 "mesh_ip": {
                     "type": "string",

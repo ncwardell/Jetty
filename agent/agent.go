@@ -38,9 +38,7 @@ var validNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 type Peer struct {
 	ID         string    `json:"id"`          // HWID
 	Name       string    `json:"name"`        // Hostname
-	MeshIP     string    `json:"mesh_ip"`
-	Endpoint   string    `json:"endpoint"`    // public:wg_port
-	PublicKey  string    `json:"public_key"`
+	MeshIP     string    `json:"mesh_ip"`     // Mesh network IP
 	TunnelHost string    `json:"tunnel_host"` // Peer-specific tunnel hostname (e.g., "node1.cluster.example.com")
 	WarpIP     string    `json:"warp_ip"`     // Cloudflare WARP IP (CGNAT range, e.g., "100.96.x.x")
 	Healthy    bool      `json:"healthy"`
