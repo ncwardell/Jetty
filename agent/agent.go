@@ -3626,6 +3626,40 @@ func (a *Agent) loadState() {
 // Cloudflare Tunnel
 // =============================================================================
 
+// cloudflaredLogFilter filters cloudflared output to only log important messages.
+// This prevents verbose debug output from flooding the logs while still capturing
+// errors, connection status, and other important information.
+type cloudflaredLogFilter struct {
+	prefix string
+}
+
+func (f *cloudflaredLogFilter) Write(p []byte) (n int, err error) {
+	line := strings.TrimSpace(string(p))
+	if line == "" {
+		return len(p), nil
+	}
+
+	// Convert to lowercase for matching
+	lower := strings.ToLower(line)
+
+	// Always log errors and important status messages
+	important := strings.Contains(lower, "error") ||
+		strings.Contains(lower, "failed") ||
+		strings.Contains(lower, "unable") ||
+		strings.Contains(lower, "cannot") ||
+		strings.Contains(lower, "connection") ||
+		strings.Contains(lower, "registered") ||
+		strings.Contains(lower, "unregistered") ||
+		strings.Contains(lower, "reconnect") ||
+		strings.Contains(lower, "tunnel") && (strings.Contains(lower, "start") || strings.Contains(lower, "stop"))
+
+	if important {
+		log.Printf("[cloudflared] %s", line)
+	}
+
+	return len(p), nil
+}
+
 // startCloudflared starts the cloudflared tunnel process with the configured token.
 // It runs the tunnel pointing to the local API, providing external access to the cluster.
 // The process is monitored and automatically restarted on failure.
@@ -3648,12 +3682,15 @@ func (a *Agent) startCloudflared() error {
 
 	a.cfStopCh = make(chan struct{})
 
-	// Start cloudflared tunnel - pass token via environment to avoid exposing in process list
-	a.cfCmd = exec.Command("cloudflared", "tunnel", "run")
+	// Start cloudflared tunnel with --no-autoupdate to prevent background updates
+	// Pass token via environment to avoid exposing in process list
+	a.cfCmd = exec.Command("cloudflared", "tunnel", "--no-autoupdate", "run")
 	a.cfCmd.Env = append(os.Environ(), "TUNNEL_TOKEN="+token)
-	// Discard cloudflared verbose output to avoid log flooding
-	a.cfCmd.Stdout = io.Discard
-	a.cfCmd.Stderr = io.Discard
+
+	// Use filtered log writer to capture important messages while suppressing verbose output
+	logFilter := &cloudflaredLogFilter{prefix: "cloudflared"}
+	a.cfCmd.Stdout = logFilter
+	a.cfCmd.Stderr = logFilter
 
 	if err := a.cfCmd.Start(); err != nil {
 		return fmt.Errorf("cloudflared start: %w", err)
@@ -3778,11 +3815,13 @@ func (a *Agent) monitorCloudflared() {
 		}
 
 		// Pass token via environment to avoid exposing in process list
-		a.cfCmd = exec.Command("cloudflared", "tunnel", "run")
+		a.cfCmd = exec.Command("cloudflared", "tunnel", "--no-autoupdate", "run")
 		a.cfCmd.Env = append(os.Environ(), "TUNNEL_TOKEN="+token)
-		// Discard cloudflared verbose output to avoid log flooding
-		a.cfCmd.Stdout = io.Discard
-		a.cfCmd.Stderr = io.Discard
+
+		// Use filtered log writer to capture important messages while suppressing verbose output
+		logFilter := &cloudflaredLogFilter{prefix: "cloudflared"}
+		a.cfCmd.Stdout = logFilter
+		a.cfCmd.Stderr = logFilter
 
 		if err := a.cfCmd.Start(); err != nil {
 			log.Printf("Cloudflare tunnel restart failed: %v", err)
