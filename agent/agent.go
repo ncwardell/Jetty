@@ -105,6 +105,11 @@ type Agent struct {
 	warpIP      string // WARP IP address (CGNAT range, e.g., "100.96.x.x")
 	warpEnabled bool   // Whether WARP mode is active
 
+	// Cloudflare API (for WARP private network routes)
+	cfAPIToken   string // Cloudflare API token
+	cfAccountID  string // Cloudflare account ID
+	cfTunnelID   string // WARP connector tunnel ID
+
 	// Config
 	dataDir       string
 	apiPort       int
@@ -163,6 +168,9 @@ func New() (*Agent, error) {
 		clusterSecret: getEnv("JETTY_SECRET", ""),
 		tunnelDomain:  getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - enables tunnel-only mode
 		tunnelHost:    getEnv("JETTY_TUNNEL_HOST", ""),   // e.g., "node1.cluster.example.com" - this node's specific subdomain
+		cfAPIToken:    getEnv("JETTY_CF_API_TOKEN", ""),  // Cloudflare API token for route management
+		cfAccountID:   getEnv("JETTY_CF_ACCOUNT_ID", ""), // Cloudflare account ID
+		cfTunnelID:    getEnv("JETTY_CF_TUNNEL_ID", ""),  // WARP connector tunnel ID
 		composeDir:    filepath.Join(dataDir, "compose"),
 		hostsFile:     "/etc/hosts",
 		state: &State{
@@ -292,6 +300,115 @@ func (a *Agent) detectWarpIP() {
 			return
 		}
 	}
+}
+
+// =============================================================================
+// WARP Private Network Routes (Cloudflare API)
+// =============================================================================
+
+// registerWarpRoute adds a private network route for a mesh IP via Cloudflare API.
+// This allows WARP clients to reach the workload through the tunnel.
+func (a *Agent) registerWarpRoute(meshIP string) error {
+	if a.cfAPIToken == "" || a.cfAccountID == "" || a.cfTunnelID == "" {
+		return nil // WARP route management not configured
+	}
+
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/teamnet/routes", a.cfAccountID)
+
+	payload := map[string]interface{}{
+		"network":   meshIP + "/32",
+		"tunnel_id": a.cfTunnelID,
+		"comment":   fmt.Sprintf("jetty:%s:%s", a.hostname, meshIP),
+	}
+	data, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest("POST", url, strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.cfAPIToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("cloudflare API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		// Ignore "already exists" errors
+		if strings.Contains(string(body), "already exists") {
+			log.Printf("WARP route for %s already exists", meshIP)
+			return nil
+		}
+		return fmt.Errorf("cloudflare API error: %s", body)
+	}
+
+	log.Printf("WARP route registered: %s -> tunnel %s", meshIP, a.cfTunnelID[:8])
+	return nil
+}
+
+// unregisterWarpRoute removes a private network route for a mesh IP.
+func (a *Agent) unregisterWarpRoute(meshIP string) error {
+	if a.cfAPIToken == "" || a.cfAccountID == "" || a.cfTunnelID == "" {
+		return nil // WARP route management not configured
+	}
+
+	// First, find the route ID
+	listURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/teamnet/routes?network=%s",
+		a.cfAccountID, meshIP+"/32")
+
+	req, err := http.NewRequest("GET", listURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.cfAPIToken)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("cloudflare API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var listResult struct {
+		Success bool `json:"success"`
+		Result  []struct {
+			ID string `json:"id"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listResult); err != nil {
+		return err
+	}
+
+	if !listResult.Success || len(listResult.Result) == 0 {
+		return nil // Route doesn't exist
+	}
+
+	// Delete the route
+	routeID := listResult.Result[0].ID
+	deleteURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/teamnet/routes/%s",
+		a.cfAccountID, routeID)
+
+	req, err = http.NewRequest("DELETE", deleteURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.cfAPIToken)
+
+	resp, err = httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("cloudflare API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("cloudflare API delete error: %s", body)
+	}
+
+	log.Printf("WARP route unregistered: %s", meshIP)
+	return nil
 }
 
 func (a *Agent) Stop() {
@@ -894,6 +1011,11 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	a.saveState()
 	a.broadcastState()
 
+	// Register WARP private network route for this workload
+	if err := a.registerWarpRoute(wl.MeshIP); err != nil {
+		log.Printf("Warning: failed to register WARP route for %s: %v", wl.MeshIP, err)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(wl)
 }
@@ -1152,6 +1274,11 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 	// Remove if we're running it
 	if found.Owner == a.hwid {
 		a.removeWorkload(found)
+
+		// Unregister WARP route for this workload
+		if err := a.unregisterWarpRoute(found.MeshIP); err != nil {
+			log.Printf("Warning: failed to unregister WARP route for %s: %v", found.MeshIP, err)
+		}
 	}
 
 	a.updateHosts()
@@ -1227,6 +1354,11 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	// Remove locally if we own it
 	if found.Owner == a.hwid {
 		a.removeWorkload(found)
+
+		// Unregister WARP route (target will register its own)
+		if err := a.unregisterWarpRoute(found.MeshIP); err != nil {
+			log.Printf("Warning: failed to unregister WARP route for %s: %v", found.MeshIP, err)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2237,6 +2369,11 @@ func (a *Agent) autostartWorkloads() {
 	for _, wl := range toStart {
 		if err := a.deployWorkload(wl); err != nil {
 			log.Printf("Failed to auto-start %s: %v", wl.Name, err)
+		} else {
+			// Register WARP route for successfully started workload
+			if err := a.registerWarpRoute(wl.MeshIP); err != nil {
+				log.Printf("Warning: failed to register WARP route for %s: %v", wl.MeshIP, err)
+			}
 		}
 	}
 }
