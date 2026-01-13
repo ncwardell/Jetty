@@ -3675,7 +3675,8 @@ func (a *Agent) startCloudflared() error {
 
 	// Start cloudflared tunnel with --no-autoupdate to prevent background updates
 	// Pass token via environment to avoid exposing in process list
-	a.cfCmd = exec.Command("cloudflared", "tunnel", "--no-autoupdate", "run")
+	// Note: --no-autoupdate is a global flag and must come before 'tunnel'
+	a.cfCmd = exec.Command("cloudflared", "--no-autoupdate", "tunnel", "run")
 	a.cfCmd.Env = append(os.Environ(), "TUNNEL_TOKEN="+token)
 
 	// Use filtered log writer to capture important messages while suppressing verbose output
@@ -3806,7 +3807,8 @@ func (a *Agent) monitorCloudflared() {
 		}
 
 		// Pass token via environment to avoid exposing in process list
-		a.cfCmd = exec.Command("cloudflared", "tunnel", "--no-autoupdate", "run")
+		// Note: --no-autoupdate is a global flag and must come before 'tunnel'
+		a.cfCmd = exec.Command("cloudflared", "--no-autoupdate", "tunnel", "run")
 		a.cfCmd.Env = append(os.Environ(), "TUNNEL_TOKEN="+token)
 
 		// Use filtered log writer to capture important messages while suppressing verbose output
