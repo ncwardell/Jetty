@@ -948,6 +948,14 @@ const docTemplate = `{
                 }
             }
         }
+    },
+    "securityDefinitions": {
+        "ApiKeyAuth": {
+            "description": "API key for authentication (JETTY_SECRET)",
+            "type": "apiKey",
+            "name": "X-API-Key",
+            "in": "header"
+        }
     }
 }`
 

@@ -18,7 +18,7 @@
         },
         "version": "2.0"
     },
-    "host": "localhost:8080",
+    "host": "localhost:6880",
     "basePath": "/api",
     "paths": {
         "/cluster/health": {
@@ -945,6 +945,14 @@
                     "example": true
                 }
             }
+        }
+    },
+    "securityDefinitions": {
+        "ApiKeyAuth": {
+            "description": "API key for authentication (JETTY_SECRET)",
+            "type": "apiKey",
+            "name": "X-API-Key",
+            "in": "header"
         }
     }
 }
