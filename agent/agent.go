@@ -786,7 +786,12 @@ func (a *Agent) updateHosts() {
 // =============================================================================
 
 func (a *Agent) joinCluster() error {
-	log.Printf("Joining cluster via %s", a.joinURL)
+	// Normalize join URL - allow both base URL and full /api/join URL
+	joinEndpoint := a.joinURL
+	if !strings.HasSuffix(joinEndpoint, "/api/join") {
+		joinEndpoint = strings.TrimSuffix(joinEndpoint, "/") + "/api/join"
+	}
+	log.Printf("Joining cluster via %s", joinEndpoint)
 
 	// Retry loop to handle IP collisions
 	maxRetries := 5
@@ -801,7 +806,7 @@ func (a *Agent) joinCluster() error {
 		}
 
 		data, _ := json.Marshal(req)
-		resp, err := httpClient.Post(a.joinURL+"/api/join", "application/json", strings.NewReader(string(data)))
+		resp, err := httpClient.Post(joinEndpoint, "application/json", strings.NewReader(string(data)))
 		if err != nil {
 			return err
 		}
