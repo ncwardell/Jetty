@@ -1,0 +1,2056 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jetty - Docker Orchestration Dashboard</title>
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --bg-hover: #30363d;
+            --border-color: #30363d;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #6e7681;
+            --accent-blue: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-red: #f85149;
+            --accent-yellow: #d29922;
+            --accent-purple: #a371f7;
+            --accent-orange: #f0883e;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .logo {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--accent-blue);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .logo svg {
+            width: 28px;
+            height: 28px;
+        }
+
+        .connection-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+            font-size: 13px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent-red);
+        }
+
+        .status-dot.connected {
+            background: var(--accent-green);
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        /* Buttons */
+        .btn {
+            padding: 8px 16px;
+            border-radius: 6px;
+            border: 1px solid var(--border-color);
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn:hover {
+            background: var(--bg-hover);
+        }
+
+        .btn-primary {
+            background: var(--accent-blue);
+            border-color: var(--accent-blue);
+            color: #fff;
+        }
+
+        .btn-primary:hover {
+            background: #4c8ed9;
+        }
+
+        .btn-success {
+            background: var(--accent-green);
+            border-color: var(--accent-green);
+            color: #fff;
+        }
+
+        .btn-danger {
+            background: var(--accent-red);
+            border-color: var(--accent-red);
+            color: #fff;
+        }
+
+        .btn-sm {
+            padding: 4px 10px;
+            font-size: 12px;
+        }
+
+        /* Main Layout */
+        .main-container {
+            display: flex;
+            min-height: calc(100vh - 57px);
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 240px;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border-color);
+            padding: 16px 0;
+            flex-shrink: 0;
+        }
+
+        .sidebar-section {
+            margin-bottom: 24px;
+        }
+
+        .sidebar-title {
+            padding: 0 16px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+
+        .sidebar-item {
+            padding: 10px 16px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: var(--text-secondary);
+            transition: all 0.2s;
+        }
+
+        .sidebar-item:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .sidebar-item.active {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border-left: 2px solid var(--accent-blue);
+        }
+
+        .sidebar-item svg {
+            width: 18px;
+            height: 18px;
+        }
+
+        /* Content Area */
+        .content {
+            flex: 1;
+            padding: 24px;
+            overflow-y: auto;
+        }
+
+        .page {
+            display: none;
+        }
+
+        .page.active {
+            display: block;
+        }
+
+        .page-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 24px;
+        }
+
+        .page-title {
+            font-size: 24px;
+            font-weight: 600;
+        }
+
+        /* Cards */
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            margin-bottom: 16px;
+        }
+
+        .card-header {
+            padding: 16px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .card-title {
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        .card-body {
+            padding: 16px;
+        }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .stat-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+        }
+
+        .stat-label {
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-size: 28px;
+            font-weight: 600;
+        }
+
+        .stat-value.green { color: var(--accent-green); }
+        .stat-value.blue { color: var(--accent-blue); }
+        .stat-value.yellow { color: var(--accent-yellow); }
+        .stat-value.red { color: var(--accent-red); }
+
+        /* Connection Modal */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .modal-overlay.hidden {
+            display: none;
+        }
+
+        .modal {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            width: 100%;
+            max-width: 480px;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .modal-title {
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 4px;
+        }
+
+        .modal-close:hover {
+            color: var(--text-primary);
+        }
+
+        .modal-body {
+            padding: 20px;
+        }
+
+        .modal-footer {
+            padding: 16px 20px;
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+        }
+
+        /* Forms */
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-label {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 6px;
+            color: var(--text-primary);
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 10px 12px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 14px;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: var(--accent-blue);
+        }
+
+        .form-input::placeholder {
+            color: var(--text-muted);
+        }
+
+        textarea.form-input {
+            min-height: 200px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 13px;
+            resize: vertical;
+        }
+
+        .form-hint {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+
+        .form-checkbox {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+        }
+
+        .form-checkbox input {
+            width: 16px;
+            height: 16px;
+        }
+
+        /* Nodes Grid */
+        .nodes-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 16px;
+        }
+
+        .node-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            transition: all 0.2s;
+        }
+
+        .node-card:hover {
+            border-color: var(--accent-blue);
+        }
+
+        .node-card.drop-target {
+            border: 2px dashed var(--accent-blue);
+            background: rgba(88, 166, 255, 0.1);
+        }
+
+        .node-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }
+
+        .node-name {
+            font-size: 16px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .node-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: var(--accent-blue);
+            color: white;
+        }
+
+        .node-health {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+        }
+
+        .node-health.healthy {
+            color: var(--accent-green);
+        }
+
+        .node-health.unhealthy {
+            color: var(--accent-red);
+        }
+
+        .node-details {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        .node-details p {
+            margin-bottom: 4px;
+        }
+
+        .node-workloads {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border-color);
+            min-height: 60px;
+        }
+
+        .node-workloads-title {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }
+
+        .node-workloads-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        /* Workload Items */
+        .workload-chip {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 12px;
+            cursor: grab;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s;
+        }
+
+        .workload-chip:hover {
+            background: var(--bg-hover);
+            border-color: var(--accent-blue);
+        }
+
+        .workload-chip.dragging {
+            opacity: 0.5;
+        }
+
+        .workload-chip .status-indicator {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+        }
+
+        .workload-chip .status-indicator.running {
+            background: var(--accent-green);
+        }
+
+        .workload-chip .status-indicator.stopped {
+            background: var(--accent-yellow);
+        }
+
+        .workload-chip .status-indicator.error {
+            background: var(--accent-red);
+        }
+
+        /* Workloads Table */
+        .table-container {
+            overflow-x: auto;
+        }
+
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .data-table th,
+        .data-table td {
+            padding: 12px 16px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .data-table th {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            background: var(--bg-tertiary);
+        }
+
+        .data-table tr:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .data-table .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .status-badge.running {
+            background: rgba(63, 185, 80, 0.2);
+            color: var(--accent-green);
+        }
+
+        .status-badge.stopped {
+            background: rgba(210, 153, 34, 0.2);
+            color: var(--accent-yellow);
+        }
+
+        .status-badge.error {
+            background: rgba(248, 81, 73, 0.2);
+            color: var(--accent-red);
+        }
+
+        .actions-cell {
+            display: flex;
+            gap: 8px;
+        }
+
+        /* Logs Container */
+        .logs-container {
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 16px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .logs-container:empty::before {
+            content: 'No logs available';
+            color: var(--text-muted);
+        }
+
+        /* Deploy Modal */
+        .deploy-modal .modal {
+            max-width: 700px;
+        }
+
+        /* Toast Notifications */
+        .toast-container {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            z-index: 2000;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .toast {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 300px;
+            animation: slideIn 0.3s ease;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        .toast.success {
+            border-color: var(--accent-green);
+        }
+
+        .toast.error {
+            border-color: var(--accent-red);
+        }
+
+        .toast-icon {
+            width: 20px;
+            height: 20px;
+            flex-shrink: 0;
+        }
+
+        .toast.success .toast-icon {
+            color: var(--accent-green);
+        }
+
+        .toast.error .toast-icon {
+            color: var(--accent-red);
+        }
+
+        .toast-message {
+            flex: 1;
+            font-size: 14px;
+        }
+
+        .toast-close {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 4px;
+        }
+
+        /* Loading Spinner */
+        .spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid var(--border-color);
+            border-top-color: var(--accent-blue);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Empty State */
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-secondary);
+        }
+
+        .empty-state svg {
+            width: 64px;
+            height: 64px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+
+        .empty-state h3 {
+            font-size: 18px;
+            margin-bottom: 8px;
+            color: var(--text-primary);
+        }
+
+        .empty-state p {
+            font-size: 14px;
+            margin-bottom: 16px;
+        }
+
+        /* Tunnel Status */
+        .tunnel-status {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .tunnel-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .tunnel-indicator.active {
+            background: rgba(63, 185, 80, 0.2);
+            color: var(--accent-green);
+        }
+
+        .tunnel-indicator.inactive {
+            background: rgba(248, 81, 73, 0.2);
+            color: var(--accent-red);
+        }
+
+        /* Workload Detail Panel */
+        .detail-panel {
+            position: fixed;
+            top: 0;
+            right: 0;
+            width: 500px;
+            height: 100vh;
+            background: var(--bg-secondary);
+            border-left: 1px solid var(--border-color);
+            z-index: 500;
+            transform: translateX(100%);
+            transition: transform 0.3s ease;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .detail-panel.open {
+            transform: translateX(0);
+        }
+
+        .detail-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .detail-title {
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .detail-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+
+        .detail-section {
+            margin-bottom: 24px;
+        }
+
+        .detail-section-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            margin-bottom: 12px;
+        }
+
+        .detail-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .detail-label {
+            color: var(--text-secondary);
+        }
+
+        .detail-value {
+            font-weight: 500;
+        }
+
+        .detail-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 16px;
+        }
+
+        /* Container Info */
+        .container-card {
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 8px;
+        }
+
+        .container-name {
+            font-weight: 600;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .container-details {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .container-details span {
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .sidebar {
+                display: none;
+            }
+
+            .content {
+                padding: 16px;
+            }
+
+            .detail-panel {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                    <path d="M2 17l10 5 10-5"/>
+                    <path d="M2 12l10 5 10-5"/>
+                </svg>
+                Jetty
+            </div>
+            <div class="connection-status">
+                <span class="status-dot" id="connectionDot"></span>
+                <span id="connectionText">Disconnected</span>
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="tunnel-status" id="tunnelStatus" style="display: none;">
+                <div class="tunnel-indicator" id="tunnelIndicator">
+                    <span class="status-dot"></span>
+                    <span>Tunnel</span>
+                </div>
+                <div class="tunnel-indicator" id="warpIndicator">
+                    <span class="status-dot"></span>
+                    <span>WARP</span>
+                </div>
+            </div>
+            <button class="btn" onclick="openConnectModal()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+                    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+                </svg>
+                Connect
+            </button>
+            <button class="btn btn-primary" onclick="openDeployModal()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="5" x2="12" y2="19"/>
+                    <line x1="5" y1="12" x2="19" y2="12"/>
+                </svg>
+                Deploy
+            </button>
+        </div>
+    </header>
+
+    <div class="main-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-section">
+                <div class="sidebar-title">Dashboard</div>
+                <div class="sidebar-item active" data-page="overview" onclick="showPage('overview')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="7" height="7"/>
+                        <rect x="14" y="3" width="7" height="7"/>
+                        <rect x="14" y="14" width="7" height="7"/>
+                        <rect x="3" y="14" width="7" height="7"/>
+                    </svg>
+                    Overview
+                </div>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-title">Cluster</div>
+                <div class="sidebar-item" data-page="nodes" onclick="showPage('nodes')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="2" y="2" width="20" height="8" rx="2"/>
+                        <rect x="2" y="14" width="20" height="8" rx="2"/>
+                        <line x1="6" y1="6" x2="6.01" y2="6"/>
+                        <line x1="6" y1="18" x2="6.01" y2="18"/>
+                    </svg>
+                    Nodes
+                </div>
+                <div class="sidebar-item" data-page="workloads" onclick="showPage('workloads')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                        <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+                        <line x1="12" y1="22.08" x2="12" y2="12"/>
+                    </svg>
+                    Workloads
+                </div>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-title">Infrastructure</div>
+                <div class="sidebar-item" data-page="orchestrate" onclick="showPage('orchestrate')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="3"/>
+                        <path d="M12 1v4"/>
+                        <path d="M12 19v4"/>
+                        <path d="M4.22 4.22l2.83 2.83"/>
+                        <path d="M16.95 16.95l2.83 2.83"/>
+                        <path d="M1 12h4"/>
+                        <path d="M19 12h4"/>
+                        <path d="M4.22 19.78l2.83-2.83"/>
+                        <path d="M16.95 7.05l2.83-2.83"/>
+                    </svg>
+                    Orchestrate
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="content">
+            <!-- Overview Page -->
+            <div class="page active" id="page-overview">
+                <div class="page-header">
+                    <h1 class="page-title">Cluster Overview</h1>
+                    <button class="btn" onclick="refreshStatus()">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="23 4 23 10 17 10"/>
+                            <polyline points="1 20 1 14 7 14"/>
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                        </svg>
+                        Refresh
+                    </button>
+                </div>
+
+                <div class="stats-grid" id="statsGrid">
+                    <div class="stat-card">
+                        <div class="stat-label">Total Nodes</div>
+                        <div class="stat-value blue" id="stat-nodes">-</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Healthy Nodes</div>
+                        <div class="stat-value green" id="stat-healthy">-</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Total Workloads</div>
+                        <div class="stat-value blue" id="stat-workloads">-</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Running Workloads</div>
+                        <div class="stat-value green" id="stat-running">-</div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">Recent Workloads</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="recentWorkloads" class="empty-state">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                            </svg>
+                            <h3>No workloads yet</h3>
+                            <p>Connect to a Jetty cluster to see workloads</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Nodes Page -->
+            <div class="page" id="page-nodes">
+                <div class="page-header">
+                    <h1 class="page-title">Cluster Nodes</h1>
+                    <button class="btn" onclick="refreshStatus()">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="23 4 23 10 17 10"/>
+                            <polyline points="1 20 1 14 7 14"/>
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                        </svg>
+                        Refresh
+                    </button>
+                </div>
+
+                <div class="nodes-grid" id="nodesGrid">
+                    <div class="empty-state">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="2" y="2" width="20" height="8" rx="2"/>
+                            <rect x="2" y="14" width="20" height="8" rx="2"/>
+                        </svg>
+                        <h3>No nodes</h3>
+                        <p>Connect to a Jetty cluster to see nodes</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Workloads Page -->
+            <div class="page" id="page-workloads">
+                <div class="page-header">
+                    <h1 class="page-title">Workloads</h1>
+                    <div style="display: flex; gap: 12px;">
+                        <button class="btn" onclick="refreshStatus()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="23 4 23 10 17 10"/>
+                                <polyline points="1 20 1 14 7 14"/>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                            </svg>
+                            Refresh
+                        </button>
+                        <button class="btn btn-primary" onclick="openDeployModal()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="12" y1="5" x2="12" y2="19"/>
+                                <line x1="5" y1="12" x2="19" y2="12"/>
+                            </svg>
+                            Deploy Workload
+                        </button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="table-container">
+                        <table class="data-table" id="workloadsTable">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Status</th>
+                                    <th>Mesh IP</th>
+                                    <th>Owner Node</th>
+                                    <th>Revive</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="workloadsTableBody">
+                                <tr>
+                                    <td colspan="6" class="empty-state" style="padding: 40px;">
+                                        <p>No workloads. Connect to a cluster and deploy your first workload.</p>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Orchestrate Page (Drag & Drop) -->
+            <div class="page" id="page-orchestrate">
+                <div class="page-header">
+                    <h1 class="page-title">Orchestrate Workloads</h1>
+                    <button class="btn" onclick="refreshStatus()">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="23 4 23 10 17 10"/>
+                            <polyline points="1 20 1 14 7 14"/>
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                        </svg>
+                        Refresh
+                    </button>
+                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 24px;">Drag and drop workloads between nodes to migrate them.</p>
+
+                <div class="nodes-grid" id="orchestrateGrid">
+                    <div class="empty-state">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="3"/>
+                            <path d="M12 1v4"/>
+                            <path d="M12 19v4"/>
+                        </svg>
+                        <h3>No nodes available</h3>
+                        <p>Connect to a Jetty cluster to orchestrate workloads</p>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Connect Modal -->
+    <div class="modal-overlay hidden" id="connectModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title">Connect to Jetty Cluster</h2>
+                <button class="modal-close" onclick="closeConnectModal()">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">Jetty API URL</label>
+                    <input type="text" class="form-input" id="apiUrl" placeholder="https://your-cluster.example.com">
+                    <div class="form-hint">The Cloudflare tunnel URL or direct IP address of your Jetty cluster</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Secret Key</label>
+                    <input type="password" class="form-input" id="secretKey" placeholder="Your cluster secret key">
+                    <div class="form-hint">The JETTY_SECRET configured on your cluster nodes</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-checkbox">
+                        <input type="checkbox" id="rememberConnection" checked>
+                        <span>Remember this connection (stored locally)</span>
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeConnectModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="connect()">Connect</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Deploy Modal -->
+    <div class="modal-overlay hidden deploy-modal" id="deployModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title">Deploy New Workload</h2>
+                <button class="modal-close" onclick="closeDeployModal()">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">Workload Name</label>
+                    <input type="text" class="form-input" id="workloadName" placeholder="my-app">
+                    <div class="form-hint">Alphanumeric characters, dashes, and underscores only</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Mesh IP (optional)</label>
+                    <input type="text" class="form-input" id="workloadMeshIp" placeholder="10.100.50.1">
+                    <div class="form-hint">Leave empty to auto-assign an IP from the mesh network</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Docker Compose YAML</label>
+                    <textarea class="form-input" id="workloadCompose" placeholder="services:
+  web:
+    image: nginx:alpine
+    ports:
+      - '80:80'"></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Allowed Nodes (optional)</label>
+                    <input type="text" class="form-input" id="workloadAllowedNodes" placeholder="node1, node2">
+                    <div class="form-hint">Comma-separated list of node names/IDs. Leave empty for all nodes.</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-checkbox">
+                        <input type="checkbox" id="workloadRevive" checked>
+                        <span>Enable auto-failover (revive if owner node dies)</span>
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label class="form-checkbox">
+                        <input type="checkbox" id="workloadAutostart" checked>
+                        <span>Auto-start when Jetty starts</span>
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeDeployModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="deployWorkload()">Deploy</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Move Workload Modal -->
+    <div class="modal-overlay hidden" id="moveModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title">Move Workload</h2>
+                <button class="modal-close" onclick="closeMoveModal()">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body">
+                <p style="margin-bottom: 16px;">Move <strong id="moveWorkloadName"></strong> to a different node:</p>
+                <div class="form-group">
+                    <label class="form-label">Target Node</label>
+                    <select class="form-input" id="moveTargetNode"></select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeMoveModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="confirmMoveWorkload()">Move</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Workload Detail Panel -->
+    <div class="detail-panel" id="detailPanel">
+        <div class="detail-header">
+            <h2 class="detail-title" id="detailTitle">Workload Details</h2>
+            <button class="modal-close" onclick="closeDetailPanel()">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="18" y1="6" x2="6" y2="18"/>
+                    <line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+            </button>
+        </div>
+        <div class="detail-body" id="detailBody">
+            <!-- Populated dynamically -->
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script>
+        // State
+        let state = {
+            apiUrl: '',
+            secretKey: '',
+            connected: false,
+            node: null,
+            peers: [],
+            workloads: [],
+            tunnel: { configured: false, running: false },
+            warp: { enabled: false, ip: '' }
+        };
+
+        let draggedWorkload = null;
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadSavedConnection();
+            if (state.apiUrl && state.secretKey) {
+                connect();
+            }
+        });
+
+        // Connection Management
+        function loadSavedConnection() {
+            const saved = localStorage.getItem('jetty-connection');
+            if (saved) {
+                const { apiUrl, secretKey } = JSON.parse(saved);
+                state.apiUrl = apiUrl;
+                state.secretKey = secretKey;
+                document.getElementById('apiUrl').value = apiUrl;
+                document.getElementById('secretKey').value = secretKey;
+            }
+        }
+
+        function saveConnection() {
+            if (document.getElementById('rememberConnection').checked) {
+                localStorage.setItem('jetty-connection', JSON.stringify({
+                    apiUrl: state.apiUrl,
+                    secretKey: state.secretKey
+                }));
+            }
+        }
+
+        function openConnectModal() {
+            document.getElementById('connectModal').classList.remove('hidden');
+        }
+
+        function closeConnectModal() {
+            document.getElementById('connectModal').classList.add('hidden');
+        }
+
+        async function connect() {
+            const apiUrl = document.getElementById('apiUrl').value.trim().replace(/\/+$/, '');
+            const secretKey = document.getElementById('secretKey').value.trim();
+
+            if (!apiUrl || !secretKey) {
+                showToast('Please enter both API URL and secret key', 'error');
+                return;
+            }
+
+            state.apiUrl = apiUrl;
+            state.secretKey = secretKey;
+
+            try {
+                await refreshStatus();
+                state.connected = true;
+                updateConnectionStatus();
+                saveConnection();
+                closeConnectModal();
+                showToast('Connected to Jetty cluster', 'success');
+            } catch (error) {
+                state.connected = false;
+                updateConnectionStatus();
+                showToast(`Connection failed: ${error.message}`, 'error');
+            }
+        }
+
+        function updateConnectionStatus() {
+            const dot = document.getElementById('connectionDot');
+            const text = document.getElementById('connectionText');
+            const tunnelStatus = document.getElementById('tunnelStatus');
+
+            if (state.connected) {
+                dot.classList.add('connected');
+                text.textContent = state.node ? state.node.name : 'Connected';
+                tunnelStatus.style.display = 'flex';
+                updateTunnelStatus();
+            } else {
+                dot.classList.remove('connected');
+                text.textContent = 'Disconnected';
+                tunnelStatus.style.display = 'none';
+            }
+        }
+
+        function updateTunnelStatus() {
+            const tunnelInd = document.getElementById('tunnelIndicator');
+            const warpInd = document.getElementById('warpIndicator');
+
+            if (state.tunnel.running) {
+                tunnelInd.classList.add('active');
+                tunnelInd.classList.remove('inactive');
+            } else {
+                tunnelInd.classList.remove('active');
+                tunnelInd.classList.add('inactive');
+            }
+
+            if (state.warp.enabled) {
+                warpInd.classList.add('active');
+                warpInd.classList.remove('inactive');
+            } else {
+                warpInd.classList.remove('active');
+                warpInd.classList.add('inactive');
+            }
+        }
+
+        // API Calls
+        async function apiCall(endpoint, method = 'GET', body = null) {
+            const url = `${state.apiUrl}/api${endpoint}`;
+            const options = {
+                method,
+                headers: {
+                    'X-API-Key': state.secretKey,
+                    'Content-Type': 'application/json'
+                }
+            };
+
+            if (body) {
+                options.body = JSON.stringify(body);
+            }
+
+            const response = await fetch(url, options);
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(errorText || `HTTP ${response.status}`);
+            }
+
+            const text = await response.text();
+            return text ? JSON.parse(text) : null;
+        }
+
+        async function refreshStatus() {
+            const status = await apiCall('/status');
+
+            state.node = status.node;
+            state.peers = status.peers || [];
+            state.workloads = status.workloads || [];
+            state.tunnel = status.tunnel || { configured: false, running: false };
+            state.warp = status.warp || { enabled: false, ip: '' };
+
+            updateUI();
+            return status;
+        }
+
+        // UI Updates
+        function updateUI() {
+            updateStats();
+            updateNodesGrid();
+            updateWorkloadsTable();
+            updateOrchestrateGrid();
+            updateRecentWorkloads();
+            updateConnectionStatus();
+        }
+
+        function updateStats() {
+            const allNodes = [state.node, ...state.peers].filter(Boolean);
+            const healthyNodes = allNodes.filter(n => n.healthy !== false);
+            const runningWorkloads = state.workloads.filter(w => w.containers?.some(c => c.running));
+
+            document.getElementById('stat-nodes').textContent = allNodes.length;
+            document.getElementById('stat-healthy').textContent = healthyNodes.length;
+            document.getElementById('stat-workloads').textContent = state.workloads.length;
+            document.getElementById('stat-running').textContent = runningWorkloads.length;
+        }
+
+        function updateNodesGrid() {
+            const grid = document.getElementById('nodesGrid');
+            const allNodes = [state.node, ...state.peers].filter(Boolean);
+
+            if (allNodes.length === 0) {
+                grid.innerHTML = `
+                    <div class="empty-state">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="2" y="2" width="20" height="8" rx="2"/>
+                            <rect x="2" y="14" width="20" height="8" rx="2"/>
+                        </svg>
+                        <h3>No nodes</h3>
+                        <p>Connect to a Jetty cluster to see nodes</p>
+                    </div>
+                `;
+                return;
+            }
+
+            grid.innerHTML = allNodes.map(node => {
+                const isCurrentNode = node.id === state.node?.id;
+                const nodeWorkloads = state.workloads.filter(w => w.owner === node.id);
+                const healthClass = node.healthy !== false ? 'healthy' : 'unhealthy';
+
+                return `
+                    <div class="node-card">
+                        <div class="node-header">
+                            <div class="node-name">
+                                ${node.name || node.id.substring(0, 8)}
+                                ${isCurrentNode ? '<span class="node-badge">Current</span>' : ''}
+                            </div>
+                            <div class="node-health ${healthClass}">
+                                <span class="status-dot ${healthClass === 'healthy' ? 'connected' : ''}"></span>
+                                ${healthClass === 'healthy' ? 'Healthy' : 'Unhealthy'}
+                            </div>
+                        </div>
+                        <div class="node-details">
+                            <p><strong>Mesh IP:</strong> ${node.mesh_ip || node.meshIP || 'N/A'}</p>
+                            ${node.warp_ip || node.warpIP ? `<p><strong>WARP IP:</strong> ${node.warp_ip || node.warpIP}</p>` : ''}
+                            ${node.tunnel_host || node.tunnelHost ? `<p><strong>Tunnel:</strong> ${node.tunnel_host || node.tunnelHost}</p>` : ''}
+                        </div>
+                        <div class="node-workloads">
+                            <div class="node-workloads-title">Workloads (${nodeWorkloads.length})</div>
+                            <div class="node-workloads-list">
+                                ${nodeWorkloads.map(w => {
+                                    const isRunning = w.containers?.some(c => c.running);
+                                    const statusClass = isRunning ? 'running' : 'stopped';
+                                    return `
+                                        <div class="workload-chip" onclick="showWorkloadDetail('${w.name}')">
+                                            <span class="status-indicator ${statusClass}"></span>
+                                            ${w.name}
+                                        </div>
+                                    `;
+                                }).join('')}
+                                ${nodeWorkloads.length === 0 ? '<span style="color: var(--text-muted); font-size: 12px;">No workloads</span>' : ''}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function updateWorkloadsTable() {
+            const tbody = document.getElementById('workloadsTableBody');
+
+            if (state.workloads.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="6" style="text-align: center; padding: 40px; color: var(--text-secondary);">
+                            No workloads. Deploy your first workload to get started.
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+
+            tbody.innerHTML = state.workloads.map(w => {
+                const isRunning = w.containers?.some(c => c.running);
+                const statusClass = isRunning ? 'running' : 'stopped';
+                const statusText = isRunning ? 'Running' : 'Stopped';
+                const ownerNode = [state.node, ...state.peers].find(n => n?.id === w.owner);
+                const ownerName = ownerNode?.name || w.owner?.substring(0, 8) || 'Unknown';
+
+                return `
+                    <tr>
+                        <td>
+                            <a href="#" onclick="showWorkloadDetail('${w.name}'); return false;" style="color: var(--accent-blue); text-decoration: none;">
+                                ${w.name}
+                            </a>
+                        </td>
+                        <td>
+                            <span class="status-badge ${statusClass}">
+                                <span class="status-dot ${statusClass === 'running' ? 'connected' : ''}"></span>
+                                ${statusText}
+                            </span>
+                        </td>
+                        <td><code>${w.mesh_ip || w.meshIP}</code></td>
+                        <td>${ownerName}</td>
+                        <td>${w.revive ? 'Yes' : 'No'}</td>
+                        <td class="actions-cell">
+                            ${isRunning ? `
+                                <button class="btn btn-sm" onclick="stopWorkload('${w.name}')" title="Stop">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <rect x="6" y="6" width="12" height="12"/>
+                                    </svg>
+                                </button>
+                            ` : `
+                                <button class="btn btn-sm btn-success" onclick="startWorkload('${w.name}')" title="Start">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <polygon points="5 3 19 12 5 21 5 3"/>
+                                    </svg>
+                                </button>
+                            `}
+                            <button class="btn btn-sm" onclick="openMoveModal('${w.name}')" title="Move">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="5 9 2 12 5 15"/>
+                                    <polyline points="9 5 12 2 15 5"/>
+                                    <polyline points="15 19 12 22 9 19"/>
+                                    <polyline points="19 9 22 12 19 15"/>
+                                    <line x1="2" y1="12" x2="22" y2="12"/>
+                                    <line x1="12" y1="2" x2="12" y2="22"/>
+                                </svg>
+                            </button>
+                            <button class="btn btn-sm" onclick="viewLogs('${w.name}')" title="Logs">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                    <polyline points="14 2 14 8 20 8"/>
+                                    <line x1="16" y1="13" x2="8" y2="13"/>
+                                    <line x1="16" y1="17" x2="8" y2="17"/>
+                                </svg>
+                            </button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteWorkload('${w.name}')" title="Delete">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="3 6 5 6 21 6"/>
+                                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                                </svg>
+                            </button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function updateOrchestrateGrid() {
+            const grid = document.getElementById('orchestrateGrid');
+            const allNodes = [state.node, ...state.peers].filter(Boolean);
+
+            if (allNodes.length === 0) {
+                grid.innerHTML = `
+                    <div class="empty-state">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="3"/>
+                            <path d="M12 1v4"/>
+                            <path d="M12 19v4"/>
+                        </svg>
+                        <h3>No nodes available</h3>
+                        <p>Connect to a Jetty cluster to orchestrate workloads</p>
+                    </div>
+                `;
+                return;
+            }
+
+            grid.innerHTML = allNodes.map(node => {
+                const isCurrentNode = node.id === state.node?.id;
+                const nodeWorkloads = state.workloads.filter(w => w.owner === node.id);
+                const healthClass = node.healthy !== false ? 'healthy' : 'unhealthy';
+
+                return `
+                    <div class="node-card"
+                         data-node-id="${node.id}"
+                         ondragover="handleDragOver(event)"
+                         ondragleave="handleDragLeave(event)"
+                         ondrop="handleDrop(event, '${node.id}')">
+                        <div class="node-header">
+                            <div class="node-name">
+                                ${node.name || node.id.substring(0, 8)}
+                                ${isCurrentNode ? '<span class="node-badge">Current</span>' : ''}
+                            </div>
+                            <div class="node-health ${healthClass}">
+                                <span class="status-dot ${healthClass === 'healthy' ? 'connected' : ''}"></span>
+                                ${healthClass === 'healthy' ? 'Healthy' : 'Unhealthy'}
+                            </div>
+                        </div>
+                        <div class="node-details">
+                            <p><strong>Mesh IP:</strong> ${node.mesh_ip || node.meshIP || 'N/A'}</p>
+                        </div>
+                        <div class="node-workloads">
+                            <div class="node-workloads-title">Drag workloads here (${nodeWorkloads.length})</div>
+                            <div class="node-workloads-list">
+                                ${nodeWorkloads.map(w => {
+                                    const isRunning = w.containers?.some(c => c.running);
+                                    const statusClass = isRunning ? 'running' : 'stopped';
+                                    return `
+                                        <div class="workload-chip"
+                                             draggable="true"
+                                             data-workload-name="${w.name}"
+                                             ondragstart="handleDragStart(event, '${w.name}')"
+                                             ondragend="handleDragEnd(event)">
+                                            <span class="status-indicator ${statusClass}"></span>
+                                            ${w.name}
+                                        </div>
+                                    `;
+                                }).join('')}
+                                ${nodeWorkloads.length === 0 ? '<span style="color: var(--text-muted); font-size: 12px;">Drop workloads here</span>' : ''}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function updateRecentWorkloads() {
+            const container = document.getElementById('recentWorkloads');
+
+            if (state.workloads.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                        </svg>
+                        <h3>No workloads yet</h3>
+                        <p>Connect to a Jetty cluster and deploy your first workload</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = `
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Status</th>
+                                <th>Mesh IP</th>
+                                <th>Owner</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${state.workloads.slice(0, 5).map(w => {
+                                const isRunning = w.containers?.some(c => c.running);
+                                const statusClass = isRunning ? 'running' : 'stopped';
+                                const ownerNode = [state.node, ...state.peers].find(n => n?.id === w.owner);
+                                const ownerName = ownerNode?.name || w.owner?.substring(0, 8) || 'Unknown';
+                                return `
+                                    <tr onclick="showWorkloadDetail('${w.name}')" style="cursor: pointer;">
+                                        <td>${w.name}</td>
+                                        <td><span class="status-badge ${statusClass}">${isRunning ? 'Running' : 'Stopped'}</span></td>
+                                        <td><code>${w.mesh_ip || w.meshIP}</code></td>
+                                        <td>${ownerName}</td>
+                                    </tr>
+                                `;
+                            }).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        // Page Navigation
+        function showPage(pageName) {
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.sidebar-item').forEach(i => i.classList.remove('active'));
+
+            document.getElementById(`page-${pageName}`).classList.add('active');
+            document.querySelector(`[data-page="${pageName}"]`).classList.add('active');
+        }
+
+        // Workload Actions
+        function openDeployModal() {
+            if (!state.connected) {
+                showToast('Please connect to a cluster first', 'error');
+                return;
+            }
+            document.getElementById('deployModal').classList.remove('hidden');
+        }
+
+        function closeDeployModal() {
+            document.getElementById('deployModal').classList.add('hidden');
+        }
+
+        async function deployWorkload() {
+            const name = document.getElementById('workloadName').value.trim();
+            const meshIp = document.getElementById('workloadMeshIp').value.trim();
+            const compose = document.getElementById('workloadCompose').value;
+            const allowedNodesStr = document.getElementById('workloadAllowedNodes').value.trim();
+            const revive = document.getElementById('workloadRevive').checked;
+            const autostart = document.getElementById('workloadAutostart').checked;
+
+            if (!name) {
+                showToast('Please enter a workload name', 'error');
+                return;
+            }
+
+            if (!compose) {
+                showToast('Please enter Docker Compose YAML', 'error');
+                return;
+            }
+
+            const payload = {
+                name,
+                compose,
+                revive,
+                autostart
+            };
+
+            if (meshIp) {
+                payload.mesh_ip = meshIp;
+            }
+
+            if (allowedNodesStr) {
+                payload.allowed_nodes = allowedNodesStr.split(',').map(s => s.trim()).filter(Boolean);
+            }
+
+            try {
+                await apiCall('/workloads', 'POST', payload);
+                showToast(`Workload "${name}" deployed successfully`, 'success');
+                closeDeployModal();
+
+                // Clear form
+                document.getElementById('workloadName').value = '';
+                document.getElementById('workloadMeshIp').value = '';
+                document.getElementById('workloadCompose').value = '';
+                document.getElementById('workloadAllowedNodes').value = '';
+                document.getElementById('workloadRevive').checked = true;
+                document.getElementById('workloadAutostart').checked = true;
+
+                await refreshStatus();
+            } catch (error) {
+                showToast(`Deploy failed: ${error.message}`, 'error');
+            }
+        }
+
+        async function startWorkload(name) {
+            try {
+                await apiCall(`/workloads/${name}/start`, 'POST');
+                showToast(`Workload "${name}" started`, 'success');
+                await refreshStatus();
+            } catch (error) {
+                showToast(`Failed to start: ${error.message}`, 'error');
+            }
+        }
+
+        async function stopWorkload(name) {
+            try {
+                await apiCall(`/workloads/${name}/stop`, 'POST');
+                showToast(`Workload "${name}" stopped`, 'success');
+                await refreshStatus();
+            } catch (error) {
+                showToast(`Failed to stop: ${error.message}`, 'error');
+            }
+        }
+
+        async function deleteWorkload(name) {
+            if (!confirm(`Are you sure you want to delete "${name}"? This will remove all containers and data.`)) {
+                return;
+            }
+
+            try {
+                await apiCall(`/workloads/${name}`, 'DELETE');
+                showToast(`Workload "${name}" deleted`, 'success');
+                await refreshStatus();
+            } catch (error) {
+                showToast(`Failed to delete: ${error.message}`, 'error');
+            }
+        }
+
+        // Move Workload
+        let workloadToMove = null;
+
+        function openMoveModal(name) {
+            workloadToMove = name;
+            document.getElementById('moveWorkloadName').textContent = name;
+
+            const select = document.getElementById('moveTargetNode');
+            const workload = state.workloads.find(w => w.name === name);
+            const allNodes = [state.node, ...state.peers].filter(n => n && n.id !== workload?.owner);
+
+            select.innerHTML = allNodes.map(n =>
+                `<option value="${n.id}">${n.name || n.id.substring(0, 8)}</option>`
+            ).join('');
+
+            document.getElementById('moveModal').classList.remove('hidden');
+        }
+
+        function closeMoveModal() {
+            document.getElementById('moveModal').classList.add('hidden');
+            workloadToMove = null;
+        }
+
+        async function confirmMoveWorkload() {
+            const targetNode = document.getElementById('moveTargetNode').value;
+
+            if (!workloadToMove || !targetNode) return;
+
+            try {
+                await apiCall(`/workloads/${workloadToMove}/move`, 'POST', { target_node: targetNode });
+                showToast(`Workload "${workloadToMove}" moved successfully`, 'success');
+                closeMoveModal();
+                await refreshStatus();
+            } catch (error) {
+                showToast(`Move failed: ${error.message}`, 'error');
+            }
+        }
+
+        // Drag and Drop
+        function handleDragStart(event, workloadName) {
+            draggedWorkload = workloadName;
+            event.target.classList.add('dragging');
+            event.dataTransfer.effectAllowed = 'move';
+        }
+
+        function handleDragEnd(event) {
+            event.target.classList.remove('dragging');
+            draggedWorkload = null;
+            document.querySelectorAll('.node-card').forEach(card => {
+                card.classList.remove('drop-target');
+            });
+        }
+
+        function handleDragOver(event) {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = 'move';
+            event.currentTarget.classList.add('drop-target');
+        }
+
+        function handleDragLeave(event) {
+            event.currentTarget.classList.remove('drop-target');
+        }
+
+        async function handleDrop(event, targetNodeId) {
+            event.preventDefault();
+            event.currentTarget.classList.remove('drop-target');
+
+            if (!draggedWorkload) return;
+
+            const workload = state.workloads.find(w => w.name === draggedWorkload);
+            if (workload?.owner === targetNodeId) {
+                showToast('Workload is already on this node', 'error');
+                return;
+            }
+
+            try {
+                await apiCall(`/workloads/${draggedWorkload}/move`, 'POST', { target_node: targetNodeId });
+                showToast(`Workload "${draggedWorkload}" moved successfully`, 'success');
+                await refreshStatus();
+            } catch (error) {
+                showToast(`Move failed: ${error.message}`, 'error');
+            }
+        }
+
+        // Workload Detail Panel
+        async function showWorkloadDetail(name) {
+            const panel = document.getElementById('detailPanel');
+            const title = document.getElementById('detailTitle');
+            const body = document.getElementById('detailBody');
+
+            title.textContent = name;
+            body.innerHTML = '<div style="text-align: center; padding: 40px;"><div class="spinner"></div></div>';
+            panel.classList.add('open');
+
+            try {
+                const workload = await apiCall(`/workloads/${name}`);
+                const ownerNode = [state.node, ...state.peers].find(n => n?.id === workload.owner);
+                const ownerName = ownerNode?.name || workload.owner?.substring(0, 8) || 'Unknown';
+                const isRunning = workload.containers?.some(c => c.running);
+
+                body.innerHTML = `
+                    <div class="detail-section">
+                        <div class="detail-section-title">Configuration</div>
+                        <div class="detail-row">
+                            <span class="detail-label">Name</span>
+                            <span class="detail-value">${workload.name}</span>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Mesh IP</span>
+                            <span class="detail-value"><code>${workload.mesh_ip || workload.meshIP}</code></span>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Owner Node</span>
+                            <span class="detail-value">${ownerName}</span>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Revive</span>
+                            <span class="detail-value">${workload.revive ? 'Enabled' : 'Disabled'}</span>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Autostart</span>
+                            <span class="detail-value">${workload.autostart ? 'Enabled' : 'Disabled'}</span>
+                        </div>
+                        ${workload.allowed_nodes?.length ? `
+                        <div class="detail-row">
+                            <span class="detail-label">Allowed Nodes</span>
+                            <span class="detail-value">${workload.allowed_nodes.join(', ')}</span>
+                        </div>
+                        ` : ''}
+                    </div>
+
+                    <div class="detail-section">
+                        <div class="detail-section-title">Containers (${workload.containers?.length || 0})</div>
+                        ${workload.containers?.map(c => `
+                            <div class="container-card">
+                                <div class="container-name">
+                                    <span class="status-indicator ${c.running ? 'running' : 'stopped'}"></span>
+                                    ${c.name}
+                                </div>
+                                <div class="container-details">
+                                    <span><strong>Image:</strong> ${c.image}</span>
+                                    <span><strong>Status:</strong> ${c.status}</span>
+                                    ${c.cpu_percent !== undefined ? `<span><strong>CPU:</strong> ${c.cpu_percent.toFixed(1)}%</span>` : ''}
+                                    ${c.memory_percent !== undefined ? `<span><strong>Memory:</strong> ${c.memory_percent.toFixed(1)}%</span>` : ''}
+                                    ${c.uptime ? `<span><strong>Uptime:</strong> ${c.uptime}</span>` : ''}
+                                </div>
+                            </div>
+                        `).join('') || '<p style="color: var(--text-muted);">No containers</p>'}
+                    </div>
+
+                    <div class="detail-section">
+                        <div class="detail-section-title">Docker Compose</div>
+                        <pre style="background: var(--bg-primary); padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px;">${escapeHtml(workload.compose || '')}</pre>
+                    </div>
+
+                    <div class="detail-actions">
+                        ${isRunning ? `
+                            <button class="btn" onclick="stopWorkload('${name}')">Stop</button>
+                        ` : `
+                            <button class="btn btn-success" onclick="startWorkload('${name}')">Start</button>
+                        `}
+                        <button class="btn" onclick="viewLogs('${name}')">View Logs</button>
+                        <button class="btn btn-danger" onclick="deleteWorkload('${name}'); closeDetailPanel();">Delete</button>
+                    </div>
+                `;
+            } catch (error) {
+                body.innerHTML = `<div class="empty-state"><p>Failed to load workload: ${error.message}</p></div>`;
+            }
+        }
+
+        function closeDetailPanel() {
+            document.getElementById('detailPanel').classList.remove('open');
+        }
+
+        async function viewLogs(name) {
+            const panel = document.getElementById('detailPanel');
+            const title = document.getElementById('detailTitle');
+            const body = document.getElementById('detailBody');
+
+            title.textContent = `${name} - Logs`;
+            body.innerHTML = '<div style="text-align: center; padding: 40px;"><div class="spinner"></div></div>';
+            panel.classList.add('open');
+
+            try {
+                const response = await apiCall(`/workloads/${name}/logs`);
+                const logs = response.logs || 'No logs available';
+
+                body.innerHTML = `
+                    <div class="detail-section">
+                        <div class="detail-section-title">Container Logs</div>
+                        <button class="btn btn-sm" onclick="viewLogs('${name}')" style="margin-bottom: 12px;">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="23 4 23 10 17 10"/>
+                                <polyline points="1 20 1 14 7 14"/>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                            </svg>
+                            Refresh
+                        </button>
+                        <div class="logs-container">${escapeHtml(logs)}</div>
+                    </div>
+                    <div class="detail-actions">
+                        <button class="btn" onclick="showWorkloadDetail('${name}')">Back to Details</button>
+                    </div>
+                `;
+            } catch (error) {
+                body.innerHTML = `<div class="empty-state"><p>Failed to load logs: ${error.message}</p></div>`;
+            }
+        }
+
+        // Utility Functions
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+
+            const icon = type === 'success'
+                ? '<svg class="toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>'
+                : '<svg class="toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+
+            toast.innerHTML = `
+                ${icon}
+                <span class="toast-message">${message}</span>
+                <button class="toast-close" onclick="this.parentElement.remove()">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            `;
+
+            container.appendChild(toast);
+
+            setTimeout(() => {
+                toast.remove();
+            }, 5000);
+        }
+
+        // Auto-refresh every 30 seconds if connected
+        setInterval(() => {
+            if (state.connected) {
+                refreshStatus().catch(() => {
+                    state.connected = false;
+                    updateConnectionStatus();
+                });
+            }
+        }, 30000);
+    </script>
+</body>
+</html>
