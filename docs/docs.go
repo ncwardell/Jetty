@@ -25,7 +25,7 @@ const docTemplate = `{
     "paths": {
         "/health": {
             "get": {
-                "description": "Returns health status of this node",
+                "description": "Returns health status of this node or the entire cluster. Use node=local for just this node.",
                 "produces": [
                     "application/json"
                 ],
@@ -33,6 +33,14 @@ const docTemplate = `{
                     "cluster"
                 ],
                 "summary": "Health check",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Filter by node: 'local' for this node only, or node name/ID for specific node",
+                        "name": "node",
+                        "in": "query"
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
