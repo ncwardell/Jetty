@@ -509,15 +509,11 @@ func (a *Agent) initWarpRules() error {
 		log.Printf("Warning: failed to add WARP rule for mesh IP: %v", err)
 	}
 
-	// Add rules to allow cloudflared traffic through WARP's firewall
-	// WARP creates a restrictive nftables table that blocks cloudflared's connections
-	// Allow all UDP port 7844 (cloudflared QUIC) and Cloudflare edge IPs
-	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "output", "udp", "dport", "7844", "accept").Run()
-	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "input", "udp", "sport", "7844", "accept").Run()
-	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "output", "ip", "daddr", "198.41.192.0/24", "accept").Run()
-	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "output", "ip", "daddr", "198.41.200.0/24", "accept").Run()
-	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "input", "ip", "saddr", "198.41.192.0/24", "accept").Run()
-	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "input", "ip", "saddr", "198.41.200.0/24", "accept").Run()
+	// Fix WARP's overly restrictive firewall that breaks SSH, git, cloudflared, etc.
+	// Allow all established/related connections and new outbound connections
+	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "input", "ct", "state", "established,related", "accept").Run()
+	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "output", "ct", "state", "established,related", "accept").Run()
+	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "output", "ct", "state", "new", "accept").Run()
 
 	log.Printf("WARP nft rules initialized")
 	return nil
