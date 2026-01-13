@@ -260,6 +260,9 @@ func (a *Agent) Start() error {
 	// Start failover monitor
 	go a.failoverLoop()
 
+	// Start IP monitor (detects WARP IP changes and re-announces)
+	go a.ipMonitorLoop()
+
 	mode := "warp (" + a.ip + ")"
 	if a.tunnelDomain != "" {
 		mode += " + tunnel (" + a.tunnelDomain + ")"
@@ -299,6 +302,58 @@ func (a *Agent) detectWarpIP() {
 			a.ip = ipnet.IP.String()
 			log.Printf("WARP IP detected: %s", a.ip)
 			return
+		}
+	}
+}
+
+// getWarpIP returns the current WARP IP without modifying agent state.
+func (a *Agent) getWarpIP() string {
+	// Try to find CloudflareWARP interface
+	iface, err := net.InterfaceByName("CloudflareWARP")
+	if err != nil {
+		return ""
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return ""
+	}
+
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+			return ipnet.IP.String()
+		}
+	}
+	return ""
+}
+
+// ipMonitorLoop periodically checks for WARP IP changes and re-announces if needed.
+// WARP can assign new IPs when reconnecting, so we need to propagate changes to peers.
+func (a *Agent) ipMonitorLoop() {
+	tick := time.NewTicker(10 * time.Second)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-a.stopCh:
+			return
+		case <-tick.C:
+			newIP := a.getWarpIP()
+			if newIP == "" || newIP == a.ip {
+				continue
+			}
+
+			oldIP := a.ip
+			a.ip = newIP
+			log.Printf("WARP IP changed: %s -> %s", oldIP, newIP)
+
+			// Re-announce our new IP to all peers
+			go a.announceOurIP()
+
+			// Update IPIP tunnels (they use our local IP)
+			a.stateMu.Lock()
+			a.updateWorkloadRoutes()
+			a.stateMu.Unlock()
 		}
 	}
 }
@@ -2990,12 +3045,27 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	req.Peer.Healthy = true
 	req.Peer.LastSeen = time.Now()
 
+	// Check if peer IP changed
 	a.stateMu.Lock()
+	oldPeer := a.state.Peers[req.Peer.ID]
+	oldIP := ""
+	if oldPeer != nil {
+		oldIP = oldPeer.IP
+	}
+	ipChanged := oldIP != "" && oldIP != req.Peer.IP
 	a.state.Peers[req.Peer.ID] = &req.Peer
 	a.stateMu.Unlock()
 
 	a.updateHosts()
 	a.saveState()
+
+	// If peer IP changed, update IPIP tunnel
+	if ipChanged {
+		log.Printf("Peer %s IP changed: %s -> %s, updating tunnel", req.Peer.Name, oldIP, req.Peer.IP)
+		a.stateMu.Lock()
+		a.updateWorkloadRoutes()
+		a.stateMu.Unlock()
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -3702,23 +3772,14 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 	}
 	data, _ := json.Marshal(announcement)
 
-	// In tunnel-only mode, broadcast to tunnel
-	if a.tunnelDomain != "" {
-		url := a.getTunnelAPIURL("/api/peer-announce")
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
-		if err != nil {
-			log.Printf("Failed to announce peer: %v", err)
-		} else {
-			resp.Body.Close()
-		}
-		return
-	}
+	// Track if any direct announcements succeeded
+	directSuccess := 0
 
-	// Direct mode: send to each peer
+	// Try direct peer IPs first (if we have peers with IPs)
 	a.stateMu.RLock()
 	peers := make([]*Peer, 0)
 	for _, p := range a.state.Peers {
-		if p.ID != newPeer.ID {
+		if p.ID != newPeer.ID && p.IP != "" {
 			peers = append(peers, p)
 		}
 	}
@@ -3728,10 +3789,22 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 		url := fmt.Sprintf("http://%s:%d/api/peer-announce", peer.IP, a.apiPort)
 		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
 		if err != nil {
-			log.Printf("Failed to announce peer to %s: %v", peer.Name, err)
+			log.Printf("Failed to announce peer to %s via direct IP: %v", peer.Name, err)
 			continue
 		}
 		resp.Body.Close()
+		directSuccess++
+	}
+
+	// Use tunnel as fallback if direct failed or no peers had IPs
+	if directSuccess == 0 && a.tunnelDomain != "" {
+		url := a.getTunnelAPIURL("/api/peer-announce")
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to announce peer via tunnel: %v", err)
+		} else {
+			resp.Body.Close()
+		}
 	}
 }
 
