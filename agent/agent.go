@@ -26,7 +26,7 @@ import (
 
 // Shared HTTP client with timeout to prevent blocking on hung peers
 var httpClient = &http.Client{
-	Timeout: 10 * time.Second,
+	Timeout: 30 * time.Second,
 }
 
 // Valid workload name pattern (alphanumeric, dash, underscore only)
@@ -106,6 +106,7 @@ type Agent struct {
 	// Runtime
 	startTime            time.Time // When Jetty started (for uptime tracking)
 	lastHeartbeatErrLog  time.Time // Last time we logged a heartbeat error (to reduce spam)
+	publicIP             string    // Cached public IP (set at startup to avoid slow lookups)
 
 	stopCh chan struct{}
 }
@@ -146,6 +147,9 @@ func New() (*Agent, error) {
 func (a *Agent) Start() error {
 	// Record start time for uptime tracking
 	a.startTime = time.Now()
+
+	// Cache public IP at startup (avoid slow lookups on every health check)
+	a.publicIP = getPublicIP()
 
 	// Detect WARP IP if WARP is enabled
 	a.detectWarpIP()
@@ -786,7 +790,12 @@ func (a *Agent) updateHosts() {
 // =============================================================================
 
 func (a *Agent) joinCluster() error {
-	log.Printf("Joining cluster via %s", a.joinURL)
+	// Normalize join URL - allow both base URL and full /api/join URL
+	joinEndpoint := a.joinURL
+	if !strings.HasSuffix(joinEndpoint, "/api/join") {
+		joinEndpoint = strings.TrimSuffix(joinEndpoint, "/") + "/api/join"
+	}
+	log.Printf("Joining cluster via %s", joinEndpoint)
 
 	// Retry loop to handle IP collisions
 	maxRetries := 5
@@ -801,7 +810,7 @@ func (a *Agent) joinCluster() error {
 		}
 
 		data, _ := json.Marshal(req)
-		resp, err := httpClient.Post(a.joinURL+"/api/join", "application/json", strings.NewReader(string(data)))
+		resp, err := httpClient.Post(joinEndpoint, "application/json", strings.NewReader(string(data)))
 		if err != nil {
 			return err
 		}
@@ -953,6 +962,7 @@ func (a *Agent) corsMiddleware(next http.Handler) http.Handler {
 // The API key is the cluster secret (JETTY_SECRET).
 func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[middleware] %s %s received", r.Method, r.URL.Path)
 		// Skip authentication if no secret is configured
 		if a.clusterSecret == "" {
 			next.ServeHTTP(w, r)
@@ -2112,6 +2122,9 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 // @Failure 409 {object} ErrorResponse "Mesh IP collision"
 // @Router /join [post]
 func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	log.Printf("[join] request started")
+
 	var req struct {
 		Secret     string `json:"secret"` // Cluster secret for authentication
 		ID         string `json:"id"`
@@ -2121,6 +2134,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		WarpIP     string `json:"warp_ip"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
+	log.Printf("[join] decoded request: %v", time.Since(start))
 
 	// Validate cluster secret
 	if a.clusterSecret == "" {
@@ -2223,7 +2237,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 
-	log.Printf("Peer joined: %s (%s)", peer.Name, peer.MeshIP)
+	log.Printf("[join] Peer joined: %s (%s) - total: %v", peer.Name, peer.MeshIP, time.Since(start))
 }
 
 // apiHealth godoc
@@ -2234,7 +2248,11 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} HealthResponse
 // @Router /health [get]
 func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	log.Printf("[health] request started")
+
 	// Count workloads
+	t1 := time.Now()
 	a.stateMu.RLock()
 	var localWorkloads []string
 	var totalWorkloads int
@@ -2251,17 +2269,24 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.stateMu.RUnlock()
+	log.Printf("[health] workloads: %v", time.Since(t1))
 
 	// Get system stats
+	t2 := time.Now()
 	systemStats := a.getSystemStats()
+	log.Printf("[health] systemStats: %v", time.Since(t2))
+
+	t3 := time.Now()
+	healthStatus := getHealthStatus()
+	log.Printf("[health] getHealthStatus: %v", time.Since(t3))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":          getHealthStatus(),
+		"status":          healthStatus,
 		"id":              a.hwid,
 		"name":            a.hostname,
 		"mesh_ip":         a.meshIP,
-		"public_ip":       getPublicIP(),
+		"public_ip":       a.publicIP,
 		"timestamp":       time.Now().UTC().Format(time.RFC3339),
 		"workloads_local": localWorkloads,
 		"workloads_total": totalWorkloads,
@@ -2269,6 +2294,7 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 		"warp_ip":         a.warpIP,
 		"system":          systemStats,
 	})
+	log.Printf("[health] total: %v", time.Since(start))
 }
 
 // apiClusterHealth godoc
@@ -3885,8 +3911,9 @@ func getPublicIP() string {
 		return ip
 	}
 
-	// Try to determine IP by dialing out
-	c, err := net.Dial("udp", "8.8.8.8:80")
+	// Try to determine IP by dialing out (with timeout to prevent hangs)
+	dialer := net.Dialer{Timeout: 2 * time.Second}
+	c, err := dialer.Dial("udp", "8.8.8.8:80")
 	if err == nil {
 		defer c.Close()
 		if addr, ok := c.LocalAddr().(*net.UDPAddr); ok && !addr.IP.IsLoopback() {
