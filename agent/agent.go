@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/ncwardell/jetty/docs"
 	httpSwagger "github.com/swaggo/http-swagger"
 )
 
@@ -962,6 +963,14 @@ func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 }
 
 func (a *Agent) runAPI() {
+	// Configure Swagger host from environment or use default
+	// Set JETTY_API_HOST to your cloudflared tunnel domain (e.g., "jetty.example.com")
+	if apiHost := os.Getenv("JETTY_API_HOST"); apiHost != "" {
+		docs.SwaggerInfo.Host = apiHost
+		docs.SwaggerInfo.Schemes = []string{"https"}
+		log.Printf("Swagger API host: %s", apiHost)
+	}
+
 	r := mux.NewRouter()
 
 	r.HandleFunc("/api/status", a.apiStatus).Methods("GET")

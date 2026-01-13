@@ -269,7 +269,7 @@ definitions:
         example: true
         type: boolean
     type: object
-host: localhost:8080
+host: localhost:6880
 info:
   contact:
     name: Jetty Support
@@ -642,4 +642,10 @@ paths:
 schemes:
 - http
 - https
+securityDefinitions:
+  ApiKeyAuth:
+    description: API key for authentication (JETTY_SECRET)
+    in: header
+    name: X-API-Key
+    type: apiKey
 swagger: "2.0"
