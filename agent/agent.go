@@ -2277,9 +2277,10 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 
 // apiHealth godoc
 // @Summary Health check
-// @Description Returns health status of this node
+// @Description Returns health status of this node or the entire cluster. Use node=local for just this node.
 // @Tags cluster
 // @Produce json
+// @Param node query string false "Filter by node: 'local' for this node only, or node name/ID for specific node"
 // @Success 200 {object} HealthResponse
 // @Router /health [get]
 func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
