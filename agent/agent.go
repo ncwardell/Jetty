@@ -1064,6 +1064,9 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 // @Failure 500 {object} ErrorResponse "Deployment failed"
 // @Router /workloads [post]
 func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
+	// Check if this is a move operation (allows IP overlap during migration)
+	isMove := r.URL.Query().Get("move") == "true"
+
 	var wl Workload
 	if err := json.NewDecoder(r.Body).Decode(&wl); err != nil {
 		http.Error(w, err.Error(), 400)
@@ -1096,6 +1099,9 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		// Proxy deployment to allowed node
 		data, _ := json.Marshal(wl)
 		url := a.getPeerAPIURL(targetPeer, "/api/workloads")
+		if isMove {
+			url += "?move=true"
+		}
 		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to proxy to allowed node: %v", err), 502)
@@ -1136,8 +1142,8 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Check if IP is already taken
-		if a.isIPTaken(wl.MeshIP) {
+		// Check if IP is already taken (skip during move for blue-green deployment)
+		if !isMove && a.isIPTaken(wl.MeshIP) {
 			a.stateMu.Unlock()
 			http.Error(w, "mesh_ip already in use", 409)
 			return
@@ -1517,12 +1523,16 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
-	// Find workload
+	// Find workload and current owner
 	a.stateMu.RLock()
 	var found *Workload
+	var currentOwner *Peer
 	for _, wl := range a.state.Workloads {
 		if wl.Name == name {
 			found = wl
+			if wl.Owner != a.hwid {
+				currentOwner = a.state.Peers[wl.Owner]
+			}
 			break
 		}
 	}
@@ -1545,32 +1555,54 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "target not found", 404)
 		return
 	}
+	if !target.Healthy {
+		http.Error(w, "target node is not healthy", 503)
+		return
+	}
 
-	// Deploy on target
+	// Check if target is allowed to run this workload
+	if !a.isNodeAllowed(found, target.ID, target.Name) {
+		http.Error(w, "target node is not in allowed_nodes for this workload", 403)
+		return
+	}
+
+	// Blue-green deployment: deploy on target first (with move=true to allow IP overlap)
 	data, _ := json.Marshal(found)
-	resp, err := httpClient.Post(fmt.Sprintf("http://%s:%d/api/workloads", target.MeshIP, a.apiPort),
-		"application/json", strings.NewReader(string(data)))
+	url := a.getPeerAPIURL(target, "/api/workloads?move=true")
+	resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, fmt.Sprintf("failed to deploy on target: %v", err), 502)
 		return
 	}
 	resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		http.Error(w, "target rejected", 500)
+		http.Error(w, fmt.Sprintf("target rejected deployment (status %d)", resp.StatusCode), 500)
 		return
 	}
 
-	// Remove locally if we own it
+	// Target is now running - remove from source
+	// If we own it, remove locally
 	if found.Owner == a.hwid {
 		a.removeWorkload(found)
 
-		// Unregister WARP route (target will register its own)
+		// Unregister WARP route (target has registered its own)
 		if err := a.unregisterWarpRoute(found.MeshIP); err != nil {
 			log.Printf("Warning: failed to unregister WARP route for %s: %v", found.MeshIP, err)
 		}
+	} else if currentOwner != nil && currentOwner.Healthy {
+		// Proxy delete to current owner
+		deleteURL := a.getPeerAPIURL(currentOwner, "/api/workloads/"+name)
+		delReq, _ := http.NewRequest("DELETE", deleteURL, nil)
+		delResp, err := httpClient.Do(delReq)
+		if err != nil {
+			log.Printf("Warning: failed to remove workload from original owner: %v", err)
+		} else {
+			delResp.Body.Close()
+		}
 	}
 
+	log.Printf("Moved workload %s to %s (blue-green)", found.Name, target.Name)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"moved": "ok", "to": target.Name})
 }
