@@ -191,13 +191,34 @@ main() {
 # Handle signals for graceful shutdown
 cleanup() {
     log "Shutting down..."
-    if [ -n "$WARP_SVC_PID" ]; then
-        warp-cli --accept-tos disconnect 2>/dev/null || true
-        kill $WARP_SVC_PID 2>/dev/null || true
-    fi
+
+    # Stop cloudflared tunnel
     if [ -n "$TUNNEL_PID" ]; then
+        log "Stopping Cloudflare Tunnel..."
         kill $TUNNEL_PID 2>/dev/null || true
     fi
+
+    # Disconnect and stop WARP
+    if [ -n "$WARP_SVC_PID" ]; then
+        log "Disconnecting WARP..."
+        warp-cli --accept-tos disconnect 2>/dev/null || true
+        sleep 1
+        kill $WARP_SVC_PID 2>/dev/null || true
+    fi
+
+    # Clean up WARP network modifications (important for --net host mode)
+    log "Cleaning up network configuration..."
+
+    # Remove the CloudflareWARP interface
+    ip link delete CloudflareWARP 2>/dev/null || true
+
+    # Remove the cloudflare-warp nftables table
+    nft delete table inet cloudflare-warp 2>/dev/null || true
+
+    # Remove WARP CGNAT route
+    ip route del 100.96.0.0/12 2>/dev/null || true
+
+    log "Cleanup complete"
     exit 0
 }
 
