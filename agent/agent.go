@@ -483,6 +483,7 @@ func (a *Agent) initNetwork() error {
 // This includes:
 // 1. Masquerade rule for response routing through CloudflareWARP
 // 2. Route for WARP client IP range (100.96.0.0/12)
+// 3. Rules to allow cloudflared QUIC traffic through WARP firewall
 func (a *Agent) initWarpRules() error {
 	// Add masquerade rule for traffic going out through CloudflareWARP
 	// This ensures responses from our mesh IPs route back through WARP
@@ -500,6 +501,11 @@ func (a *Agent) initWarpRules() error {
 	if err := a.addWarpRule(a.meshIP); err != nil {
 		log.Printf("Warning: failed to add WARP rule for mesh IP: %v", err)
 	}
+
+	// Add rules to allow cloudflared QUIC traffic through WARP's firewall
+	// WARP creates a restrictive nftables table that blocks cloudflared's connections
+	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "output", "udp", "dport", "7844", "accept").Run()
+	exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "input", "udp", "sport", "7844", "accept").Run()
 
 	log.Printf("WARP nft rules initialized")
 	return nil

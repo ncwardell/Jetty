@@ -165,6 +165,16 @@ main() {
         start_warp_svc
         configure_warp
 
+        # Add nftables rules to allow cloudflared traffic through WARP firewall
+        # WARP creates a restrictive firewall that blocks cloudflared's QUIC connections
+        if nft list table inet cloudflare-warp >/dev/null 2>&1; then
+            log "Adding firewall rules for cloudflared..."
+            # Allow outbound UDP port 7844 (cloudflared QUIC tunnel)
+            nft insert rule inet cloudflare-warp output udp dport 7844 accept 2>/dev/null || true
+            # Allow inbound UDP from port 7844 (responses)
+            nft insert rule inet cloudflare-warp input udp sport 7844 accept 2>/dev/null || true
+        fi
+
         log "WARP initialization complete"
     elif [ -n "$JETTY_JOIN" ]; then
         log "WARP token not available - will be fetched from cluster during join"
