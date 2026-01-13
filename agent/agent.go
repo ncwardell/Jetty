@@ -309,10 +309,11 @@ func (a *Agent) configureWarpRuntime(token string) error {
 	if err := exec.Command("warp-cli", "--accept-tos", "status").Run(); err != nil {
 		log.Printf("Starting WARP service...")
 
-		// Start warp-svc in background
+		// Start warp-svc in background with suppressed output
+		// RUST_LOG=error reduces verbose debug output that floods logs on some distros (e.g., Arch)
 		cmd := exec.Command("warp-svc", "--accept-tos")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		cmd.Env = append(os.Environ(), "RUST_LOG=error")
+		// Discard stdout/stderr to prevent log flooding
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("failed to start warp-svc: %w", err)
 		}
