@@ -32,8 +32,9 @@ start_dbus() {
 # Start WARP service daemon
 start_warp_svc() {
     log "Starting WARP service..."
-    # Redirect warp-svc output to /dev/null to prevent log flooding
-    warp-svc --accept-tos >/dev/null 2>&1 &
+    # Set RUST_LOG to error to suppress verbose debug output from warp-svc
+    # Also redirect any remaining output to /dev/null to prevent log flooding
+    RUST_LOG=error warp-svc --accept-tos >/dev/null 2>&1 &
     WARP_SVC_PID=$!
 
     # Wait for WARP to be ready
