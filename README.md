@@ -1,4 +1,6 @@
-```html
+# Jetty
+
+```
  ╦ ╔═╗ ╔╦╗ ╔╦╗ ╦ ╦
  ║ ║╣   ║   ║  ╚╦╝
 ╚╝ ╚═╝  ╩   ╩   ╩
@@ -8,10 +10,12 @@ Peer-to-peer Docker Compose orchestration. Every node is equal.
 
 ## Features
 
-- **Mesh Network**: WireGuard-based private network (10.100.0.0/16)
+- **Mesh Network**: Cloudflare WARP-based private network (10.100.0.0/16)
 - **Internal DNS**: Use hostnames instead of IPs in compose files
 - **Auto-Failover**: Workloads with `revive: true` restart on healthy nodes
 - **No Master**: Any node can be the entry point via Cloudflare tunnel
+- **Node Allowlist**: Restrict workloads to specific nodes with `allowed_nodes`
+- **Zero-Downtime Moves**: Blue-green deployment when moving workloads
 
 ## Architecture
 
@@ -20,19 +24,16 @@ Node 1 (node1)            Node 2 (node2)            Node 3 (node3)
 ┌───────────────────┐    ┌───────────────────┐    ┌───────────────────┐
 │  Jetty Agent      │    │  Jetty Agent      │    │  Jetty Agent      │
 │  10.100.0.1       │◄──►│  10.100.0.2       │◄──►│  10.100.0.3       │
+│  WARP: 100.96.x.x │    │  WARP: 100.96.x.x │    │  WARP: 100.96.x.x │
 │                   │    │                   │    │                   │
 │  Workloads:       │    │  Workloads:       │    │  Workloads:       │
 │  └─ nginx         │    │  └─ app           │    │  └─ nfs-server    │
 │     10.100.0.101  │    │     10.100.0.102  │    │     10.100.0.50   │
 └───────────────────┘    └───────────────────┘    └───────────────────┘
-
-/etc/hosts on every node:
-10.100.0.1    node1
-10.100.0.2    node2
-10.100.0.3    node3
-10.100.0.101  nginx
-10.100.0.102  app
-10.100.0.50   nfs-server
+         │                        │                        │
+         └────────────────────────┼────────────────────────┘
+                                  │
+                        Cloudflare WARP Mesh
 ```
 
 ## Quick Start
@@ -46,12 +47,8 @@ docker run -d \
   --net host \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v jetty-data:/data \
+  -e JETTY_SECRET=my-cluster-password \
   jetty:latest
-```
-
-Get join token:
-```bash
-curl -X POST http://localhost:8080/api/token
 ```
 
 ### Additional Nodes
@@ -64,7 +61,7 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v jetty-data:/data \
   -e JETTY_JOIN=http://<first-node>:8080 \
-  -e JETTY_TOKEN=<token> \
+  -e JETTY_SECRET=my-cluster-password \
   jetty:latest
 ```
 
@@ -74,33 +71,54 @@ docker run -d \
 ```bash
 # Get this node + all peers + all workloads cluster-wide
 curl http://node:8080/api/status
+
+# Get aggregate cluster health from all nodes
+curl http://node:8080/api/cluster/health
+
+# Filter by specific node
+curl http://node:8080/api/cluster/health?node=node1
 ```
 
 ### Workloads
 ```bash
-# List all workloads (cluster-wide, cached)
+# List all workloads (cluster-wide)
 curl http://node:8080/api/workloads
 
-# Deploy workload
+# Filter by node
+curl http://node:8080/api/workloads?node=node1
+
+# Deploy workload (mesh_ip auto-assigned if omitted)
 curl -X POST http://node:8080/api/workloads -d '{
   "name": "nfs-server",
   "mesh_ip": "10.100.0.50",
   "revive": true,
-  "compose": "version: '\''3'\''\nservices:\n  nfs:\n    image: itsthenetwork/nfs-server-alpine"
+  "autostart": true,
+  "allowed_nodes": ["node1", "node2"],
+  "compose": "services:\n  nfs:\n    image: itsthenetwork/nfs-server-alpine"
+}'
+
+# Update workload
+curl -X PATCH http://node:8080/api/workloads/nfs-server -d '{
+  "revive": false,
+  "allowed_nodes": ["node1", "node2", "node3"]
 }'
 
 # Delete workload
 curl -X DELETE http://node:8080/api/workloads/nfs-server
 
-# Move workload
+# Move workload (zero-downtime blue-green deployment)
 curl -X POST http://node:8080/api/workloads/nfs-server/move -d '{"to": "node2"}'
+
+# Start/Stop workload
+curl -X POST http://node:8080/api/workloads/nfs-server/start
+curl -X POST http://node:8080/api/workloads/nfs-server/stop
+
+# View logs
+curl http://node:8080/api/workloads/nfs-server/logs
 ```
 
 ### Cluster Management
 ```bash
-# Generate join token
-curl -X POST http://node:8080/api/token
-
 # Join (called automatically by JETTY_JOIN)
 curl -X POST http://node:8080/api/join -d '{...}'
 ```
@@ -111,9 +129,15 @@ curl -X POST http://node:8080/api/join -d '{...}'
 {
   "name": "nfs-server",
   "mesh_ip": "10.100.0.50",
-  "compose": "version: '3'\nservices:\n  ...",
+  "compose": "services:\n  nfs:\n    image: ...",
   "revive": true,
-  "owner": "abc123def456",
+  "autostart": true,
+  "allowed_nodes": ["node1", "node2"],
+  "owner": {
+    "id": "abc123def456",
+    "name": "node1",
+    "mesh_ip": "10.100.0.1"
+  },
   "version": 1705312200
 }
 ```
@@ -121,11 +145,13 @@ curl -X POST http://node:8080/api/join -d '{...}'
 | Field | Description |
 |-------|-------------|
 | `name` | Workload name, becomes DNS hostname |
-| `mesh_ip` | Unique IP on mesh network (the "lock") |
+| `mesh_ip` | Unique IP on mesh network (auto-assigned if omitted) |
 | `compose` | Docker Compose YAML |
 | `revive` | If true, another node will revive if owner dies |
-| `owner` | Node HWID currently running this |
-| `version` | Unix timestamp, for conflict resolution |
+| `autostart` | If true, auto-start when Jetty starts |
+| `allowed_nodes` | Whitelist of nodes that can run this workload |
+| `owner` | Node info (id, name, mesh_ip) currently running this |
+| `version` | Unix timestamp for conflict resolution |
 
 ## Using Hostnames in Compose
 
@@ -166,7 +192,7 @@ When a node goes down (no response for 30s):
 
 1. All nodes detect via gossip health checks
 2. Workloads with `revive: true` become orphaned
-3. Deterministic election: **lowest healthy node HWID wins**
+3. Deterministic election: **lowest healthy node HWID wins** (respecting `allowed_nodes`)
 4. Winner claims the `mesh_ip` and deploys workload
 5. Other nodes update their cache
 
@@ -176,9 +202,8 @@ No coordination needed - all nodes reach same conclusion independently.
 
 ```
 /data/
-├── state.json        # All state (peers, workloads, tokens)
+├── state.json        # All state (peers, workloads)
 ├── hwid              # This node's hardware ID
-├── wg_private_key    # WireGuard private key
 └── compose/          # Local compose files
     └── {name}/docker-compose.yml
 ```
@@ -187,9 +212,10 @@ No coordination needed - all nodes reach same conclusion independently.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `JETTY_SECRET` | Shared cluster password (required) | - |
 | `JETTY_DATA_DIR` | Data directory | `/data` |
 | `JETTY_API_PORT` | API port | `8080` |
-| `JETTY_WG_PORT` | WireGuard port | `51820` |
 | `JETTY_MESH_CIDR` | Mesh network | `10.100.0.0/16` |
 | `JETTY_JOIN` | URL to join existing cluster | - |
-| `JETTY_TOKEN` | Join token | - |
+| `JETTY_CF_TOKEN` | Cloudflare tunnel token | - |
+| `JETTY_WARP_CONNECTOR_TOKEN` | WARP Connector token | - |
