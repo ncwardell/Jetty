@@ -260,6 +260,9 @@ func (a *Agent) Start() error {
 	// Start failover monitor
 	go a.failoverLoop()
 
+	// Start IP monitor (detects WARP IP changes and re-announces)
+	go a.ipMonitorLoop()
+
 	mode := "warp (" + a.ip + ")"
 	if a.tunnelDomain != "" {
 		mode += " + tunnel (" + a.tunnelDomain + ")"
@@ -299,6 +302,58 @@ func (a *Agent) detectWarpIP() {
 			a.ip = ipnet.IP.String()
 			log.Printf("WARP IP detected: %s", a.ip)
 			return
+		}
+	}
+}
+
+// getWarpIP returns the current WARP IP without modifying agent state.
+func (a *Agent) getWarpIP() string {
+	// Try to find CloudflareWARP interface
+	iface, err := net.InterfaceByName("CloudflareWARP")
+	if err != nil {
+		return ""
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return ""
+	}
+
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+			return ipnet.IP.String()
+		}
+	}
+	return ""
+}
+
+// ipMonitorLoop periodically checks for WARP IP changes and re-announces if needed.
+// WARP can assign new IPs when reconnecting, so we need to propagate changes to peers.
+func (a *Agent) ipMonitorLoop() {
+	tick := time.NewTicker(10 * time.Second)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-a.stopCh:
+			return
+		case <-tick.C:
+			newIP := a.getWarpIP()
+			if newIP == "" || newIP == a.ip {
+				continue
+			}
+
+			oldIP := a.ip
+			a.ip = newIP
+			log.Printf("WARP IP changed: %s -> %s", oldIP, newIP)
+
+			// Re-announce our new IP to all peers
+			go a.announceOurIP()
+
+			// Update IPIP tunnels (they use our local IP)
+			a.stateMu.Lock()
+			a.updateWorkloadRoutes()
+			a.stateMu.Unlock()
 		}
 	}
 }
@@ -382,49 +437,19 @@ func (a *Agent) configureWarpRuntime(token string) error {
 }
 
 // =============================================================================
-// WARP Private Network Routes (via cloudflared CLI)
+// WARP Private Network Routes
 // =============================================================================
+// NOTE: These functions are no longer used. Workload routing now uses IPIP
+// tunnels between nodes instead of Cloudflare private network routes.
+// Keeping the functions as no-ops to avoid breaking callers.
 
-// registerWarpRoute adds a private network route for a mesh IP using cloudflared CLI.
-// This allows WARP clients to reach the workload through the tunnel.
+// registerWarpRoute is a no-op - IPIP tunnels handle routing now.
 func (a *Agent) registerWarpRoute(meshIP string) error {
-	if a.cfTunnelID == "" {
-		return nil // WARP route management not configured
-	}
-
-	// Use cloudflared tunnel route command
-	cmd := exec.Command("cloudflared", "tunnel", "route", "ip", "add", meshIP+"/32", a.cfTunnelID)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// Ignore "already exists" errors
-		if strings.Contains(string(output), "already exists") {
-			log.Printf("WARP route for %s already exists", meshIP)
-			return nil
-		}
-		return fmt.Errorf("cloudflared route add: %s", output)
-	}
-
-	log.Printf("WARP route registered: %s -> tunnel %s", meshIP, a.cfTunnelID[:8])
 	return nil
 }
 
-// unregisterWarpRoute removes a private network route for a mesh IP.
+// unregisterWarpRoute is a no-op - IPIP tunnels handle routing now.
 func (a *Agent) unregisterWarpRoute(meshIP string) error {
-	if a.cfTunnelID == "" {
-		return nil // WARP route management not configured
-	}
-
-	cmd := exec.Command("cloudflared", "tunnel", "route", "ip", "delete", meshIP+"/32")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// Ignore "not found" errors
-		if strings.Contains(string(output), "not found") {
-			return nil
-		}
-		return fmt.Errorf("cloudflared route delete: %s", output)
-	}
-
-	log.Printf("WARP route unregistered: %s", meshIP)
 	return nil
 }
 
@@ -2352,6 +2377,13 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	a.updateHosts()
 	a.saveState()
 
+	// Create IPIP tunnel to this peer (for receiving their traffic)
+	if peer.IP != "" {
+		if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
+			log.Printf("Warning: failed to create tunnel to %s: %v", peer.Name, err)
+		}
+	}
+
 	// Notify other peers
 	go a.announcePeer(peer)
 
@@ -3020,12 +3052,35 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	req.Peer.Healthy = true
 	req.Peer.LastSeen = time.Now()
 
+	// Check if peer IP changed
 	a.stateMu.Lock()
+	oldPeer := a.state.Peers[req.Peer.ID]
+	oldIP := ""
+	if oldPeer != nil {
+		oldIP = oldPeer.IP
+	}
+	ipChanged := oldIP != "" && oldIP != req.Peer.IP
 	a.state.Peers[req.Peer.ID] = &req.Peer
 	a.stateMu.Unlock()
 
 	a.updateHosts()
 	a.saveState()
+
+	// Always ensure we have an IPIP tunnel to this peer (for receiving their traffic)
+	// IPIP requires both sides to have matching tunnels
+	if req.Peer.IP != "" {
+		if err := a.ensurePeerTunnel(req.Peer.ID, req.Peer.IP); err != nil {
+			log.Printf("Warning: failed to create tunnel to %s: %v", req.Peer.Name, err)
+		}
+	}
+
+	// If peer IP changed, also update workload routes
+	if ipChanged {
+		log.Printf("Peer %s IP changed: %s -> %s", req.Peer.Name, oldIP, req.Peer.IP)
+		a.stateMu.Lock()
+		a.updateWorkloadRoutes()
+		a.stateMu.Unlock()
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -3732,23 +3787,14 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 	}
 	data, _ := json.Marshal(announcement)
 
-	// In tunnel-only mode, broadcast to tunnel
-	if a.tunnelDomain != "" {
-		url := a.getTunnelAPIURL("/api/peer-announce")
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
-		if err != nil {
-			log.Printf("Failed to announce peer: %v", err)
-		} else {
-			resp.Body.Close()
-		}
-		return
-	}
+	// Track if any direct announcements succeeded
+	directSuccess := 0
 
-	// Direct mode: send to each peer
+	// Try direct peer IPs first (if we have peers with IPs)
 	a.stateMu.RLock()
 	peers := make([]*Peer, 0)
 	for _, p := range a.state.Peers {
-		if p.ID != newPeer.ID {
+		if p.ID != newPeer.ID && p.IP != "" {
 			peers = append(peers, p)
 		}
 	}
@@ -3758,10 +3804,22 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 		url := fmt.Sprintf("http://%s:%d/api/peer-announce", peer.IP, a.apiPort)
 		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
 		if err != nil {
-			log.Printf("Failed to announce peer to %s: %v", peer.Name, err)
+			log.Printf("Failed to announce peer to %s via direct IP: %v", peer.Name, err)
 			continue
 		}
 		resp.Body.Close()
+		directSuccess++
+	}
+
+	// Use tunnel as fallback if direct failed or no peers had IPs
+	if directSuccess == 0 && a.tunnelDomain != "" {
+		url := a.getTunnelAPIURL("/api/peer-announce")
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to announce peer via tunnel: %v", err)
+		} else {
+			resp.Body.Close()
+		}
 	}
 }
 
@@ -3936,29 +3994,12 @@ func (a *Agent) loadState() {
 // errors, connection status, and other important information.
 type cloudflaredLogFilter struct {
 	prefix string
-	agent  *Agent // Reference to agent to capture tunnel ID
 }
 
 func (f *cloudflaredLogFilter) Write(p []byte) (n int, err error) {
 	line := strings.TrimSpace(string(p))
 	if line == "" {
 		return len(p), nil
-	}
-
-	// Extract tunnel ID from "Starting tunnel" log line
-	// Example: "2026-01-13T22:24:19Z INF Starting tunnel tunnelID=81f15f65-05ae-4e1b-931d-8866f058dd1d"
-	if strings.Contains(line, "Starting tunnel") && strings.Contains(line, "tunnelID=") {
-		if idx := strings.Index(line, "tunnelID="); idx != -1 {
-			tunnelID := line[idx+9:] // Skip "tunnelID="
-			// Trim any trailing content after the UUID
-			if spaceIdx := strings.IndexAny(tunnelID, " \t\n"); spaceIdx != -1 {
-				tunnelID = tunnelID[:spaceIdx]
-			}
-			if f.agent != nil && f.agent.cfTunnelID == "" && len(tunnelID) > 0 {
-				f.agent.cfTunnelID = tunnelID
-				log.Printf("Captured tunnel ID: %s (WARP route registration enabled)", tunnelID[:8])
-			}
-		}
 	}
 
 	// Only log important messages: errors, warnings, connection status
@@ -4005,8 +4046,7 @@ func (a *Agent) startCloudflared() error {
 	a.cfCmd = exec.Command("cloudflared", "--no-autoupdate", "tunnel", "run", "--token", token)
 
 	// Use filtered log writer to capture important messages while suppressing verbose output
-	// The filter also captures tunnel ID for WARP route registration
-	logFilter := &cloudflaredLogFilter{prefix: "cloudflared", agent: a}
+	logFilter := &cloudflaredLogFilter{prefix: "cloudflared"}
 	a.cfCmd.Stdout = logFilter
 	a.cfCmd.Stderr = logFilter
 
