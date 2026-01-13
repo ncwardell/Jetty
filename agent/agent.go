@@ -48,24 +48,19 @@ type Peer struct {
 }
 
 type Workload struct {
-	Name      string `json:"name"`      // DNS hostname
-	MeshIP    string `json:"mesh_ip"`   // Unique lock
-	Compose   string `json:"compose"`
-	Revive    bool   `json:"revive"`    // Auto-failover to another node if owner dies
-	Autostart bool   `json:"autostart"` // Auto-start when Jetty starts up
-	Owner     string `json:"owner"`     // Node HWID
-	Version   int64  `json:"version"`   // Unix timestamp
-}
-
-type Token struct {
-	Token     string    `json:"token"`
-	ExpiresAt time.Time `json:"expires_at"`
+	Name         string   `json:"name"`                    // DNS hostname
+	MeshIP       string   `json:"mesh_ip"`                 // Unique lock
+	Compose      string   `json:"compose"`
+	Revive       bool     `json:"revive"`                  // Auto-failover to another node if owner dies
+	Autostart    bool     `json:"autostart"`               // Auto-start when Jetty starts up
+	AllowedNodes []string `json:"allowed_nodes,omitempty"` // Node whitelist: empty/["*"] = all, otherwise node names/IDs
+	Owner        string   `json:"owner"`                   // Node HWID
+	Version      int64    `json:"version"`                 // Unix timestamp
 }
 
 type State struct {
 	Peers     map[string]*Peer     `json:"peers"`     // ID -> Peer
 	Workloads map[string]*Workload `json:"workloads"` // MeshIP -> Workload
-	Tokens    map[string]*Token    `json:"tokens"`
 	CFToken   string               `json:"cf_token,omitempty"`   // Cloudflare tunnel token (shared cluster-wide)
 	WarpToken string               `json:"warp_token,omitempty"` // Cloudflare WARP connector token (shared cluster-wide)
 }
@@ -92,8 +87,7 @@ type Agent struct {
 	apiPort       int
 	meshCIDR      string
 	joinURL       string
-	joinTok       string
-	clusterSecret string // Shared secret all nodes must have to join
+	clusterSecret string // Shared secret for cluster authentication
 	tunnelDomain  string // Cloudflare tunnel domain for API access
 	tunnelHost    string // This node's specific tunnel hostname (e.g., "node1.cluster.example.com")
 
@@ -126,7 +120,6 @@ func New() (*Agent, error) {
 		apiPort:       getEnvInt("JETTY_API_PORT", 8080),
 		meshCIDR:      getEnv("JETTY_MESH_CIDR", "10.100.0.0/16"),
 		joinURL:       getEnv("JETTY_JOIN", ""),
-		joinTok:       getEnv("JETTY_TOKEN", ""),
 		clusterSecret: getEnv("JETTY_SECRET", ""),
 		tunnelDomain:  getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - Cloudflare tunnel for API access
 		tunnelHost:    getEnv("JETTY_TUNNEL_HOST", ""),   // e.g., "node1.cluster.example.com" - this node's specific subdomain
@@ -136,7 +129,6 @@ func New() (*Agent, error) {
 		state: &State{
 			Peers:     make(map[string]*Peer),
 			Workloads: make(map[string]*Workload),
-			Tokens:    make(map[string]*Token),
 			CFToken:   getEnv("JETTY_CF_TOKEN", ""),             // Bootstrap tunnel token
 			WarpToken: getEnv("JETTY_WARP_CONNECTOR_TOKEN", ""), // Bootstrap WARP connector token
 		},
@@ -158,7 +150,11 @@ func (a *Agent) Start() error {
 	// Detect WARP IP if WARP is enabled
 	a.detectWarpIP()
 
+	// Load state first so we can check for IP collisions
+	a.loadState()
+
 	// Init network interface (dummy interface for local mesh IP binding)
+	// This uses collision-checked IP derivation based on loaded peer state
 	if err := a.initNetwork(); err != nil {
 		return fmt.Errorf("network: %w", err)
 	}
@@ -170,17 +166,18 @@ func (a *Agent) Start() error {
 		}
 	}
 
-	// Load state
-	a.loadState()
+	// Join cluster or sync with existing peers
+	a.stateMu.RLock()
+	hasClusterState := a.state.CFToken != "" || a.state.WarpToken != "" || len(a.state.Peers) > 0
+	a.stateMu.RUnlock()
 
-	// Join or bootstrap
-	if a.joinURL != "" {
+	if a.joinURL != "" && !hasClusterState {
+		// First run with join URL - join the cluster
 		if err := a.joinCluster(); err != nil {
 			return fmt.Errorf("join: %w", err)
 		}
 	} else {
-		// Not joining - sync state from known peers before autostart
-		// This handles the case where we restarted and workloads were revived by other nodes
+		// Already part of cluster (restart) or no join URL - sync state with known peers
 		a.syncStateOnStartup()
 	}
 
@@ -382,8 +379,10 @@ func (a *Agent) loadOrCreateHWID() string {
 // initNetwork creates a dummy interface for local mesh IP binding.
 // WARP handles all inter-node connectivity through Cloudflare's network.
 func (a *Agent) initNetwork() error {
-	// Derive mesh IP from HWID
-	a.meshIP = a.deriveMeshIP(a.hwid)
+	// Derive mesh IP from HWID with collision checking against known peers
+	a.stateMu.RLock()
+	a.meshIP = a.deriveMeshIPWithCollisionCheck(a.hwid)
+	a.stateMu.RUnlock()
 
 	// Clean up any existing interface
 	exec.Command("ip", "link", "del", "jetty0").Run()
@@ -474,6 +473,156 @@ func (a *Agent) deriveMeshIP(id string) string {
 	return fmt.Sprintf("%d.%d.%d.%d", (ipInt>>24)&0xff, (ipInt>>16)&0xff, (ipInt>>8)&0xff, ipInt&0xff)
 }
 
+// isIPInCIDR checks if an IP address is within the mesh CIDR range.
+func (a *Agent) isIPInCIDR(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	_, network, err := net.ParseCIDR(a.meshCIDR)
+	if err != nil {
+		return false
+	}
+	return network.Contains(ip)
+}
+
+// isIPTaken checks if an IP is already used by this node, a peer, or a workload.
+// Caller must hold stateMu lock (read or write).
+func (a *Agent) isIPTaken(ipStr string) bool {
+	// Check if it's our own mesh IP
+	if ipStr == a.meshIP {
+		return true
+	}
+
+	// Check peers
+	for _, p := range a.state.Peers {
+		if p.MeshIP == ipStr {
+			return true
+		}
+	}
+
+	// Check workloads
+	if _, exists := a.state.Workloads[ipStr]; exists {
+		return true
+	}
+
+	return false
+}
+
+// isNodeAllowed checks if a node (by ID or name) is allowed to run a workload.
+// Empty or ["*"] allowed_nodes means all nodes are allowed.
+func (a *Agent) isNodeAllowed(wl *Workload, nodeID, nodeName string) bool {
+	// Empty list or nil means all nodes allowed
+	if len(wl.AllowedNodes) == 0 {
+		return true
+	}
+
+	for _, allowed := range wl.AllowedNodes {
+		// Wildcard means all nodes allowed
+		if allowed == "*" || allowed == "all" {
+			return true
+		}
+		// Check by ID or name
+		if allowed == nodeID || allowed == nodeName {
+			return true
+		}
+	}
+	return false
+}
+
+// isThisNodeAllowed checks if this node is allowed to run a workload.
+func (a *Agent) isThisNodeAllowed(wl *Workload) bool {
+	return a.isNodeAllowed(wl, a.hwid, a.hostname)
+}
+
+// findAllowedNode finds a healthy peer that is allowed to run this workload.
+// Returns nil if no suitable node is found.
+// Caller must hold stateMu lock (read).
+func (a *Agent) findAllowedNode(wl *Workload) *Peer {
+	for _, p := range a.state.Peers {
+		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name) {
+			return p
+		}
+	}
+	return nil
+}
+
+// allocateMeshIP finds the next available IP in the mesh CIDR for a workload.
+// Returns empty string if no IPs are available.
+// Caller must hold stateMu lock (read or write).
+func (a *Agent) allocateMeshIP() string {
+	_, network, err := net.ParseCIDR(a.meshCIDR)
+	if err != nil {
+		return ""
+	}
+
+	ones, bits := network.Mask.Size()
+	maxHosts := (1 << (bits - ones)) - 2 // Exclude network and broadcast
+
+	baseIP := network.IP.To4()
+	baseInt := int(baseIP[0])<<24 | int(baseIP[1])<<16 | int(baseIP[2])<<8 | int(baseIP[3])
+
+	// Try to find an available IP, starting from host 1
+	for host := 1; host <= maxHosts; host++ {
+		ipInt := baseInt + host
+		ipStr := fmt.Sprintf("%d.%d.%d.%d", (ipInt>>24)&0xff, (ipInt>>16)&0xff, (ipInt>>8)&0xff, ipInt&0xff)
+
+		if !a.isIPTaken(ipStr) {
+			return ipStr
+		}
+	}
+
+	return "" // No available IPs
+}
+
+// deriveMeshIPWithCollisionCheck derives a mesh IP for a node, checking for collisions.
+// If the derived IP is already taken, it tries sequential IPs until finding an available one.
+// Caller must hold stateMu lock (read or write).
+func (a *Agent) deriveMeshIPWithCollisionCheck(id string) string {
+	_, network, _ := net.ParseCIDR(a.meshCIDR)
+	if network == nil {
+		return "10.100.0.1"
+	}
+
+	// Start with hash-derived IP
+	h := 0
+	for _, c := range id {
+		h = h*31 + int(c)
+	}
+	if h < 0 {
+		h = -h
+	}
+
+	ones, bits := network.Mask.Size()
+	maxHosts := (1 << (bits - ones)) - 2
+	startHost := (h % maxHosts) + 1
+
+	baseIP := network.IP.To4()
+	baseInt := int(baseIP[0])<<24 | int(baseIP[1])<<16 | int(baseIP[2])<<8 | int(baseIP[3])
+
+	// Try the hash-derived IP first, then scan for available IPs
+	for i := 0; i < maxHosts; i++ {
+		host := ((startHost + i - 1) % maxHosts) + 1
+		ipInt := baseInt + host
+		ipStr := fmt.Sprintf("%d.%d.%d.%d", (ipInt>>24)&0xff, (ipInt>>16)&0xff, (ipInt>>8)&0xff, ipInt&0xff)
+
+		// For node IPs, only check against other peers (not our own meshIP which isn't set yet)
+		taken := false
+		for _, p := range a.state.Peers {
+			if p.MeshIP == ipStr {
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			return ipStr
+		}
+	}
+
+	// Fallback (shouldn't happen unless network is full)
+	return fmt.Sprintf("%d.%d.%d.%d", (baseInt+1)>>24&0xff, (baseInt+1)>>16&0xff, (baseInt+1)>>8&0xff, (baseInt+1)&0xff)
+}
+
 // =============================================================================
 // /etc/hosts Management
 // =============================================================================
@@ -554,66 +703,130 @@ func (a *Agent) updateHosts() {
 func (a *Agent) joinCluster() error {
 	log.Printf("Joining cluster via %s", a.joinURL)
 
-	req := map[string]string{
-		"token":       a.joinTok,
-		"secret":      a.clusterSecret,
-		"id":          a.hwid,
-		"name":        a.hostname,
-		"mesh_ip":     a.meshIP,
-		"tunnel_host": a.tunnelHost, // Our specific subdomain for direct API routing
-		"warp_ip":     a.warpIP,     // Cloudflare WARP IP for L3 connectivity
-	}
-
-	data, _ := json.Marshal(req)
-	resp, err := httpClient.Post(a.joinURL+"/api/join", "application/json", strings.NewReader(string(data)))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("join failed: %s", body)
-	}
-
-	var result struct {
-		Peers     []*Peer     `json:"peers"`
-		Workloads []*Workload `json:"workloads"`
-		CFToken   string      `json:"cf_token,omitempty"`
-		WarpToken string      `json:"warp_token,omitempty"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("decode join response: %w", err)
-	}
-
-	a.stateMu.Lock()
-	for _, p := range result.Peers {
-		a.state.Peers[p.ID] = p
-	}
-	for _, w := range result.Workloads {
-		a.state.Workloads[w.MeshIP] = w
-	}
-	// Store tokens received from the cluster
-	if result.CFToken != "" {
-		a.state.CFToken = result.CFToken
-	}
-	if result.WarpToken != "" {
-		a.state.WarpToken = result.WarpToken
-	}
-	a.stateMu.Unlock()
-
-	a.saveState()
-
-	// Start cloudflared if we received a token
-	if result.CFToken != "" {
-		if err := a.startCloudflared(); err != nil {
-			log.Printf("Warning: failed to start cloudflared: %v", err)
+	// Retry loop to handle IP collisions
+	maxRetries := 5
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		req := map[string]string{
+			"secret":      a.clusterSecret, // Cluster secret for authentication
+			"id":          a.hwid,
+			"name":        a.hostname,
+			"mesh_ip":     a.meshIP,
+			"tunnel_host": a.tunnelHost, // Our specific subdomain for direct API routing
+			"warp_ip":     a.warpIP,     // Cloudflare WARP IP for L3 connectivity
 		}
+
+		data, _ := json.Marshal(req)
+		resp, err := httpClient.Post(a.joinURL+"/api/join", "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			return err
+		}
+
+		// Handle IP collision - re-derive IP and retry
+		if resp.StatusCode == http.StatusConflict {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if strings.Contains(string(body), "collision") {
+				log.Printf("Mesh IP %s collision, re-deriving...", a.meshIP)
+
+				// Mark our current IP as taken so derivation skips it
+				a.stateMu.Lock()
+				// Add a temporary "peer" to mark our IP as taken
+				tempPeer := &Peer{ID: "collision-marker", MeshIP: a.meshIP}
+				a.state.Peers["collision-marker-"+a.meshIP] = tempPeer
+				a.meshIP = a.deriveMeshIPWithCollisionCheck(a.hwid)
+				delete(a.state.Peers, "collision-marker-"+tempPeer.MeshIP)
+				a.stateMu.Unlock()
+
+				// Update network interface with new IP
+				_, network, _ := net.ParseCIDR(a.meshCIDR)
+				pfx, _ := network.Mask.Size()
+				exec.Command("ip", "addr", "flush", "dev", "jetty0").Run()
+				exec.Command("ip", "addr", "add", fmt.Sprintf("%s/%d", a.meshIP, pfx), "dev", "jetty0").Run()
+
+				log.Printf("New mesh IP: %s, retrying join...", a.meshIP)
+				continue
+			}
+			return fmt.Errorf("join failed: %s", body)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return fmt.Errorf("join failed: %s", body)
+		}
+
+		// Success - process response
+		var result struct {
+			Peers        []*Peer     `json:"peers"`
+			Workloads    []*Workload `json:"workloads"`
+			CFToken      string      `json:"cf_token,omitempty"`
+			WarpToken    string      `json:"warp_token,omitempty"`
+			MeshCIDR     string      `json:"mesh_cidr,omitempty"`
+			TunnelDomain string      `json:"tunnel_domain,omitempty"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			return fmt.Errorf("decode join response: %w", err)
+		}
+		resp.Body.Close()
+
+		// Update mesh CIDR if received and different (cluster's CIDR takes precedence)
+		if result.MeshCIDR != "" && result.MeshCIDR != a.meshCIDR {
+			log.Printf("Adopting cluster mesh CIDR: %s (was %s)", result.MeshCIDR, a.meshCIDR)
+			a.meshCIDR = result.MeshCIDR
+			// Re-derive our mesh IP for the new CIDR
+			a.stateMu.Lock()
+			oldIP := a.meshIP
+			a.meshIP = a.deriveMeshIPWithCollisionCheck(a.hwid)
+			a.stateMu.Unlock()
+			if oldIP != a.meshIP {
+				// Update network interface with new IP
+				_, network, _ := net.ParseCIDR(a.meshCIDR)
+				pfx, _ := network.Mask.Size()
+				exec.Command("ip", "addr", "flush", "dev", "jetty0").Run()
+				exec.Command("ip", "addr", "add", fmt.Sprintf("%s/%d", a.meshIP, pfx), "dev", "jetty0").Run()
+				log.Printf("Updated mesh IP to %s for new CIDR", a.meshIP)
+			}
+		}
+
+		// Update tunnel domain if received and not set locally
+		if result.TunnelDomain != "" && a.tunnelDomain == "" {
+			a.tunnelDomain = result.TunnelDomain
+			log.Printf("Adopting cluster tunnel domain: %s", a.tunnelDomain)
+		}
+
+		a.stateMu.Lock()
+		for _, p := range result.Peers {
+			a.state.Peers[p.ID] = p
+		}
+		for _, w := range result.Workloads {
+			a.state.Workloads[w.MeshIP] = w
+		}
+		// Store tokens received from the cluster
+		if result.CFToken != "" {
+			a.state.CFToken = result.CFToken
+		}
+		if result.WarpToken != "" {
+			a.state.WarpToken = result.WarpToken
+		}
+		a.stateMu.Unlock()
+
+		a.saveState()
+
+		// Start cloudflared if we received a token
+		if result.CFToken != "" {
+			if err := a.startCloudflared(); err != nil {
+				log.Printf("Warning: failed to start cloudflared: %v", err)
+			}
+		}
+
+		log.Printf("Joined: %d peers, %d workloads, tunnel=%v, warp=%v, cidr=%s",
+			len(result.Peers), len(result.Workloads), result.CFToken != "", result.WarpToken != "", a.meshCIDR)
+		return nil
 	}
 
-	log.Printf("Joined: %d peers, %d workloads, tunnel=%v, warp=%v",
-		len(result.Peers), len(result.Workloads), result.CFToken != "", result.WarpToken != "")
-	return nil
+	return fmt.Errorf("join failed after %d attempts due to IP collisions", maxRetries)
 }
 
 // =============================================================================
@@ -633,12 +846,11 @@ func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 		// Public endpoints that don't require API key
 		publicPaths := []string{
 			"/api/health",        // Monitoring
-			"/api/join",          // Node joining (uses token + secret in body)
-			"/api/sync",          // Internal cluster sync (uses secret in body)
+			"/api/join",          // Node joining (uses secret in body)
+			"/api/sync",          // Internal cluster sync
 			"/api/peer-announce", // Internal peer announcement
 			"/api/heartbeat",     // Internal heartbeat
 			"/api/tunnel/sync",   // Internal tunnel sync
-			"/api/token/sync",    // Internal token sync
 			"/swagger/",          // API documentation
 		}
 
@@ -672,20 +884,20 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/workloads", a.apiListWorkloads).Methods("GET")
 	r.HandleFunc("/api/workloads", a.apiCreateWorkload).Methods("POST")
 	r.HandleFunc("/api/workloads/{name}", a.apiGetWorkload).Methods("GET")
+	r.HandleFunc("/api/workloads/{name}", a.apiUpdateWorkload).Methods("PATCH")
 	r.HandleFunc("/api/workloads/{name}", a.apiDeleteWorkload).Methods("DELETE")
 	r.HandleFunc("/api/workloads/{name}/move", a.apiMoveWorkload).Methods("POST")
 	r.HandleFunc("/api/workloads/{name}/logs", a.apiWorkloadLogs).Methods("GET")
 	r.HandleFunc("/api/workloads/{name}/start", a.apiStartWorkload).Methods("POST")
 	r.HandleFunc("/api/workloads/{name}/stop", a.apiStopWorkload).Methods("POST")
-	r.HandleFunc("/api/token", a.apiCreateToken).Methods("POST", "GET")
 	r.HandleFunc("/api/join", a.apiJoin).Methods("POST")
 	r.HandleFunc("/api/health", a.apiHealth).Methods("GET")
+	r.HandleFunc("/api/cluster/health", a.apiClusterHealth).Methods("GET")
 	r.HandleFunc("/api/sync", a.apiSync).Methods("GET")
 	r.HandleFunc("/api/tunnel", a.apiGetTunnel).Methods("GET")
 	r.HandleFunc("/api/tunnel", a.apiSetTunnel).Methods("POST")
 	r.HandleFunc("/api/tunnel", a.apiDeleteTunnel).Methods("DELETE")
 	r.HandleFunc("/api/tunnel/sync", a.apiTunnelSync).Methods("POST")
-	r.HandleFunc("/api/token/sync", a.apiTokenSync).Methods("POST")
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 	r.HandleFunc("/api/heartbeat", a.apiHeartbeat).Methods("POST")
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)
@@ -746,16 +958,93 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 
 // apiListWorkloads godoc
 // @Summary List all workloads
-// @Description Returns all workloads in the cluster
+// @Description Returns all workloads in the cluster, optionally filtered by node
 // @Tags workloads
 // @Produce json
+// @Param node query string false "Filter by node name or ID (use 'local' for this node only)"
 // @Success 200 {array} Workload
 // @Router /workloads [get]
 func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
+	nodeFilter := r.URL.Query().Get("node")
+
 	a.stateMu.RLock()
-	workloads := make([]*Workload, 0, len(a.state.Workloads))
+
+	// Build peer info maps for enrichment and filtering
+	peerNameToID := make(map[string]string)
+	peerIDToInfo := make(map[string]map[string]string)
+	for _, p := range a.state.Peers {
+		peerNameToID[p.Name] = p.ID
+		peerIDToInfo[p.ID] = map[string]string{
+			"id":      p.ID,
+			"name":    p.Name,
+			"mesh_ip": p.MeshIP,
+		}
+	}
+
+	// Add local node to owner info map
+	peerIDToInfo[a.hwid] = map[string]string{
+		"id":      a.hwid,
+		"name":    a.hostname,
+		"mesh_ip": a.meshIP,
+	}
+
+	type WorkloadResponse struct {
+		Name         string            `json:"name"`
+		MeshIP       string            `json:"mesh_ip"`
+		Compose      string            `json:"compose"`
+		Revive       bool              `json:"revive"`
+		Autostart    bool              `json:"autostart"`
+		AllowedNodes []string          `json:"allowed_nodes,omitempty"`
+		Owner        map[string]string `json:"owner"`
+		Version      int64             `json:"version"`
+	}
+
+	var workloads []WorkloadResponse
+
 	for _, wl := range a.state.Workloads {
-		workloads = append(workloads, wl)
+		// Apply node filter if specified
+		if nodeFilter != "" {
+			// Handle special "local" filter
+			if nodeFilter == "local" {
+				if wl.Owner != a.hwid {
+					continue
+				}
+			} else if nodeFilter == a.hwid || nodeFilter == a.hostname {
+				// Filter for this node by ID or name
+				if wl.Owner != a.hwid {
+					continue
+				}
+			} else {
+				// Filter for a specific peer by ID or name
+				matchesFilter := wl.Owner == nodeFilter
+				if !matchesFilter {
+					// Check if filter matches a peer name
+					if peerID, ok := peerNameToID[nodeFilter]; ok {
+						matchesFilter = wl.Owner == peerID
+					}
+				}
+				if !matchesFilter {
+					continue
+				}
+			}
+		}
+
+		// Build enriched owner info
+		ownerInfo := peerIDToInfo[wl.Owner]
+		if ownerInfo == nil {
+			ownerInfo = map[string]string{"id": wl.Owner, "name": "unknown", "mesh_ip": "unknown"}
+		}
+
+		workloads = append(workloads, WorkloadResponse{
+			Name:         wl.Name,
+			MeshIP:       wl.MeshIP,
+			Compose:      wl.Compose,
+			Revive:       wl.Revive,
+			Autostart:    wl.Autostart,
+			AllowedNodes: wl.AllowedNodes,
+			Owner:        ownerInfo,
+			Version:      wl.Version,
+		})
 	}
 	a.stateMu.RUnlock()
 
@@ -776,14 +1065,17 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 // @Failure 500 {object} ErrorResponse "Deployment failed"
 // @Router /workloads [post]
 func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
+	// Check if this is a move operation (allows IP overlap during migration)
+	isMove := r.URL.Query().Get("move") == "true"
+
 	var wl Workload
 	if err := json.NewDecoder(r.Body).Decode(&wl); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
 
-	if wl.Name == "" || wl.MeshIP == "" || wl.Compose == "" {
-		http.Error(w, "name, mesh_ip, compose required", 400)
+	if wl.Name == "" || wl.Compose == "" {
+		http.Error(w, "name and compose required", 400)
 		return
 	}
 
@@ -793,19 +1085,70 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate mesh IP format
-	if net.ParseIP(wl.MeshIP) == nil {
-		http.Error(w, "invalid mesh_ip: must be valid IP address", 400)
+	// Check if this node is allowed to run this workload
+	if !a.isThisNodeAllowed(&wl) {
+		// Find an allowed node and proxy the deployment
+		a.stateMu.RLock()
+		targetPeer := a.findAllowedNode(&wl)
+		a.stateMu.RUnlock()
+
+		if targetPeer == nil {
+			http.Error(w, "no allowed nodes available for this workload", 503)
+			return
+		}
+
+		// Proxy deployment to allowed node
+		data, _ := json.Marshal(wl)
+		url := a.getPeerAPIURL(targetPeer, "/api/workloads")
+		if isMove {
+			url += "?move=true"
+		}
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to proxy to allowed node: %v", err), 502)
+			return
+		}
+		defer resp.Body.Close()
+
+		// Forward the response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
 		return
 	}
 
 	// Lock for entire check-and-set to prevent race condition
 	a.stateMu.Lock()
-	existing := a.state.Workloads[wl.MeshIP]
-	if existing != nil && existing.Owner != a.hwid {
-		a.stateMu.Unlock()
-		http.Error(w, "mesh_ip already in use", 409)
-		return
+
+	// Auto-allocate mesh IP if not provided
+	if wl.MeshIP == "" {
+		wl.MeshIP = a.allocateMeshIP()
+		if wl.MeshIP == "" {
+			a.stateMu.Unlock()
+			http.Error(w, "no available IPs in mesh CIDR", 507)
+			return
+		}
+	} else {
+		// Validate provided mesh IP format
+		if net.ParseIP(wl.MeshIP) == nil {
+			a.stateMu.Unlock()
+			http.Error(w, "invalid mesh_ip: must be valid IP address", 400)
+			return
+		}
+
+		// Validate IP is within mesh CIDR
+		if !a.isIPInCIDR(wl.MeshIP) {
+			a.stateMu.Unlock()
+			http.Error(w, fmt.Sprintf("mesh_ip must be within %s", a.meshCIDR), 400)
+			return
+		}
+
+		// Check if IP is already taken (skip during move for blue-green deployment)
+		if !isMove && a.isIPTaken(wl.MeshIP) {
+			a.stateMu.Unlock()
+			http.Error(w, "mesh_ip already in use", 409)
+			return
+		}
 	}
 
 	wl.Owner = a.hwid
@@ -834,8 +1177,24 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Build response with enriched owner info
+	response := map[string]interface{}{
+		"name":          wl.Name,
+		"mesh_ip":       wl.MeshIP,
+		"compose":       wl.Compose,
+		"revive":        wl.Revive,
+		"autostart":     wl.Autostart,
+		"allowed_nodes": wl.AllowedNodes,
+		"owner": map[string]string{
+			"id":      a.hwid,
+			"name":    a.hostname,
+			"mesh_ip": a.meshIP,
+		},
+		"version": wl.Version,
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(wl)
+	json.NewEncoder(w).Encode(response)
 }
 
 // apiGetWorkload godoc
@@ -870,22 +1229,35 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Helper to build owner info object
+	buildOwnerInfo := func(id, peerName, meshIP string) map[string]string {
+		return map[string]string{
+			"id":      id,
+			"name":    peerName,
+			"mesh_ip": meshIP,
+		}
+	}
+
 	// If workload is remote, proxy the request to the owner node
 	if found.Owner != a.hwid {
 		if ownerPeer == nil || !ownerPeer.Healthy {
 			// Owner not reachable, return basic info without container details
+			ownerInfo := buildOwnerInfo(found.Owner, "unknown", "unknown")
+			if ownerPeer != nil {
+				ownerInfo = buildOwnerInfo(ownerPeer.ID, ownerPeer.Name, ownerPeer.MeshIP)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"name":       found.Name,
-				"mesh_ip":    found.MeshIP,
-				"compose":    found.Compose,
-				"revive":     found.Revive,
-				"autostart":  found.Autostart,
-				"owner":      found.Owner,
-				"version":    found.Version,
-				"is_local":   false,
-				"owner_node": ownerPeer.Name,
-				"error":      "owner node unreachable",
+				"name":          found.Name,
+				"mesh_ip":       found.MeshIP,
+				"compose":       found.Compose,
+				"revive":        found.Revive,
+				"autostart":     found.Autostart,
+				"allowed_nodes": found.AllowedNodes,
+				"owner":         ownerInfo,
+				"version":       found.Version,
+				"is_local":      false,
+				"error":         "owner node unreachable",
 			})
 			return
 		}
@@ -894,18 +1266,19 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
 		resp, err := httpClient.Get(url)
 		if err != nil {
+			ownerInfo := buildOwnerInfo(ownerPeer.ID, ownerPeer.Name, ownerPeer.MeshIP)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"name":       found.Name,
-				"mesh_ip":    found.MeshIP,
-				"compose":    found.Compose,
-				"revive":     found.Revive,
-				"autostart":  found.Autostart,
-				"owner":      found.Owner,
-				"version":    found.Version,
-				"is_local":   false,
-				"owner_node": ownerPeer.Name,
-				"error":      fmt.Sprintf("failed to reach owner: %v", err),
+				"name":          found.Name,
+				"mesh_ip":       found.MeshIP,
+				"compose":       found.Compose,
+				"revive":        found.Revive,
+				"autostart":     found.Autostart,
+				"allowed_nodes": found.AllowedNodes,
+				"owner":         ownerInfo,
+				"version":       found.Version,
+				"is_local":      false,
+				"error":         fmt.Sprintf("failed to reach owner: %v", err),
 			})
 			return
 		}
@@ -915,10 +1288,9 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		body, _ := io.ReadAll(resp.Body)
 
-		// Parse and add owner_node field
+		// Parse and update is_local field
 		var remoteResp map[string]interface{}
 		if err := json.Unmarshal(body, &remoteResp); err == nil {
-			remoteResp["owner_node"] = ownerPeer.Name
 			remoteResp["is_local"] = false // Override since we proxied
 			json.NewEncoder(w).Encode(remoteResp)
 		} else {
@@ -928,20 +1300,212 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build enriched response with Docker info for local workload
+	ownerInfo := buildOwnerInfo(a.hwid, a.hostname, a.meshIP)
 	response := map[string]interface{}{
-		"name":      found.Name,
-		"mesh_ip":   found.MeshIP,
-		"compose":   found.Compose,
-		"revive":    found.Revive,
-		"autostart": found.Autostart,
-		"owner":     found.Owner,
-		"version":   found.Version,
-		"is_local":  true,
+		"name":          found.Name,
+		"mesh_ip":       found.MeshIP,
+		"compose":       found.Compose,
+		"revive":        found.Revive,
+		"autostart":     found.Autostart,
+		"allowed_nodes": found.AllowedNodes,
+		"owner":         ownerInfo,
+		"version":       found.Version,
+		"is_local":      true,
 	}
 
 	containerInfo := a.getContainerInfo(found.Name)
 	response["containers"] = containerInfo
 
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// apiUpdateWorkload godoc
+// @Summary Update a workload
+// @Description Updates workload configuration. Some fields require redeploy.
+// @Tags workloads
+// @Accept json
+// @Produce json
+// @Param name path string true "Workload name"
+// @Param update body object true "Fields to update"
+// @Success 200 {object} Workload
+// @Failure 404 {object} ErrorResponse "Workload not found"
+// @Failure 409 {object} ErrorResponse "Mesh IP conflict"
+// @Failure 500 {object} ErrorResponse "Update failed"
+// @Router /workloads/{name} [patch]
+func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+
+	// Parse update request
+	var update struct {
+		Compose      *string   `json:"compose,omitempty"`
+		MeshIP       *string   `json:"mesh_ip,omitempty"`
+		Revive       *bool     `json:"revive,omitempty"`
+		Autostart    *bool     `json:"autostart,omitempty"`
+		AllowedNodes *[]string `json:"allowed_nodes,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	// Find workload
+	a.stateMu.RLock()
+	var found *Workload
+	var foundIP string
+	var ownerPeer *Peer
+	for ip, wl := range a.state.Workloads {
+		if wl.Name == name {
+			found = wl
+			foundIP = ip
+			if wl.Owner != a.hwid {
+				ownerPeer = a.state.Peers[wl.Owner]
+			}
+			break
+		}
+	}
+	a.stateMu.RUnlock()
+
+	if found == nil {
+		http.Error(w, "not found", 404)
+		return
+	}
+
+	// If workload is remote, proxy to owner
+	if found.Owner != a.hwid {
+		if ownerPeer == nil || !ownerPeer.Healthy {
+			http.Error(w, "owner node unreachable", 502)
+			return
+		}
+
+		// Proxy PATCH to owner
+		body, _ := json.Marshal(update)
+		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
+		req, _ := http.NewRequest("PATCH", url, strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			return
+		}
+		defer resp.Body.Close()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	// Local workload - apply updates
+	needsRedeploy := false
+	newMeshIP := foundIP
+
+	a.stateMu.Lock()
+
+	// Handle mesh IP change
+	if update.MeshIP != nil && *update.MeshIP != found.MeshIP {
+		newIP := *update.MeshIP
+
+		// Validate new IP
+		if net.ParseIP(newIP) == nil {
+			a.stateMu.Unlock()
+			http.Error(w, "invalid mesh_ip: must be valid IP address", 400)
+			return
+		}
+		if !a.isIPInCIDR(newIP) {
+			a.stateMu.Unlock()
+			http.Error(w, fmt.Sprintf("mesh_ip must be within %s", a.meshCIDR), 400)
+			return
+		}
+		if a.isIPTaken(newIP) {
+			a.stateMu.Unlock()
+			http.Error(w, "mesh_ip already in use", 409)
+			return
+		}
+
+		// Remove old entry, will add new one
+		delete(a.state.Workloads, foundIP)
+		newMeshIP = newIP
+		found.MeshIP = newIP
+		needsRedeploy = true
+	}
+
+	// Handle compose change
+	if update.Compose != nil && *update.Compose != found.Compose {
+		found.Compose = *update.Compose
+		needsRedeploy = true
+	}
+
+	// Handle metadata updates (no redeploy needed)
+	if update.Revive != nil {
+		found.Revive = *update.Revive
+	}
+	if update.Autostart != nil {
+		found.Autostart = *update.Autostart
+	}
+	if update.AllowedNodes != nil {
+		found.AllowedNodes = *update.AllowedNodes
+	}
+
+	// Update version
+	found.Version = time.Now().Unix()
+
+	// Store with (potentially new) mesh IP
+	a.state.Workloads[newMeshIP] = found
+	a.stateMu.Unlock()
+
+	// Redeploy if needed
+	if needsRedeploy {
+		// Remove old deployment
+		a.removeWorkload(found)
+
+		// Unregister old WARP route
+		if a.warpEnabled && foundIP != newMeshIP {
+			a.unregisterWarpRoute(foundIP)
+		}
+
+		// Deploy with new config
+		if err := a.deployWorkload(found); err != nil {
+			// Rollback on failure
+			a.stateMu.Lock()
+			delete(a.state.Workloads, newMeshIP)
+			if newMeshIP != foundIP {
+				found.MeshIP = foundIP
+				a.state.Workloads[foundIP] = found
+			}
+			a.stateMu.Unlock()
+			http.Error(w, fmt.Sprintf("redeploy failed: %v", err), 500)
+			return
+		}
+
+		// Register new WARP route
+		if a.warpEnabled {
+			a.addWarpRule(newMeshIP)
+		}
+	}
+
+	a.updateHosts()
+	a.saveState()
+	a.broadcastState()
+
+	// Build response
+	response := map[string]interface{}{
+		"name":          found.Name,
+		"mesh_ip":       found.MeshIP,
+		"compose":       found.Compose,
+		"revive":        found.Revive,
+		"autostart":     found.Autostart,
+		"allowed_nodes": found.AllowedNodes,
+		"owner": map[string]string{
+			"id":      a.hwid,
+			"name":    a.hostname,
+			"mesh_ip": a.meshIP,
+		},
+		"version":    found.Version,
+		"redeployed": needsRedeploy,
+	}
+
+	log.Printf("Updated workload %s (redeploy=%v)", found.Name, needsRedeploy)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
@@ -1059,33 +1623,58 @@ func (a *Agent) getContainerInfo(workloadName string) []map[string]interface{} {
 func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 
-	a.stateMu.Lock()
+	a.stateMu.RLock()
 	var found *Workload
 	var foundIP string
+	var ownerPeer *Peer
 	for ip, wl := range a.state.Workloads {
 		if wl.Name == name {
 			found = wl
 			foundIP = ip
+			if wl.Owner != a.hwid {
+				ownerPeer = a.state.Peers[wl.Owner]
+			}
 			break
 		}
 	}
+	a.stateMu.RUnlock()
 
 	if found == nil {
-		a.stateMu.Unlock()
 		http.Error(w, "not found", 404)
 		return
 	}
 
-	// Only owner can delete (or anyone if owner is dead)
+	// If workload is remote and owner is healthy, proxy the delete request
 	if found.Owner != a.hwid {
-		peer := a.state.Peers[found.Owner]
-		if peer != nil && peer.Healthy {
-			a.stateMu.Unlock()
-			http.Error(w, "workload owned by another node", 403)
+		if ownerPeer != nil && ownerPeer.Healthy {
+			// Proxy delete to owner node
+			url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
+			req, err := http.NewRequest("DELETE", url, nil)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("failed to create request: %v", err), 500)
+				return
+			}
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+				return
+			}
+			defer resp.Body.Close()
+
+			// Forward response from owner
+			w.WriteHeader(resp.StatusCode)
+			if resp.StatusCode != 204 {
+				body, _ := io.ReadAll(resp.Body)
+				w.Write(body)
+			}
 			return
 		}
+		// Owner is dead - allow cleanup of orphaned workload from our state
+		log.Printf("Cleaning up orphaned workload %s (owner %s unreachable)", name, found.Owner)
 	}
 
+	// Local workload or orphaned cleanup - delete from state
+	a.stateMu.Lock()
 	delete(a.state.Workloads, foundIP)
 	a.stateMu.Unlock()
 
@@ -1125,12 +1714,16 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
-	// Find workload
+	// Find workload and current owner
 	a.stateMu.RLock()
 	var found *Workload
+	var currentOwner *Peer
 	for _, wl := range a.state.Workloads {
 		if wl.Name == name {
 			found = wl
+			if wl.Owner != a.hwid {
+				currentOwner = a.state.Peers[wl.Owner]
+			}
 			break
 		}
 	}
@@ -1153,32 +1746,54 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "target not found", 404)
 		return
 	}
+	if !target.Healthy {
+		http.Error(w, "target node is not healthy", 503)
+		return
+	}
 
-	// Deploy on target
+	// Check if target is allowed to run this workload
+	if !a.isNodeAllowed(found, target.ID, target.Name) {
+		http.Error(w, "target node is not in allowed_nodes for this workload", 403)
+		return
+	}
+
+	// Blue-green deployment: deploy on target first (with move=true to allow IP overlap)
 	data, _ := json.Marshal(found)
-	resp, err := httpClient.Post(fmt.Sprintf("http://%s:%d/api/workloads", target.MeshIP, a.apiPort),
-		"application/json", strings.NewReader(string(data)))
+	url := a.getPeerAPIURL(target, "/api/workloads?move=true")
+	resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, fmt.Sprintf("failed to deploy on target: %v", err), 502)
 		return
 	}
 	resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		http.Error(w, "target rejected", 500)
+		http.Error(w, fmt.Sprintf("target rejected deployment (status %d)", resp.StatusCode), 500)
 		return
 	}
 
-	// Remove locally if we own it
+	// Target is now running - remove from source
+	// If we own it, remove locally
 	if found.Owner == a.hwid {
 		a.removeWorkload(found)
 
-		// Unregister WARP route (target will register its own)
+		// Unregister WARP route (target has registered its own)
 		if err := a.unregisterWarpRoute(found.MeshIP); err != nil {
 			log.Printf("Warning: failed to unregister WARP route for %s: %v", found.MeshIP, err)
 		}
+	} else if currentOwner != nil && currentOwner.Healthy {
+		// Proxy delete to current owner
+		deleteURL := a.getPeerAPIURL(currentOwner, "/api/workloads/"+name)
+		delReq, _ := http.NewRequest("DELETE", deleteURL, nil)
+		delResp, err := httpClient.Do(delReq)
+		if err != nil {
+			log.Printf("Warning: failed to remove workload from original owner: %v", err)
+		} else {
+			delResp.Body.Close()
+		}
 	}
 
+	log.Printf("Moved workload %s to %s (blue-green)", found.Name, target.Name)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"moved": "ok", "to": target.Name})
 }
@@ -1197,16 +1812,41 @@ func (a *Agent) apiWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 
 	a.stateMu.RLock()
 	var found *Workload
+	var ownerPeer *Peer
 	for _, wl := range a.state.Workloads {
-		if wl.Name == name && wl.Owner == a.hwid {
+		if wl.Name == name {
 			found = wl
+			if wl.Owner != a.hwid {
+				ownerPeer = a.state.Peers[wl.Owner]
+			}
 			break
 		}
 	}
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found or not local", 404)
+		http.Error(w, "not found", 404)
+		return
+	}
+
+	// If workload is remote, proxy to owner
+	if found.Owner != a.hwid {
+		if ownerPeer == nil || !ownerPeer.Healthy {
+			http.Error(w, "owner node unreachable", 502)
+			return
+		}
+		// Proxy logs request to owner
+		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/logs")
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			return
+		}
+		defer resp.Body.Close()
+
+		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
 		return
 	}
 
@@ -1229,16 +1869,41 @@ func (a *Agent) apiStartWorkload(w http.ResponseWriter, r *http.Request) {
 
 	a.stateMu.RLock()
 	var found *Workload
+	var ownerPeer *Peer
 	for _, wl := range a.state.Workloads {
-		if wl.Name == name && wl.Owner == a.hwid {
+		if wl.Name == name {
 			found = wl
+			if wl.Owner != a.hwid {
+				ownerPeer = a.state.Peers[wl.Owner]
+			}
 			break
 		}
 	}
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found or not local", 404)
+		http.Error(w, "not found", 404)
+		return
+	}
+
+	// If workload is remote, proxy to owner
+	if found.Owner != a.hwid {
+		if ownerPeer == nil || !ownerPeer.Healthy {
+			http.Error(w, "owner node unreachable", 502)
+			return
+		}
+		// Proxy start request to owner
+		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/start")
+		resp, err := httpClient.Post(url, "application/json", nil)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			return
+		}
+		defer resp.Body.Close()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
 		return
 	}
 
@@ -1269,16 +1934,41 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 
 	a.stateMu.RLock()
 	var found *Workload
+	var ownerPeer *Peer
 	for _, wl := range a.state.Workloads {
-		if wl.Name == name && wl.Owner == a.hwid {
+		if wl.Name == name {
 			found = wl
+			if wl.Owner != a.hwid {
+				ownerPeer = a.state.Peers[wl.Owner]
+			}
 			break
 		}
 	}
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found or not local", 404)
+		http.Error(w, "not found", 404)
+		return
+	}
+
+	// If workload is remote, proxy to owner
+	if found.Owner != a.hwid {
+		if ownerPeer == nil || !ownerPeer.Healthy {
+			http.Error(w, "owner node unreachable", 502)
+			return
+		}
+		// Proxy stop request to owner
+		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/stop")
+		resp, err := httpClient.Post(url, "application/json", nil)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			return
+		}
+		defer resp.Body.Close()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
 		return
 	}
 
@@ -1295,78 +1985,37 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "stopped", "name": found.Name})
 }
 
-// apiCreateToken godoc
-// @Summary Create join token
-// @Description Generates a new single-use token for joining the cluster (expires in 24h)
-// @Tags cluster
-// @Produce json
-// @Success 200 {object} TokenResponse
-// @Router /token [post]
-func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
-	tok := &Token{
-		Token:     genID() + genID(),
-		ExpiresAt: time.Now().Add(24 * time.Hour),
-	}
-
-	a.stateMu.Lock()
-	a.state.Tokens[tok.Token] = tok
-	a.stateMu.Unlock()
-
-	a.saveState()
-
-	// Broadcast token to all peers so any node can validate it
-	// (important when using Cloudflare tunnel load balancing)
-	go a.broadcastToken(tok)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tok)
-}
-
 // apiJoin godoc
 // @Summary Join cluster
-// @Description Allows a new node to join the cluster using a token
+// @Description Allows a new node to join the cluster using the cluster secret
 // @Tags cluster
 // @Accept json
 // @Produce json
 // @Param request body JoinRequest true "Join request"
 // @Success 200 {object} JoinResponse
-// @Failure 401 {object} ErrorResponse "Invalid token or secret"
+// @Failure 401 {object} ErrorResponse "Invalid secret"
 // @Failure 409 {object} ErrorResponse "Mesh IP collision"
 // @Router /join [post]
 func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Token      string `json:"token"`
-		Secret     string `json:"secret"`
+		Secret     string `json:"secret"` // Cluster secret for authentication
 		ID         string `json:"id"`
 		Name       string `json:"name"`
 		MeshIP     string `json:"mesh_ip"`
-		Endpoint   string `json:"endpoint"`
-		PublicKey  string `json:"public_key"`
 		TunnelHost string `json:"tunnel_host"`
 		WarpIP     string `json:"warp_ip"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
-	// Validate cluster secret first
-	if a.clusterSecret != "" && req.Secret != a.clusterSecret {
-		http.Error(w, "invalid cluster secret", 401)
+	// Validate cluster secret
+	if a.clusterSecret == "" {
+		http.Error(w, "cluster has no secret configured", 500)
 		return
 	}
-
-	// Validate and consume token (single-use)
-	a.stateMu.Lock()
-	tok := a.state.Tokens[req.Token]
-	if tok == nil || time.Now().After(tok.ExpiresAt) {
-		a.stateMu.Unlock()
-		http.Error(w, "invalid token", 401)
+	if req.Secret != a.clusterSecret {
+		http.Error(w, "invalid secret", 401)
 		return
 	}
-	// Delete token after use (single-use tokens)
-	delete(a.state.Tokens, req.Token)
-	a.stateMu.Unlock()
-
-	// Broadcast token deletion to other nodes
-	go a.broadcastTokenDeletion(req.Token)
 
 	// Check for mesh IP collision before creating peer
 	a.stateMu.RLock()
@@ -1397,8 +2046,6 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		ID:         req.ID,
 		Name:       req.Name,
 		MeshIP:     req.MeshIP,
-		Endpoint:   req.Endpoint,
-		PublicKey:  req.PublicKey,
 		TunnelHost: req.TunnelHost,
 		WarpIP:     req.WarpIP,
 		Healthy:    true,
@@ -1440,6 +2087,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]interface{}{
 		"peers":     allPeers,
 		"workloads": allWorkloads,
+		"mesh_cidr": a.meshCIDR, // So joining node uses same CIDR
 	}
 
 	// Include CF token so new peer can start its tunnel
@@ -1450,6 +2098,11 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	// Include WARP connector token so new peer can join WARP network
 	if warpToken != "" {
 		resp["warp_token"] = warpToken
+	}
+
+	// Include tunnel domain if configured
+	if a.tunnelDomain != "" {
+		resp["tunnel_domain"] = a.tunnelDomain
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1500,6 +2153,179 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 		"warp_enabled":    a.warpEnabled,
 		"warp_ip":         a.warpIP,
 		"system":          systemStats,
+	})
+}
+
+// apiClusterHealth godoc
+// @Summary Aggregate cluster health
+// @Description Returns health status from all nodes in the cluster
+// @Tags cluster
+// @Produce json
+// @Param node query string false "Filter by specific node name or ID"
+// @Success 200 {object} ClusterHealthResponse
+// @Router /cluster/health [get]
+func (a *Agent) apiClusterHealth(w http.ResponseWriter, r *http.Request) {
+	nodeFilter := r.URL.Query().Get("node")
+
+	// Get list of peers
+	a.stateMu.RLock()
+	peers := make([]*Peer, 0, len(a.state.Peers))
+	for _, p := range a.state.Peers {
+		peers = append(peers, p)
+	}
+	a.stateMu.RUnlock()
+
+	type NodeHealth struct {
+		ID        string                 `json:"id"`
+		Name      string                 `json:"name"`
+		MeshIP    string                 `json:"mesh_ip"`
+		Healthy   bool                   `json:"healthy"`
+		Status    string                 `json:"status"`
+		Workloads []string               `json:"workloads"`
+		System    map[string]interface{} `json:"system,omitempty"`
+		Error     string                 `json:"error,omitempty"`
+	}
+
+	var results []NodeHealth
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	// Check if we should include this node
+	includeLocal := nodeFilter == "" || nodeFilter == a.hwid || nodeFilter == a.hostname
+
+	// Get local node health
+	if includeLocal {
+		a.stateMu.RLock()
+		var localWorkloads []string
+		for _, wl := range a.state.Workloads {
+			if wl.Owner == a.hwid {
+				out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
+				status := "stopped"
+				if len(strings.TrimSpace(string(out))) > 0 {
+					status = "running"
+				}
+				localWorkloads = append(localWorkloads, fmt.Sprintf("%s:%s:%s", wl.Name, wl.MeshIP, status))
+			}
+		}
+		a.stateMu.RUnlock()
+
+		localHealth := NodeHealth{
+			ID:        a.hwid,
+			Name:      a.hostname,
+			MeshIP:    a.meshIP,
+			Healthy:   true,
+			Status:    getHealthStatus(),
+			Workloads: localWorkloads,
+			System:    a.getSystemStats(),
+		}
+		results = append(results, localHealth)
+	}
+
+	// Fetch health from peers concurrently
+	for _, peer := range peers {
+		// Check node filter
+		if nodeFilter != "" && nodeFilter != peer.ID && nodeFilter != peer.Name {
+			continue
+		}
+
+		wg.Add(1)
+		go func(p *Peer) {
+			defer wg.Done()
+
+			health := NodeHealth{
+				ID:      p.ID,
+				Name:    p.Name,
+				MeshIP:  p.MeshIP,
+				Healthy: p.Healthy,
+			}
+
+			if !p.Healthy {
+				health.Status = "unreachable"
+				health.Error = "peer marked unhealthy"
+				mu.Lock()
+				results = append(results, health)
+				mu.Unlock()
+				return
+			}
+
+			// Fetch health from peer
+			url := a.getPeerAPIURL(p, "/api/health")
+			resp, err := httpClient.Get(url)
+			if err != nil {
+				health.Status = "error"
+				health.Error = err.Error()
+				mu.Lock()
+				results = append(results, health)
+				mu.Unlock()
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != 200 {
+				health.Status = "error"
+				health.Error = fmt.Sprintf("status %d", resp.StatusCode)
+				mu.Lock()
+				results = append(results, health)
+				mu.Unlock()
+				return
+			}
+
+			var peerHealth map[string]interface{}
+			if err := json.NewDecoder(resp.Body).Decode(&peerHealth); err != nil {
+				health.Status = "error"
+				health.Error = "failed to decode response"
+				mu.Lock()
+				results = append(results, health)
+				mu.Unlock()
+				return
+			}
+
+			health.Status = fmt.Sprintf("%v", peerHealth["status"])
+			if wls, ok := peerHealth["workloads_local"].([]interface{}); ok {
+				for _, wl := range wls {
+					health.Workloads = append(health.Workloads, fmt.Sprintf("%v", wl))
+				}
+			}
+			if sys, ok := peerHealth["system"].(map[string]interface{}); ok {
+				health.System = sys
+			}
+
+			mu.Lock()
+			results = append(results, health)
+			mu.Unlock()
+		}(peer)
+	}
+
+	wg.Wait()
+
+	// Calculate cluster summary
+	totalNodes := len(results)
+	healthyNodes := 0
+	totalWorkloads := 0
+	for _, h := range results {
+		if h.Healthy && h.Status != "error" && h.Status != "unreachable" {
+			healthyNodes++
+		}
+		totalWorkloads += len(h.Workloads)
+	}
+
+	clusterStatus := "healthy"
+	if healthyNodes < totalNodes {
+		if healthyNodes == 0 {
+			clusterStatus = "degraded"
+		} else {
+			clusterStatus = "partial"
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"cluster_status":   clusterStatus,
+		"total_nodes":      totalNodes,
+		"healthy_nodes":    healthyNodes,
+		"total_workloads":  totalWorkloads,
+		"timestamp":        time.Now().UTC().Format(time.RFC3339),
+		"nodes":            results,
 	})
 }
 
@@ -2042,124 +2868,6 @@ func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// apiTokenSync receives a token from another node (for cluster-wide token availability)
-// Also handles token deletion when "delete" field is set.
-func (a *Agent) apiTokenSync(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Token     string    `json:"token"`
-		ExpiresAt time.Time `json:"expires_at"`
-		Delete    string    `json:"delete,omitempty"` // Token to delete (if set)
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-
-	a.stateMu.Lock()
-	if req.Delete != "" {
-		// Delete a consumed token
-		delete(a.state.Tokens, req.Delete)
-	} else if req.Token != "" && time.Now().Before(req.ExpiresAt) {
-		// Add new token if not expired
-		if _, exists := a.state.Tokens[req.Token]; !exists {
-			a.state.Tokens[req.Token] = &Token{
-				Token:     req.Token,
-				ExpiresAt: req.ExpiresAt,
-			}
-		}
-	}
-	a.stateMu.Unlock()
-	a.saveState()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
-// broadcastToken sends a new token to all peers so any node can validate join requests.
-// This is critical when using Cloudflare tunnel - the join request may hit any node.
-func (a *Agent) broadcastToken(tok *Token) {
-	data, _ := json.Marshal(tok)
-
-	// In tunnel-only mode, broadcast to tunnel (gossip will propagate)
-	if a.tunnelDomain != "" {
-		url := a.getTunnelAPIURL("/api/token/sync")
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
-		if err != nil {
-			log.Printf("Failed to broadcast token: %v", err)
-		} else {
-			resp.Body.Close()
-		}
-		return
-	}
-
-	// Direct mode: send to each peer
-	a.stateMu.RLock()
-	peers := make([]*Peer, 0)
-	for _, p := range a.state.Peers {
-		if p.Healthy {
-			peers = append(peers, p)
-		}
-	}
-	a.stateMu.RUnlock()
-
-	for _, peer := range peers {
-		url := fmt.Sprintf("http://%s:%d/api/token/sync", peer.MeshIP, a.apiPort)
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
-		if err != nil {
-			log.Printf("Failed to broadcast token to %s: %v", peer.Name, err)
-			continue
-		}
-		resp.Body.Close()
-	}
-}
-
-// broadcastTokenDeletion tells all peers to delete a consumed token.
-func (a *Agent) broadcastTokenDeletion(tokenStr string) {
-	data, _ := json.Marshal(map[string]string{"delete": tokenStr})
-
-	// In tunnel-only mode, broadcast to tunnel
-	if a.tunnelDomain != "" {
-		url := a.getTunnelAPIURL("/api/token/sync")
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
-		if err == nil {
-			resp.Body.Close()
-		}
-		return
-	}
-
-	// Direct mode: send to each peer
-	a.stateMu.RLock()
-	peers := make([]*Peer, 0)
-	for _, p := range a.state.Peers {
-		if p.Healthy {
-			peers = append(peers, p)
-		}
-	}
-	a.stateMu.RUnlock()
-
-	for _, peer := range peers {
-		url := fmt.Sprintf("http://%s:%d/api/token/sync", peer.MeshIP, a.apiPort)
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
-		if err != nil {
-			continue
-		}
-		resp.Body.Close()
-	}
-}
-
-// cleanupExpiredTokens removes tokens that have expired from state.
-func (a *Agent) cleanupExpiredTokens() {
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
-
-	now := time.Now()
-	for k, tok := range a.state.Tokens {
-		if now.After(tok.ExpiresAt) {
-			delete(a.state.Tokens, k)
-		}
-	}
-}
-
 // =============================================================================
 // Docker Compose
 // =============================================================================
@@ -2325,7 +3033,6 @@ func (a *Agent) gossipLoop() {
 		case <-tick.C:
 			a.checkPeers()
 			a.syncWorkloads()
-			a.cleanupExpiredTokens()
 		}
 	}
 }
@@ -2706,10 +3413,20 @@ func (a *Agent) checkFailover() {
 // shouldClaim determines if this node should claim an orphaned workload.
 // NOTE: Caller must already hold stateMu lock.
 func (a *Agent) shouldClaim(wl *Workload) bool {
-	// Deterministic: lowest healthy node ID wins
-	candidates := []string{a.hwid}
+	// First check if this node is even allowed to run the workload
+	if !a.isThisNodeAllowed(wl) {
+		return false
+	}
+
+	// Deterministic: lowest healthy node ID that is allowed wins
+	var candidates []string
+
+	// Add ourselves if allowed (we already checked above)
+	candidates = append(candidates, a.hwid)
+
+	// Add healthy peers that are allowed
 	for _, p := range a.state.Peers {
-		if p.Healthy {
+		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name) {
 			candidates = append(candidates, p.ID)
 		}
 	}
