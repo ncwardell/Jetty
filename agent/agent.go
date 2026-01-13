@@ -318,6 +318,10 @@ func (a *Agent) configureWarpRuntime(token string) error {
 			if err := a.initWarpRules(); err != nil {
 				log.Printf("Warning: failed to init WARP rules: %v", err)
 			}
+
+			// Announce our IP to other peers so they can reach us
+			go a.announceOurIP()
+
 			return nil
 		}
 	}
@@ -3405,6 +3409,26 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 		}
 		resp.Body.Close()
 	}
+}
+
+// announceOurIP sends our current IP to all known peers.
+// Called after WARP connects so peers can update our address.
+func (a *Agent) announceOurIP() {
+	if a.ip == "" {
+		return
+	}
+
+	self := &Peer{
+		ID:         a.hwid,
+		Name:       a.hostname,
+		IP:         a.ip,
+		TunnelHost: a.tunnelHost,
+		Healthy:    true,
+		LastSeen:   time.Now(),
+	}
+
+	log.Printf("Announcing our IP (%s) to cluster...", a.ip)
+	a.announcePeer(self)
 }
 
 // =============================================================================
