@@ -2,7 +2,6 @@ package agent
 
 import (
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -21,9 +20,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/gorilla/websocket"
 	httpSwagger "github.com/swaggo/http-swagger"
-	"golang.org/x/crypto/curve25519"
 )
 
 // Shared HTTP client with timeout to prevent blocking on hung peers
@@ -31,20 +28,8 @@ var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
 }
 
-// WebSocket upgrader for WireGuard tunnel
-var wsUpgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
 // Valid workload name pattern (alphanumeric, dash, underscore only)
 var validNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-
-// WGPacket represents a WireGuard UDP packet sent through the WebSocket tunnel
-type WGPacket struct {
-	FromID string `json:"from"` // Sender's HWID
-	ToID   string `json:"to"`   // Target peer's HWID
-	Data   []byte `json:"data"` // Raw UDP payload (WireGuard encrypted)
-}
 
 // =============================================================================
 // Types
@@ -95,15 +80,12 @@ type Agent struct {
 	hostname string
 	meshIP   string
 
-	// WireGuard
-	wgPrivKey  string
-	wgPubKey   string
-	wgPort     int
-	wgDisabled bool // True if using dummy interface (no WireGuard kernel module)
-
 	// Cloudflare WARP
 	warpIP      string // WARP IP address (CGNAT range, e.g., "100.96.x.x")
 	warpEnabled bool   // Whether WARP mode is active
+
+	// Cloudflare tunnel (for WARP private network routes)
+	cfTunnelID string // WARP connector tunnel ID (for route management)
 
 	// Config
 	dataDir       string
@@ -112,7 +94,7 @@ type Agent struct {
 	joinURL       string
 	joinTok       string
 	clusterSecret string // Shared secret all nodes must have to join
-	tunnelDomain  string // Cloudflare tunnel domain for tunnel-only mode (no WG port forwarding needed)
+	tunnelDomain  string // Cloudflare tunnel domain for API access
 	tunnelHost    string // This node's specific tunnel hostname (e.g., "node1.cluster.example.com")
 
 	// State
@@ -131,21 +113,7 @@ type Agent struct {
 	// Runtime
 	startTime time.Time // When Jetty started (for uptime tracking)
 
-	// WebSocket WireGuard tunnel (for tunnel-only mode)
-	wgRelays     map[string]*udpRelay // peerID -> local UDP relay
-	wgRelaysMu   sync.RWMutex
-	wgLocalConn  *net.UDPConn // Local UDP socket to inject packets into WireGuard
-	wgRelayBase  int          // Base port for UDP relays (51821, 51822, etc.)
-
 	stopCh chan struct{}
-}
-
-// udpRelay captures UDP packets destined for a peer and forwards via WebSocket
-type udpRelay struct {
-	peerID   string
-	conn     *net.UDPConn
-	localPort int
-	stopCh   chan struct{}
 }
 
 func New() (*Agent, error) {
@@ -154,27 +122,25 @@ func New() (*Agent, error) {
 
 	a := &Agent{
 		hostname:      getHostname(),
-		wgPort:        getEnvInt("JETTY_WG_PORT", 51820),
 		dataDir:       dataDir,
 		apiPort:       getEnvInt("JETTY_API_PORT", 8080),
 		meshCIDR:      getEnv("JETTY_MESH_CIDR", "10.100.0.0/16"),
 		joinURL:       getEnv("JETTY_JOIN", ""),
 		joinTok:       getEnv("JETTY_TOKEN", ""),
 		clusterSecret: getEnv("JETTY_SECRET", ""),
-		tunnelDomain:  getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - enables tunnel-only mode
+		tunnelDomain:  getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - Cloudflare tunnel for API access
 		tunnelHost:    getEnv("JETTY_TUNNEL_HOST", ""),   // e.g., "node1.cluster.example.com" - this node's specific subdomain
+		cfTunnelID:    getEnv("JETTY_CF_TUNNEL_ID", ""),  // WARP connector tunnel ID for route management
 		composeDir:    filepath.Join(dataDir, "compose"),
 		hostsFile:     "/etc/hosts",
 		state: &State{
 			Peers:     make(map[string]*Peer),
 			Workloads: make(map[string]*Workload),
 			Tokens:    make(map[string]*Token),
-			CFToken:   getEnv("JETTY_CF_TOKEN", ""),            // Bootstrap tunnel token
+			CFToken:   getEnv("JETTY_CF_TOKEN", ""),             // Bootstrap tunnel token
 			WarpToken: getEnv("JETTY_WARP_CONNECTOR_TOKEN", ""), // Bootstrap WARP connector token
 		},
-		wgRelays:    make(map[string]*udpRelay),
-		wgRelayBase: 51821, // Start relay ports from 51821
-		stopCh:      make(chan struct{}),
+		stopCh: make(chan struct{}),
 	}
 
 	os.MkdirAll(a.composeDir, 0755)
@@ -192,16 +158,15 @@ func (a *Agent) Start() error {
 	// Detect WARP IP if WARP is enabled
 	a.detectWarpIP()
 
-	// Init WireGuard (for local workload routing)
-	// In tunnel-only mode, WG is still used for local mesh IP routing but not for inter-node traffic
-	if err := a.initWireGuard(); err != nil {
-		return fmt.Errorf("wireguard: %w", err)
+	// Init network interface (dummy interface for local mesh IP binding)
+	if err := a.initNetwork(); err != nil {
+		return fmt.Errorf("network: %w", err)
 	}
 
-	// In tunnel-only mode, start the local UDP socket for packet injection
-	if a.tunnelDomain != "" {
-		if err := a.initWGTunnel(); err != nil {
-			return fmt.Errorf("wg tunnel: %w", err)
+	// Init WARP nft rules if WARP is enabled
+	if a.warpEnabled {
+		if err := a.initWarpRules(); err != nil {
+			log.Printf("Warning: failed to init WARP rules: %v", err)
 		}
 	}
 
@@ -239,19 +204,12 @@ func (a *Agent) Start() error {
 	// Start failover monitor
 	go a.failoverLoop()
 
-	mode := "wireguard"
-	if a.wgDisabled {
-		mode = "dummy (local only)"
-	}
-	if a.tunnelDomain != "" {
-		if a.wgDisabled {
-			mode = "tunnel-only (" + a.tunnelDomain + ") [dummy + HTTP proxy]"
-		} else {
-			mode = "tunnel-only (" + a.tunnelDomain + ") [WebSocket UDP tunnel]"
-		}
-	}
+	mode := "local-only"
 	if a.warpEnabled {
 		mode = "warp (" + a.warpIP + ")"
+	}
+	if a.tunnelDomain != "" {
+		mode += " + tunnel (" + a.tunnelDomain + ")"
 	}
 	log.Printf("Jetty started: %s (%s) @ %s [mode: %s]", a.hostname, a.hwid[:12], a.meshIP, mode)
 	return nil
@@ -294,14 +252,57 @@ func (a *Agent) detectWarpIP() {
 	}
 }
 
+// =============================================================================
+// WARP Private Network Routes (via cloudflared CLI)
+// =============================================================================
+
+// registerWarpRoute adds a private network route for a mesh IP using cloudflared CLI.
+// This allows WARP clients to reach the workload through the tunnel.
+func (a *Agent) registerWarpRoute(meshIP string) error {
+	if a.cfTunnelID == "" {
+		return nil // WARP route management not configured
+	}
+
+	// Use cloudflared tunnel route command
+	cmd := exec.Command("cloudflared", "tunnel", "route", "ip", "add", meshIP+"/32", a.cfTunnelID)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Ignore "already exists" errors
+		if strings.Contains(string(output), "already exists") {
+			log.Printf("WARP route for %s already exists", meshIP)
+			return nil
+		}
+		return fmt.Errorf("cloudflared route add: %s", output)
+	}
+
+	log.Printf("WARP route registered: %s -> tunnel %s", meshIP, a.cfTunnelID[:8])
+	return nil
+}
+
+// unregisterWarpRoute removes a private network route for a mesh IP.
+func (a *Agent) unregisterWarpRoute(meshIP string) error {
+	if a.cfTunnelID == "" {
+		return nil // WARP route management not configured
+	}
+
+	cmd := exec.Command("cloudflared", "tunnel", "route", "ip", "delete", meshIP+"/32")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Ignore "not found" errors
+		if strings.Contains(string(output), "not found") {
+			return nil
+		}
+		return fmt.Errorf("cloudflared route delete: %s", output)
+	}
+
+	log.Printf("WARP route unregistered: %s", meshIP)
+	return nil
+}
+
 func (a *Agent) Stop() {
 	log.Printf("Shutting down Jetty...")
 	close(a.stopCh)
 	a.stopCloudflared()
-	a.stopUDPRelays()
-	if a.wgLocalConn != nil {
-		a.wgLocalConn.Close()
-	}
 	a.saveState()
 
 	// Clean up network resources
@@ -330,9 +331,14 @@ func (a *Agent) cleanupNetwork() {
 					}
 				}
 			}
+			// Remove WARP nft rule for this workload
+			a.removeWarpRule(wl.MeshIP)
 		}
 	}
 	a.stateMu.RUnlock()
+
+	// Remove WARP nft rule for our own mesh IP
+	a.removeWarpRule(a.meshIP)
 
 	// Remove jetty0 interface (this also removes all IPs bound to it)
 	if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
@@ -370,71 +376,17 @@ func (a *Agent) loadOrCreateHWID() string {
 }
 
 // =============================================================================
-// Network Interface (WireGuard or Dummy fallback)
+// Network Interface (Dummy interface for mesh IP binding)
 // =============================================================================
 
-func (a *Agent) initWireGuard() error {
-	keyFile := filepath.Join(a.dataDir, "wg_private_key")
-
-	// Load or generate keys (still useful for peer identity even without WG)
-	if data, err := os.ReadFile(keyFile); err == nil {
-		a.wgPrivKey = strings.TrimSpace(string(data))
-		a.wgPubKey = derivePubKey(a.wgPrivKey)
-	} else {
-		a.wgPrivKey, a.wgPubKey = genKeyPair()
-		os.WriteFile(keyFile, []byte(a.wgPrivKey), 0600)
-	}
-
-	// Derive mesh IP
+// initNetwork creates a dummy interface for local mesh IP binding.
+// WARP handles all inter-node connectivity through Cloudflare's network.
+func (a *Agent) initNetwork() error {
+	// Derive mesh IP from HWID
 	a.meshIP = a.deriveMeshIP(a.hwid)
 
 	// Clean up any existing interface
 	exec.Command("ip", "link", "del", "jetty0").Run()
-
-	// Try WireGuard first
-	if err := a.tryWireGuard(keyFile); err != nil {
-		log.Printf("WireGuard not available (%v), using dummy interface", err)
-		if err := a.initDummyInterface(); err != nil {
-			return err
-		}
-	}
-
-	// Enable forwarding
-	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
-
-	return nil
-}
-
-// tryWireGuard attempts to create a WireGuard interface
-func (a *Agent) tryWireGuard(keyFile string) error {
-	// Try to create WireGuard interface
-	if err := exec.Command("ip", "link", "add", "dev", "jetty0", "type", "wireguard").Run(); err != nil {
-		return fmt.Errorf("create interface: %w", err)
-	}
-
-	// Configure WireGuard
-	if err := exec.Command("wg", "set", "jetty0",
-		"listen-port", fmt.Sprintf("%d", a.wgPort),
-		"private-key", keyFile).Run(); err != nil {
-		// Clean up failed interface
-		exec.Command("ip", "link", "del", "jetty0").Run()
-		return fmt.Errorf("configure wg: %w", err)
-	}
-
-	// Add IP and bring up
-	_, network, _ := net.ParseCIDR(a.meshCIDR)
-	pfx, _ := network.Mask.Size()
-	exec.Command("ip", "addr", "add", fmt.Sprintf("%s/%d", a.meshIP, pfx), "dev", "jetty0").Run()
-	exec.Command("ip", "link", "set", "up", "dev", "jetty0").Run()
-
-	log.Printf("WireGuard up: %s", a.meshIP)
-	return nil
-}
-
-// initDummyInterface creates a dummy interface for local IP binding
-// Used when WireGuard kernel module is not available
-func (a *Agent) initDummyInterface() error {
-	a.wgDisabled = true
 
 	// Create dummy interface
 	if err := exec.Command("ip", "link", "add", "dev", "jetty0", "type", "dummy").Run(); err != nil {
@@ -447,58 +399,54 @@ func (a *Agent) initDummyInterface() error {
 	exec.Command("ip", "addr", "add", fmt.Sprintf("%s/%d", a.meshIP, pfx), "dev", "jetty0").Run()
 	exec.Command("ip", "link", "set", "up", "dev", "jetty0").Run()
 
-	log.Printf("Dummy interface up: %s (WireGuard disabled, use tunnel/WARP for inter-node)", a.meshIP)
+	// Enable forwarding
+	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
+
+	log.Printf("Network interface up: %s (using WARP for inter-node connectivity)", a.meshIP)
 	return nil
 }
 
-func (a *Agent) addWGPeer(p *Peer) {
-	// Skip WireGuard operations if using dummy interface
-	if a.wgDisabled {
-		return
+// initWarpRules sets up nftables rules for WARP traffic routing.
+// This includes:
+// 1. Masquerade rule for response routing through CloudflareWARP
+// 2. Route for WARP client IP range (100.96.0.0/12)
+func (a *Agent) initWarpRules() error {
+	// Add masquerade rule for traffic going out through CloudflareWARP
+	// This ensures responses from our mesh IPs route back through WARP
+	if err := exec.Command("nft", "add", "rule", "ip", "nat", "POSTROUTING",
+		"oifname", "CloudflareWARP", "masquerade").Run(); err != nil {
+		log.Printf("Warning: failed to add WARP masquerade rule: %v", err)
 	}
 
-	if p.PublicKey == a.wgPubKey {
-		return
+	// Add route for WARP client IP range to CloudflareWARP interface
+	// This ensures we can reach other WARP clients
+	exec.Command("ip", "route", "add", "100.96.0.0/12", "dev", "CloudflareWARP").Run()
+
+	// Add accept rule for our own mesh IP in the cloudflare-warp nft table
+	// This allows traffic originating from our mesh IP to pass through
+	if err := a.addWarpRule(a.meshIP); err != nil {
+		log.Printf("Warning: failed to add WARP rule for mesh IP: %v", err)
 	}
 
-	// Add peer's mesh IP
-	allowedIPs := p.MeshIP + "/32"
-
-	// Also add any workload IPs owned by this peer
-	a.stateMu.RLock()
-	for _, w := range a.state.Workloads {
-		if w.Owner == p.ID && w.MeshIP != "" {
-			allowedIPs += "," + w.MeshIP + "/32"
-		}
-	}
-	a.stateMu.RUnlock()
-
-	args := []string{"set", "jetty0", "peer", p.PublicKey,
-		"allowed-ips", allowedIPs,
-		"persistent-keepalive", "25"}
-
-	// In tunnel-only mode, use local UDP relay instead of real endpoint
-	if a.tunnelDomain != "" {
-		relayEndpoint, err := a.getRelayEndpoint(p.ID)
-		if err != nil {
-			log.Printf("Failed to create relay for peer %s: %v", p.Name, err)
-		} else {
-			args = append(args, "endpoint", relayEndpoint)
-		}
-	} else if p.Endpoint != "" {
-		args = append(args, "endpoint", p.Endpoint)
-	}
-
-	exec.Command("wg", args...).Run()
+	log.Printf("WARP nft rules initialized")
+	return nil
 }
 
-func (a *Agent) updateWGPeers() {
-	a.stateMu.RLock()
-	defer a.stateMu.RUnlock()
+// addWarpRule adds an nft accept rule for a mesh IP in the cloudflare-warp table.
+// This allows traffic from the specified IP to pass through WARP's firewall rules.
+func (a *Agent) addWarpRule(meshIP string) error {
+	// Insert rule at the beginning of the tun chain to allow traffic from this mesh IP
+	// The cloudflare-warp table restricts traffic to only WARP source IPs by default
+	return exec.Command("nft", "insert", "rule", "inet", "cloudflare-warp", "tun",
+		"ip", "saddr", meshIP, "accept").Run()
+}
 
-	for _, p := range a.state.Peers {
-		a.addWGPeer(p)
-	}
+// removeWarpRule removes an nft accept rule for a mesh IP.
+func (a *Agent) removeWarpRule(meshIP string) error {
+	// Find and delete the rule for this mesh IP
+	// Note: This uses a simple approach - in production you might want to track rule handles
+	return exec.Command("nft", "delete", "rule", "inet", "cloudflare-warp", "tun",
+		"ip", "saddr", meshIP, "accept").Run()
 }
 
 func (a *Agent) deriveMeshIP(id string) string {
@@ -560,11 +508,11 @@ func (a *Agent) updateHosts() {
 	jettyLines = append(jettyLines, "# JETTY START - managed by jetty, do not edit")
 
 	// Add mode indicator
+	if a.warpEnabled {
+		jettyLines = append(jettyLines, "# Mode: WARP mesh")
+	}
 	if a.tunnelDomain != "" {
-		jettyLines = append(jettyLines, fmt.Sprintf("# Mode: tunnel-only (%s)", a.tunnelDomain))
-		jettyLines = append(jettyLines, "# Note: Remote workloads accessible via /api/proxy/{mesh_ip}/")
-	} else {
-		jettyLines = append(jettyLines, "# Mode: wireguard mesh")
+		jettyLines = append(jettyLines, fmt.Sprintf("# Tunnel: %s", a.tunnelDomain))
 	}
 
 	// Add self
@@ -606,17 +554,13 @@ func (a *Agent) updateHosts() {
 func (a *Agent) joinCluster() error {
 	log.Printf("Joining cluster via %s", a.joinURL)
 
-	publicIP := getPublicIP()
-
 	req := map[string]string{
 		"token":       a.joinTok,
 		"secret":      a.clusterSecret,
 		"id":          a.hwid,
 		"name":        a.hostname,
 		"mesh_ip":     a.meshIP,
-		"endpoint":    fmt.Sprintf("%s:%d", publicIP, a.wgPort),
-		"public_key":  a.wgPubKey,
-		"tunnel_host": a.tunnelHost, // Our specific subdomain for direct WG packet routing
+		"tunnel_host": a.tunnelHost, // Our specific subdomain for direct API routing
 		"warp_ip":     a.warpIP,     // Cloudflare WARP IP for L3 connectivity
 	}
 
@@ -658,7 +602,6 @@ func (a *Agent) joinCluster() error {
 	}
 	a.stateMu.Unlock()
 
-	a.updateWGPeers()
 	a.saveState()
 
 	// Start cloudflared if we received a token
@@ -689,16 +632,14 @@ func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 
 		// Public endpoints that don't require API key
 		publicPaths := []string{
-			"/api/health",      // Monitoring
-			"/api/join",        // Node joining (uses token + secret in body)
-			"/api/sync",        // Internal cluster sync (uses secret in body)
+			"/api/health",        // Monitoring
+			"/api/join",          // Node joining (uses token + secret in body)
+			"/api/sync",          // Internal cluster sync (uses secret in body)
 			"/api/peer-announce", // Internal peer announcement
-			"/api/heartbeat",   // Internal heartbeat
-			"/api/tunnel/sync", // Internal tunnel sync
-			"/api/token/sync",  // Internal token sync
-			"/api/ws/wg",       // WireGuard WebSocket tunnel
-			"/api/wg/packet",   // WireGuard HTTP tunnel
-			"/swagger/",        // API documentation
+			"/api/heartbeat",     // Internal heartbeat
+			"/api/tunnel/sync",   // Internal tunnel sync
+			"/api/token/sync",    // Internal token sync
+			"/swagger/",          // API documentation
 		}
 
 		path := r.URL.Path
@@ -748,8 +689,6 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 	r.HandleFunc("/api/heartbeat", a.apiHeartbeat).Methods("POST")
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)
-	r.HandleFunc("/api/ws/wg", a.wsWireGuard)                     // WebSocket endpoint for WG packets
-	r.HandleFunc("/api/wg/packet", a.apiWGPacket).Methods("POST") // HTTP fallback for WG packets
 
 	// Swagger UI
 	r.PathPrefix("/swagger/").Handler(httpSwagger.WrapHandler)
@@ -784,18 +723,13 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 
 	resp := map[string]interface{}{
 		"node": map[string]interface{}{
-			"id":         a.hwid,
-			"name":       a.hostname,
-			"mesh_ip":    a.meshIP,
-			"public_key": a.wgPubKey,
-			"warp_ip":    a.warpIP,
+			"id":      a.hwid,
+			"name":    a.hostname,
+			"mesh_ip": a.meshIP,
+			"warp_ip": a.warpIP,
 		},
 		"peers":     peers,
 		"workloads": workloads,
-		"wireguard": map[string]interface{}{
-			"enabled": !a.wgDisabled,
-			"mode":    func() string { if a.wgDisabled { return "dummy" } else { return "kernel" } }(),
-		},
 		"tunnel": map[string]interface{}{
 			"configured": hasTunnel,
 			"running":    a.isTunnelRunning(),
@@ -890,9 +824,15 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.updateHosts()
-	a.updateWGPeers()
 	a.saveState()
 	a.broadcastState()
+
+	// Add WARP nft rule for this workload's mesh IP
+	if a.warpEnabled {
+		if err := a.addWarpRule(wl.MeshIP); err != nil {
+			log.Printf("Warning: failed to add WARP rule for %s: %v", wl.MeshIP, err)
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(wl)
@@ -1152,6 +1092,11 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 	// Remove if we're running it
 	if found.Owner == a.hwid {
 		a.removeWorkload(found)
+
+		// Unregister WARP route for this workload
+		if err := a.unregisterWarpRoute(found.MeshIP); err != nil {
+			log.Printf("Warning: failed to unregister WARP route for %s: %v", found.MeshIP, err)
+		}
 	}
 
 	a.updateHosts()
@@ -1227,6 +1172,11 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	// Remove locally if we own it
 	if found.Owner == a.hwid {
 		a.removeWorkload(found)
+
+		// Unregister WARP route (target will register its own)
+		if err := a.unregisterWarpRoute(found.MeshIP); err != nil {
+			log.Printf("Warning: failed to unregister WARP route for %s: %v", found.MeshIP, err)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1463,8 +1413,6 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		ID:         a.hwid,
 		Name:       a.hostname,
 		MeshIP:     a.meshIP,
-		Endpoint:   fmt.Sprintf("%s:%d", getPublicIP(), a.wgPort),
-		PublicKey:  a.wgPubKey,
 		TunnelHost: a.tunnelHost,
 		WarpIP:     a.warpIP,
 		Healthy:    true,
@@ -1483,7 +1431,6 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	warpToken := a.state.WarpToken
 	a.stateMu.Unlock()
 
-	a.addWGPeer(peer)
 	a.updateHosts()
 	a.saveState()
 
@@ -1550,7 +1497,7 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 		"timestamp":       time.Now().UTC().Format(time.RFC3339),
 		"workloads_local": localWorkloads,
 		"workloads_total": totalWorkloads,
-		"wireguard_mode":  func() string { if a.wgDisabled { return "dummy" } else { return "kernel" } }(),
+		"warp_enabled":    a.warpEnabled,
 		"warp_ip":         a.warpIP,
 		"system":          systemStats,
 	})
@@ -1882,7 +1829,6 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	a.state.Peers[req.Peer.ID] = &req.Peer
 	a.stateMu.Unlock()
 
-	a.addWGPeer(&req.Peer)
 	a.updateHosts()
 	a.saveState()
 
@@ -2237,6 +2183,11 @@ func (a *Agent) autostartWorkloads() {
 	for _, wl := range toStart {
 		if err := a.deployWorkload(wl); err != nil {
 			log.Printf("Failed to auto-start %s: %v", wl.Name, err)
+		} else {
+			// Register WARP route for successfully started workload
+			if err := a.registerWarpRoute(wl.MeshIP); err != nil {
+				log.Printf("Warning: failed to register WARP route for %s: %v", wl.MeshIP, err)
+			}
 		}
 	}
 }
@@ -2740,7 +2691,12 @@ func (a *Agent) checkFailover() {
 					log.Printf("Failover deploy failed: %v", err)
 				}
 				a.updateHosts()
-				a.updateWGPeers()
+				// Add WARP nft rule for this workload
+				if a.warpEnabled {
+					if err := a.addWarpRule(w.MeshIP); err != nil {
+						log.Printf("Warning: failed to add WARP rule for %s: %v", w.MeshIP, err)
+					}
+				}
 				a.saveState()
 			}(wl)
 		}
@@ -2804,8 +2760,18 @@ func (a *Agent) loadState() {
 	}
 	a.stateMu.Unlock()
 
-	// Reconnect WG peers
-	a.updateWGPeers()
+	// Add WARP nft rules for owned workloads
+	if a.warpEnabled {
+		a.stateMu.RLock()
+		for _, w := range a.state.Workloads {
+			if w.Owner == a.hwid {
+				if err := a.addWarpRule(w.MeshIP); err != nil {
+					log.Printf("Warning: failed to add WARP rule for %s: %v", w.MeshIP, err)
+				}
+			}
+		}
+		a.stateMu.RUnlock()
+	}
 
 	log.Printf("Loaded: %d peers, %d workloads", len(a.state.Peers), len(a.state.Workloads))
 }
@@ -2958,241 +2924,6 @@ func (a *Agent) isTunnelRunning() bool {
 }
 
 // =============================================================================
-// WebSocket WireGuard Tunnel
-// =============================================================================
-
-// initWGTunnel initializes the WebSocket tunnel for WireGuard packets.
-// This creates a local UDP socket that can inject packets into the WireGuard interface.
-func (a *Agent) initWGTunnel() error {
-	// Create local UDP socket for injecting packets into WireGuard
-	// We'll send packets TO WireGuard's listen port from various source ports
-	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return err
-	}
-	a.wgLocalConn = conn
-
-	log.Printf("WG tunnel initialized (injection socket: %s)", conn.LocalAddr())
-	return nil
-}
-
-// wsWireGuard handles WebSocket connections for WireGuard packet relay.
-// Packets received here are injected into the local WireGuard interface.
-func (a *Agent) wsWireGuard(w http.ResponseWriter, r *http.Request) {
-	conn, err := wsUpgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("WebSocket upgrade failed: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	log.Printf("WG WebSocket connection from %s", r.RemoteAddr)
-
-	for {
-		_, data, err := conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WG WebSocket error: %v", err)
-			}
-			return
-		}
-
-		var pkt WGPacket
-		if err := json.Unmarshal(data, &pkt); err != nil {
-			continue
-		}
-
-		// Check if this packet is for us
-		if pkt.ToID == a.hwid {
-			a.injectWGPacket(pkt.FromID, pkt.Data)
-		}
-		// In tunnel mode, we don't forward - let the sender retry through the tunnel
-	}
-}
-
-// apiWGPacket handles HTTP POST for WireGuard packets (fallback when WebSocket isn't available).
-func (a *Agent) apiWGPacket(w http.ResponseWriter, r *http.Request) {
-	var pkt WGPacket
-	if err := json.NewDecoder(r.Body).Decode(&pkt); err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-
-	// Check if this packet is for us
-	if pkt.ToID == a.hwid {
-		a.injectWGPacket(pkt.FromID, pkt.Data)
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// Not for us - forward through tunnel
-	if a.tunnelDomain != "" {
-		go a.forwardWGPacket(&pkt)
-	}
-	w.WriteHeader(http.StatusAccepted)
-}
-
-// injectWGPacket injects a received WireGuard packet into the local interface.
-// The packet is sent to WireGuard's listen port as if it came from the peer.
-func (a *Agent) injectWGPacket(fromID string, data []byte) {
-	if a.wgLocalConn == nil {
-		return
-	}
-
-	// Send to WireGuard's listen port
-	wgAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", a.wgPort))
-	if err != nil {
-		return
-	}
-
-	_, err = a.wgLocalConn.WriteToUDP(data, wgAddr)
-	if err != nil {
-		log.Printf("Failed to inject WG packet from %s: %v", fromID[:12], err)
-	}
-}
-
-// createUDPRelay creates a UDP relay for a peer in tunnel-only mode.
-// WireGuard sends packets to this relay, which forwards them via WebSocket.
-func (a *Agent) createUDPRelay(peerID string) (*udpRelay, error) {
-	a.wgRelaysMu.Lock()
-	defer a.wgRelaysMu.Unlock()
-
-	// Check if relay already exists
-	if relay, exists := a.wgRelays[peerID]; exists {
-		return relay, nil
-	}
-
-	// Find next available port
-	port := a.wgRelayBase + len(a.wgRelays)
-
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", port))
-	if err != nil {
-		return nil, err
-	}
-
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return nil, err
-	}
-
-	relay := &udpRelay{
-		peerID:    peerID,
-		conn:      conn,
-		localPort: port,
-		stopCh:    make(chan struct{}),
-	}
-
-	a.wgRelays[peerID] = relay
-
-	// Start relay goroutine
-	go a.runUDPRelay(relay)
-
-	log.Printf("Created UDP relay for peer %s on port %d", peerID[:12], port)
-	return relay, nil
-}
-
-// runUDPRelay reads packets from the local UDP relay and forwards them via the tunnel.
-func (a *Agent) runUDPRelay(relay *udpRelay) {
-	buf := make([]byte, 65535)
-
-	for {
-		select {
-		case <-relay.stopCh:
-			return
-		case <-a.stopCh:
-			return
-		default:
-		}
-
-		relay.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, _, err := relay.conn.ReadFromUDP(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			continue
-		}
-
-		// Create packet and send through tunnel
-		pkt := &WGPacket{
-			FromID: a.hwid,
-			ToID:   relay.peerID,
-			Data:   make([]byte, n),
-		}
-		copy(pkt.Data, buf[:n])
-
-		go a.sendWGPacket(pkt)
-	}
-}
-
-// sendWGPacket sends a WireGuard packet through the Cloudflare tunnel.
-// If the target peer has a specific TunnelHost, send directly to that subdomain.
-// Otherwise, fall back to the general tunnel domain (random routing).
-func (a *Agent) sendWGPacket(pkt *WGPacket) {
-	if a.tunnelDomain == "" {
-		return
-	}
-
-	data, err := json.Marshal(pkt)
-	if err != nil {
-		return
-	}
-
-	// Look up peer's specific tunnel host for direct routing
-	var targetHost string
-	a.stateMu.RLock()
-	if peer, ok := a.state.Peers[pkt.ToID]; ok && peer.TunnelHost != "" {
-		targetHost = peer.TunnelHost
-	}
-	a.stateMu.RUnlock()
-
-	// Fall back to general tunnel domain if peer has no specific host
-	if targetHost == "" {
-		targetHost = a.tunnelDomain
-	}
-
-	// Try HTTP POST (more reliable through CF tunnel than WebSocket)
-	url := fmt.Sprintf("https://%s/api/wg/packet", targetHost)
-	resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
-	if err != nil {
-		// Log occasionally, not every packet
-		return
-	}
-	resp.Body.Close()
-}
-
-// forwardWGPacket forwards a packet through the tunnel (when we receive a packet not meant for us).
-func (a *Agent) forwardWGPacket(pkt *WGPacket) {
-	a.sendWGPacket(pkt)
-}
-
-// stopUDPRelays stops all UDP relays.
-func (a *Agent) stopUDPRelays() {
-	a.wgRelaysMu.Lock()
-	defer a.wgRelaysMu.Unlock()
-
-	for _, relay := range a.wgRelays {
-		close(relay.stopCh)
-		relay.conn.Close()
-	}
-	a.wgRelays = make(map[string]*udpRelay)
-}
-
-// getRelayEndpoint returns the local relay endpoint for a peer in tunnel-only mode.
-func (a *Agent) getRelayEndpoint(peerID string) (string, error) {
-	relay, err := a.createUDPRelay(peerID)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("127.0.0.1:%d", relay.localPort), nil
-}
-
-// =============================================================================
 // Helpers
 // =============================================================================
 
@@ -3282,29 +3013,4 @@ func genID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return hex.EncodeToString(b)
-}
-
-func genKeyPair() (priv, pub string) {
-	var privKey [32]byte
-	rand.Read(privKey[:])
-	privKey[0] &= 248
-	privKey[31] &= 127
-	privKey[31] |= 64
-
-	var pubKey [32]byte
-	curve25519.ScalarBaseMult(&pubKey, &privKey)
-
-	return base64.StdEncoding.EncodeToString(privKey[:]),
-		base64.StdEncoding.EncodeToString(pubKey[:])
-}
-
-func derivePubKey(priv string) string {
-	b, _ := base64.StdEncoding.DecodeString(priv)
-	if len(b) != 32 {
-		return ""
-	}
-	var privKey, pubKey [32]byte
-	copy(privKey[:], b)
-	curve25519.ScalarBaseMult(&pubKey, &privKey)
-	return base64.StdEncoding.EncodeToString(pubKey[:])
 }
