@@ -963,13 +963,9 @@ func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 }
 
 func (a *Agent) runAPI() {
-	// Configure Swagger host from environment or use default
-	// Set JETTY_API_HOST to your cloudflared tunnel domain (e.g., "jetty.example.com")
-	if apiHost := os.Getenv("JETTY_API_HOST"); apiHost != "" {
-		docs.SwaggerInfo.Host = apiHost
-		docs.SwaggerInfo.Schemes = []string{"https"}
-		log.Printf("Swagger API host: %s", apiHost)
-	}
+	// Set Swagger host to empty so it uses the current request's host
+	// This makes it work automatically for both localhost and cloudflared tunnels
+	docs.SwaggerInfo.Host = ""
 
 	r := mux.NewRouter()
 
