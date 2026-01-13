@@ -884,6 +884,7 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/workloads", a.apiListWorkloads).Methods("GET")
 	r.HandleFunc("/api/workloads", a.apiCreateWorkload).Methods("POST")
 	r.HandleFunc("/api/workloads/{name}", a.apiGetWorkload).Methods("GET")
+	r.HandleFunc("/api/workloads/{name}", a.apiUpdateWorkload).Methods("PATCH")
 	r.HandleFunc("/api/workloads/{name}", a.apiDeleteWorkload).Methods("DELETE")
 	r.HandleFunc("/api/workloads/{name}/move", a.apiMoveWorkload).Methods("POST")
 	r.HandleFunc("/api/workloads/{name}/logs", a.apiWorkloadLogs).Methods("GET")
@@ -1315,6 +1316,196 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 	containerInfo := a.getContainerInfo(found.Name)
 	response["containers"] = containerInfo
 
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// apiUpdateWorkload godoc
+// @Summary Update a workload
+// @Description Updates workload configuration. Some fields require redeploy.
+// @Tags workloads
+// @Accept json
+// @Produce json
+// @Param name path string true "Workload name"
+// @Param update body object true "Fields to update"
+// @Success 200 {object} Workload
+// @Failure 404 {object} ErrorResponse "Workload not found"
+// @Failure 409 {object} ErrorResponse "Mesh IP conflict"
+// @Failure 500 {object} ErrorResponse "Update failed"
+// @Router /workloads/{name} [patch]
+func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+
+	// Parse update request
+	var update struct {
+		Compose      *string   `json:"compose,omitempty"`
+		MeshIP       *string   `json:"mesh_ip,omitempty"`
+		Revive       *bool     `json:"revive,omitempty"`
+		Autostart    *bool     `json:"autostart,omitempty"`
+		AllowedNodes *[]string `json:"allowed_nodes,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	// Find workload
+	a.stateMu.RLock()
+	var found *Workload
+	var foundIP string
+	var ownerPeer *Peer
+	for ip, wl := range a.state.Workloads {
+		if wl.Name == name {
+			found = wl
+			foundIP = ip
+			if wl.Owner != a.hwid {
+				ownerPeer = a.state.Peers[wl.Owner]
+			}
+			break
+		}
+	}
+	a.stateMu.RUnlock()
+
+	if found == nil {
+		http.Error(w, "not found", 404)
+		return
+	}
+
+	// If workload is remote, proxy to owner
+	if found.Owner != a.hwid {
+		if ownerPeer == nil || !ownerPeer.Healthy {
+			http.Error(w, "owner node unreachable", 502)
+			return
+		}
+
+		// Proxy PATCH to owner
+		body, _ := json.Marshal(update)
+		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name)
+		req, _ := http.NewRequest("PATCH", url, strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			return
+		}
+		defer resp.Body.Close()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	// Local workload - apply updates
+	needsRedeploy := false
+	newMeshIP := foundIP
+
+	a.stateMu.Lock()
+
+	// Handle mesh IP change
+	if update.MeshIP != nil && *update.MeshIP != found.MeshIP {
+		newIP := *update.MeshIP
+
+		// Validate new IP
+		if net.ParseIP(newIP) == nil {
+			a.stateMu.Unlock()
+			http.Error(w, "invalid mesh_ip: must be valid IP address", 400)
+			return
+		}
+		if !a.isIPInCIDR(newIP) {
+			a.stateMu.Unlock()
+			http.Error(w, fmt.Sprintf("mesh_ip must be within %s", a.meshCIDR), 400)
+			return
+		}
+		if a.isIPTaken(newIP) {
+			a.stateMu.Unlock()
+			http.Error(w, "mesh_ip already in use", 409)
+			return
+		}
+
+		// Remove old entry, will add new one
+		delete(a.state.Workloads, foundIP)
+		newMeshIP = newIP
+		found.MeshIP = newIP
+		needsRedeploy = true
+	}
+
+	// Handle compose change
+	if update.Compose != nil && *update.Compose != found.Compose {
+		found.Compose = *update.Compose
+		needsRedeploy = true
+	}
+
+	// Handle metadata updates (no redeploy needed)
+	if update.Revive != nil {
+		found.Revive = *update.Revive
+	}
+	if update.Autostart != nil {
+		found.Autostart = *update.Autostart
+	}
+	if update.AllowedNodes != nil {
+		found.AllowedNodes = *update.AllowedNodes
+	}
+
+	// Update version
+	found.Version = time.Now().Unix()
+
+	// Store with (potentially new) mesh IP
+	a.state.Workloads[newMeshIP] = found
+	a.stateMu.Unlock()
+
+	// Redeploy if needed
+	if needsRedeploy {
+		// Remove old deployment
+		a.removeWorkload(found)
+
+		// Unregister old WARP route
+		if a.warpEnabled && foundIP != newMeshIP {
+			a.unregisterWarpRoute(foundIP)
+		}
+
+		// Deploy with new config
+		if err := a.deployWorkload(found); err != nil {
+			// Rollback on failure
+			a.stateMu.Lock()
+			delete(a.state.Workloads, newMeshIP)
+			if newMeshIP != foundIP {
+				found.MeshIP = foundIP
+				a.state.Workloads[foundIP] = found
+			}
+			a.stateMu.Unlock()
+			http.Error(w, fmt.Sprintf("redeploy failed: %v", err), 500)
+			return
+		}
+
+		// Register new WARP route
+		if a.warpEnabled {
+			a.addWarpRule(newMeshIP)
+		}
+	}
+
+	a.updateHosts()
+	a.saveState()
+	a.broadcastState()
+
+	// Build response
+	response := map[string]interface{}{
+		"name":          found.Name,
+		"mesh_ip":       found.MeshIP,
+		"compose":       found.Compose,
+		"revive":        found.Revive,
+		"autostart":     found.Autostart,
+		"allowed_nodes": found.AllowedNodes,
+		"owner": map[string]string{
+			"id":      a.hwid,
+			"name":    a.hostname,
+			"mesh_ip": a.meshIP,
+		},
+		"version":    found.Version,
+		"redeployed": needsRedeploy,
+	}
+
+	log.Printf("Updated workload %s (redeploy=%v)", found.Name, needsRedeploy)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
