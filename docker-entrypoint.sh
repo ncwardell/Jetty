@@ -165,14 +165,12 @@ main() {
         start_warp_svc
         configure_warp
 
-        # Fix WARP's overly restrictive firewall
+        # Remove WARP's overly restrictive firewall entirely
         # WARP creates a firewall with policy DROP that breaks SSH, git, cloudflared, etc.
-        # Change the default policy to ACCEPT so normal traffic works
+        # We only need WARP for routing to mesh CIDR (100.96.0.0/12), not the firewall
         if nft list table inet cloudflare-warp >/dev/null 2>&1; then
-            log "Fixing WARP firewall policies..."
-            # Change default policies from DROP to ACCEPT
-            nft 'add chain inet cloudflare-warp input { policy accept; }' 2>/dev/null || true
-            nft 'add chain inet cloudflare-warp output { policy accept; }' 2>/dev/null || true
+            log "Removing WARP firewall table (routing still works without it)..."
+            nft delete table inet cloudflare-warp
         fi
 
         log "WARP initialization complete"

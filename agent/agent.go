@@ -503,22 +503,16 @@ func (a *Agent) initWarpRules() error {
 	// This ensures we can reach other WARP clients
 	exec.Command("ip", "route", "add", "100.96.0.0/12", "dev", "CloudflareWARP").Run()
 
-	// Add accept rule for our own mesh IP in the cloudflare-warp nft table
-	// This allows traffic originating from our mesh IP to pass through
-	if err := a.addWarpRule(a.meshIP); err != nil {
-		log.Printf("Warning: failed to add WARP rule for mesh IP: %v", err)
-	}
-
-	// Fix WARP's overly restrictive firewall that breaks SSH, git, cloudflared, etc.
-	// WARP creates chains with policy DROP - change them to ACCEPT
-	// This allows normal traffic (SSH, git, cloudflared, etc.) to work while still
-	// routing WARP traffic through the CloudflareWARP interface
+	// Remove WARP's overly restrictive firewall entirely
+	// WARP creates a firewall with policy DROP that breaks SSH, git, cloudflared, etc.
+	// We only need WARP for routing to mesh CIDR (100.96.0.0/12), not the firewall
 	if _, err := exec.Command("nft", "list", "table", "inet", "cloudflare-warp").Output(); err == nil {
-		log.Printf("Found cloudflare-warp table, fixing policies...")
-		// Change input and output chain policies from DROP to ACCEPT
-		exec.Command("nft", "add", "chain", "inet", "cloudflare-warp", "input", "{ policy accept; }").Run()
-		exec.Command("nft", "add", "chain", "inet", "cloudflare-warp", "output", "{ policy accept; }").Run()
-		log.Printf("WARP firewall policies changed to accept")
+		log.Printf("Removing WARP firewall table (routing still works without it)...")
+		if err := exec.Command("nft", "delete", "table", "inet", "cloudflare-warp").Run(); err != nil {
+			log.Printf("Warning: failed to delete cloudflare-warp table: %v", err)
+		} else {
+			log.Printf("WARP firewall table removed")
+		}
 	}
 
 	log.Printf("WARP nft rules initialized")
