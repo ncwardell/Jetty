@@ -1017,6 +1017,18 @@
                     </div>
                 </div>
 
+                <div class="card" style="margin-bottom: 16px;">
+                    <div class="card-header">
+                        <h3 class="card-title">Cluster Nodes</h3>
+                        <button class="btn btn-sm" onclick="showPage('nodes')">View All</button>
+                    </div>
+                    <div class="card-body" id="clusterNodesOverview">
+                        <div class="empty-state">
+                            <p>Connect to a cluster to see nodes</p>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="card">
                     <div class="card-header">
                         <h3 class="card-title">Recent Workloads</h3>
@@ -1314,6 +1326,24 @@
             }
         }
 
+        // Helper function to format relative time
+        function formatRelativeTime(dateString) {
+            if (!dateString) return 'Unknown';
+            const date = new Date(dateString);
+            const now = new Date();
+            const diffMs = now - date;
+            const diffSecs = Math.floor(diffMs / 1000);
+            const diffMins = Math.floor(diffSecs / 60);
+            const diffHours = Math.floor(diffMins / 60);
+            const diffDays = Math.floor(diffHours / 24);
+
+            if (diffSecs < 10) return 'Just now';
+            if (diffSecs < 60) return `${diffSecs}s ago`;
+            if (diffMins < 60) return `${diffMins}m ago`;
+            if (diffHours < 24) return `${diffHours}h ago`;
+            return `${diffDays}d ago`;
+        }
+
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
             loadSavedConnection();
@@ -1457,11 +1487,63 @@
         // UI Updates
         function updateUI() {
             updateStats();
+            updateClusterNodesOverview();
             updateNodesGrid();
             updateWorkloadsTable();
             updateOrchestrateGrid();
             updateRecentWorkloads();
             updateConnectionStatus();
+        }
+
+        function updateClusterNodesOverview() {
+            const container = document.getElementById('clusterNodesOverview');
+            const allNodes = [state.node, ...state.peers].filter(Boolean);
+
+            if (allNodes.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state" style="padding: 20px;">
+                        <p>Connect to a cluster to see nodes</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = `
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Node</th>
+                                <th>Status</th>
+                                <th>Mesh IP</th>
+                                <th>Last Seen</th>
+                                <th>Workloads</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${allNodes.map(node => {
+                                const isCurrentNode = node.id === state.node?.id || node.is_self;
+                                const healthClass = node.healthy !== false ? 'running' : 'error';
+                                const healthText = node.healthy !== false ? 'Healthy' : 'Unhealthy';
+                                const lastSeen = formatRelativeTime(node.last_seen);
+                                const nodeWorkloads = state.workloads.filter(w => w.owner?.id === node.id);
+                                return `
+                                    <tr>
+                                        <td>
+                                            ${node.name || node.id.substring(0, 8)}
+                                            ${isCurrentNode ? ' <span class="node-badge">Current</span>' : ''}
+                                        </td>
+                                        <td><span class="status-badge ${healthClass}">${healthText}</span></td>
+                                        <td><code>${node.ip || 'N/A'}</code></td>
+                                        <td>${lastSeen}</td>
+                                        <td>${nodeWorkloads.length}</td>
+                                    </tr>
+                                `;
+                            }).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `;
         }
 
         function updateStats() {
@@ -1494,9 +1576,10 @@
             }
 
             grid.innerHTML = allNodes.map(node => {
-                const isCurrentNode = node.id === state.node?.id;
+                const isCurrentNode = node.id === state.node?.id || node.is_self;
                 const nodeWorkloads = state.workloads.filter(w => w.owner?.id === node.id);
                 const healthClass = node.healthy !== false ? 'healthy' : 'unhealthy';
+                const lastSeen = formatRelativeTime(node.last_seen);
 
                 return `
                     <div class="node-card">
@@ -1505,13 +1588,24 @@
                                 ${node.name || node.id.substring(0, 8)}
                                 ${isCurrentNode ? '<span class="node-badge">Current</span>' : ''}
                             </div>
-                            <div class="node-health ${healthClass}">
-                                <span class="status-dot ${healthClass === 'healthy' ? 'connected' : ''}"></span>
-                                ${healthClass === 'healthy' ? 'Healthy' : 'Unhealthy'}
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <div class="node-health ${healthClass}">
+                                    <span class="status-dot ${healthClass === 'healthy' ? 'connected' : ''}"></span>
+                                    ${healthClass === 'healthy' ? 'Healthy' : 'Unhealthy'}
+                                </div>
+                                ${!isCurrentNode ? `
+                                    <button class="btn btn-sm btn-danger" onclick="deleteNode('${node.id}')" title="Remove node">
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <polyline points="3 6 5 6 21 6"/>
+                                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                                        </svg>
+                                    </button>
+                                ` : ''}
                             </div>
                         </div>
                         <div class="node-details">
                             <p><strong>Mesh IP:</strong> ${node.ip || 'N/A'}</p>
+                            <p><strong>Last Seen:</strong> ${lastSeen}</p>
                             ${node.warp_ip || node.warpIP ? `<p><strong>WARP IP:</strong> ${node.warp_ip || node.warpIP}</p>` : ''}
                             ${node.tunnel_host || node.tunnelHost ? `<p><strong>Tunnel:</strong> ${node.tunnel_host || node.tunnelHost}</p>` : ''}
                         </div>
@@ -1835,6 +1929,32 @@
                 await refreshStatus();
             } catch (error) {
                 showToast(`Failed to delete: ${error.message}`, 'error');
+            }
+        }
+
+        async function deleteNode(nodeId) {
+            const node = state.peers.find(p => p.id === nodeId);
+            const nodeName = node?.name || nodeId.substring(0, 8);
+            const nodeWorkloads = state.workloads.filter(w => w.owner?.id === nodeId);
+
+            let message = `Are you sure you want to remove node "${nodeName}" from the cluster?`;
+            if (nodeWorkloads.length > 0) {
+                message += `\n\nThis node owns ${nodeWorkloads.length} workload(s) which will be orphaned.`;
+                if (nodeWorkloads.some(w => w.revive)) {
+                    message += ' Workloads with revive enabled will be migrated to another node.';
+                }
+            }
+
+            if (!confirm(message)) {
+                return;
+            }
+
+            try {
+                await apiCall(`/nodes/${nodeId}`, 'DELETE');
+                showToast(`Node "${nodeName}" removed from cluster`, 'success');
+                await refreshStatus();
+            } catch (error) {
+                showToast(`Failed to remove node: ${error.message}`, 'error');
             }
         }
 

@@ -1284,9 +1284,12 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 
 	resp := map[string]interface{}{
 		"node": map[string]interface{}{
-			"id":   a.hwid,
-			"name": a.hostname,
-			"ip":   a.ip,
+			"id":        a.hwid,
+			"name":      a.hostname,
+			"ip":        a.ip,
+			"healthy":   true, // Self is always healthy if we're responding
+			"last_seen": time.Now(),
+			"is_self":   true,
 		},
 		"peers":        peers,
 		"workloads":    workloads,
