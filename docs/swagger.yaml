@@ -68,6 +68,9 @@ definitions:
         type: string
       secret:
         type: string
+      version:
+        example: 2.0.0
+        type: string
     type: object
   agent.JoinResponse:
     properties:
@@ -137,6 +140,24 @@ definitions:
         example: node1
         type: string
     type: object
+  agent.NodeUpdateRequest:
+    properties:
+      image:
+        example: ghcr.io/ncwardell/jetty:2.1.0
+        type: string
+    type: object
+  agent.NodeUpdateResponse:
+    properties:
+      image:
+        example: ghcr.io/ncwardell/jetty:2.1.0
+        type: string
+      message:
+        example: pulling image and restarting
+        type: string
+      status:
+        example: updating
+        type: string
+    type: object
   agent.Peer:
     properties:
       healthy:
@@ -151,6 +172,9 @@ definitions:
         type: string
       name:
         description: Hostname
+        type: string
+      version:
+        description: Agent version
         type: string
     type: object
   agent.StatusResponse:
@@ -348,6 +372,47 @@ paths:
           schema:
             $ref: '#/definitions/agent.ErrorResponse'
       summary: Remove a node from the cluster
+      tags:
+      - nodes
+  /nodes/{id}/update:
+    post:
+      consumes:
+      - application/json
+      description: Triggers a self-update of the node by pulling a new Docker image
+        and restarting. Only works on the target node itself - requests to other nodes
+        will be proxied.
+      parameters:
+      - description: Node ID (HWID), name, or 'self'
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Update request with image to pull
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/agent.NodeUpdateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.NodeUpdateResponse'
+        "400":
+          description: Invalid request
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "404":
+          description: Node not found
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "500":
+          description: Update failed
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Update a node (self-update)
       tags:
       - nodes
   /status:
