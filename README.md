@@ -3,6 +3,7 @@
   <img src="https://img.shields.io/badge/kubernetes-at%20home-orange?style=for-the-badge" alt="K8s at Home"/>
   <img src="https://img.shields.io/badge/powered%20by-cloudflare-F38020?style=for-the-badge&logo=cloudflare&logoColor=white" alt="Cloudflare"/>
   <img src="https://img.shields.io/badge/master%20node-none-success?style=for-the-badge" alt="No Master"/>
+  <img src="https://img.shields.io/badge/multi--arch-amd64%20%7C%20arm64-purple?style=for-the-badge" alt="Multi-Arch"/>
 </p>
 
 <h1 align="center">
@@ -28,6 +29,7 @@
   <a href="#-features">Features</a> •
   <a href="#%EF%B8%8F-architecture">Architecture</a> •
   <a href="#-quick-start">Quick Start</a> •
+  <a href="#%EF%B8%8F-multi-architecture-workloads">Multi-Arch</a> •
   <a href="#-api">API</a> •
   <a href="#-failover">Failover</a> •
   <a href="GUIDE.md">Full Guide</a>
@@ -58,6 +60,7 @@ Every node is equal. Any node can accept requests. Workloads failover automatica
 | 🎯 **Node Allowlist** | Pin workloads to specific nodes with `allowed_nodes`. Your GPU workload stays on the GPU node. |
 | 🔵 **Zero-Downtime Moves** | Blue-green deployment when moving workloads. Old one keeps running until new one is healthy. |
 | 🌍 **Cloudflare Tunnel** | Optional external access. One domain, all nodes, Cloudflare handles the load balancing. |
+| 🏗️ **Multi-Architecture** | Mix AMD64 and ARM64 nodes. Workloads can have arch-specific compose files. Pi cluster? No problem. |
 | 📊 **Web Dashboard** | Built-in UI because `curl` gets old. |
 | 📜 **Swagger Docs** | Full OpenAPI spec. [Live docs here](https://nodes.secretcult.network/swagger/index.html). We're professionals. |
 
@@ -74,7 +77,8 @@ Every node is equal. Any node can accept requests. Workloads failover automatica
          │                         │                         │
          ▼                         ▼                         ▼
 ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
-│   🖥️ Node 1     │◄─────►│   🖥️ Node 2     │◄─────►│   🖥️ Node 3     │
+│   🖥️ Node 1     │◄─────►│   🖥️ Node 2     │◄─────►│   🍓 Node 3     │
+│   (amd64)       │       │   (amd64)       │       │   (arm64)       │
 │                 │       │                 │       │                 │
 │ Mesh: 10.100.0.1│       │ Mesh: 10.100.0.2│       │ Mesh: 10.100.0.3│
 │ WARP: 100.96.x.x│       │ WARP: 100.96.x.x│       │ WARP: 100.96.x.x│
@@ -213,6 +217,40 @@ Jetty will:
 
 ---
 
+## 🏗️ Multi-Architecture Workloads
+
+Got a cluster with both x86 servers and Raspberry Pis? Jetty handles it.
+
+```bash
+curl -X POST http://localhost:6880/api/workloads \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "myapp",
+    "revive": true,
+    "compose_amd64": "services:\n  app:\n    image: myapp:amd64",
+    "compose_arm64": "services:\n  app:\n    image: myapp:arm64"
+  }'
+```
+
+**How it works:**
+- Each node reports its architecture (`amd64`, `arm64`)
+- When deploying, Jetty picks the right compose file for that node
+- Failover only considers nodes with compatible architecture
+- No `compose` fallback? Workload only runs on matching nodes
+
+**Example scenarios:**
+
+| Workload Config | AMD64 Node | ARM64 Node |
+|-----------------|------------|------------|
+| Only `compose` | ✅ Uses it | ✅ Uses it |
+| Only `compose_arm64` | ❌ Can't run | ✅ Uses it |
+| `compose` + `compose_arm64` | ✅ Uses `compose` | ✅ Uses `compose_arm64` |
+| `compose_amd64` + `compose_arm64` | ✅ Uses `compose_amd64` | ✅ Uses `compose_arm64` |
+
+> **Pro tip:** Most Docker images are multi-arch these days. You only need arch-specific compose files when using images that aren't, or when you want different configs per architecture.
+
+---
+
 ## 📡 API
 
 Full Swagger docs at [`/swagger/index.html`](https://nodes.secretcult.network/swagger/index.html)
@@ -284,7 +322,9 @@ No split-brain. No consensus. Just math.
 {
   "name": "postgres",
   "mesh_ip": "10.100.0.50",
-  "compose": "services:\n  db:\n    image: postgres:16\n    volumes:\n      - data:/var/lib/postgresql/data\nvolumes:\n  data:",
+  "compose": "services:\n  db:\n    image: postgres:16\n    ...",
+  "compose_amd64": "services:\n  db:\n    image: postgres:16-amd64\n    ...",
+  "compose_arm64": "services:\n  db:\n    image: postgres:16-arm64\n    ...",
   "revive": true,
   "autostart": true,
   "allowed_nodes": ["node1", "node2"],
@@ -301,12 +341,16 @@ No split-brain. No consensus. Just math.
 |-------|------------|
 | `name` | Workload name. Becomes a DNS hostname. |
 | `mesh_ip` | IP on the mesh network. Auto-assigned if you don't care. |
-| `compose` | Your Docker Compose YAML as a string. |
+| `compose` | Default Docker Compose YAML. Used if no arch-specific file matches. |
+| `compose_amd64` | Optional. Compose file for AMD64 nodes. |
+| `compose_arm64` | Optional. Compose file for ARM64 nodes. |
 | `revive` | `true` = failover to another node if owner dies. |
 | `autostart` | `true` = start when Jetty starts. |
 | `allowed_nodes` | Only these nodes can run this workload. Empty = any node. |
 | `owner` | Who's currently running it. Don't set this manually. |
 | `version` | Unix timestamp. Higher wins in conflicts. |
+
+> **Multi-Arch Note:** If a workload only has `compose_arm64` (no default `compose`), it can only run on ARM64 nodes. Failover will skip incompatible architectures.
 
 ---
 
