@@ -118,6 +118,11 @@ type Agent struct {
 	workloadRoutes   map[string]string // workload IP -> owner WARP IP (for remote workloads)
 	workloadRoutesMu sync.Mutex
 
+	// IPIP tunnel support
+	ipipAvailable     bool              // Whether kernel supports IPIP tunnels
+	ipipWarnedPeers   map[string]bool   // Peers we've already warned about IPIP failure
+	ipipWarnedPeersMu sync.Mutex
+
 	stopCh chan struct{}
 }
 
@@ -126,18 +131,19 @@ func New() (*Agent, error) {
 	os.MkdirAll(dataDir, 0755)
 
 	a := &Agent{
-		hostname:       getHostname(),
-		dataDir:        dataDir,
-		apiPort:        getEnvInt("JETTY_API_PORT", 6880),
-		serviceCIDR:    getEnv("JETTY_SERVICE_CIDR", "10.100.0.0/16"), // CIDR for workload IPs
-		joinURL:        getEnv("JETTY_JOIN", ""),
-		clusterSecret:  getEnv("JETTY_SECRET", ""),
-		tunnelDomain:   getEnv("JETTY_TUNNEL_DOMAIN", ""),            // e.g., "cluster.example.com" - Cloudflare tunnel for API access
-		tunnelHost:     getEnv("JETTY_TUNNEL_HOST", ""),              // e.g., "node1.cluster.example.com" - this node's specific subdomain
-		cfTunnelID:     getEnv("JETTY_CF_TUNNEL_ID", ""),             // WARP connector tunnel ID for route management
-		composeDir:     filepath.Join(dataDir, "compose"),
-		hostsFile:      "/etc/hosts",
-		workloadRoutes: make(map[string]string),
+		hostname:        getHostname(),
+		dataDir:         dataDir,
+		apiPort:         getEnvInt("JETTY_API_PORT", 6880),
+		serviceCIDR:     getEnv("JETTY_SERVICE_CIDR", "10.100.0.0/16"), // CIDR for workload IPs
+		joinURL:         getEnv("JETTY_JOIN", ""),
+		clusterSecret:   getEnv("JETTY_SECRET", ""),
+		tunnelDomain:    getEnv("JETTY_TUNNEL_DOMAIN", ""),            // e.g., "cluster.example.com" - Cloudflare tunnel for API access
+		tunnelHost:      getEnv("JETTY_TUNNEL_HOST", ""),              // e.g., "node1.cluster.example.com" - this node's specific subdomain
+		cfTunnelID:      getEnv("JETTY_CF_TUNNEL_ID", ""),             // WARP connector tunnel ID for route management
+		composeDir:      filepath.Join(dataDir, "compose"),
+		hostsFile:       "/etc/hosts",
+		workloadRoutes:  make(map[string]string),
+		ipipWarnedPeers: make(map[string]bool),
 		state: &State{
 			Peers:     make(map[string]*Peer),
 			Workloads: make(map[string]*Workload),
@@ -572,8 +578,31 @@ func (a *Agent) initNetwork() error {
 	// Enable forwarding for workload traffic
 	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
 
+	// Check if IPIP tunnels are available (requires kernel module)
+	a.ipipAvailable = a.checkIPIPAvailable()
+	if !a.ipipAvailable {
+		log.Printf("Warning: IPIP tunnels not available (kernel module not loaded) - cross-node workload routing disabled")
+	}
+
 	log.Printf("Network ready: %s (WARP), workload interface: jetty0", a.ip)
 	return nil
+}
+
+// checkIPIPAvailable tests if the kernel supports IPIP tunnels.
+func (a *Agent) checkIPIPAvailable() bool {
+	// Try to create a test tunnel
+	testName := "jetty_ipip_test"
+	exec.Command("ip", "tunnel", "del", testName).Run() // Clean up any existing
+
+	err := exec.Command("ip", "tunnel", "add", testName, "mode", "ipip",
+		"local", "127.0.0.1", "remote", "127.0.0.2").Run()
+	if err != nil {
+		return false
+	}
+
+	// Clean up test tunnel
+	exec.Command("ip", "tunnel", "del", testName).Run()
+	return true
 }
 
 // initWarpRules sets up nftables rules for WARP traffic routing.
@@ -619,6 +648,11 @@ func (a *Agent) initWarpRules() error {
 func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
 	if a.ip == "" || peerIP == "" {
 		return nil // Can't create tunnel without IPs
+	}
+
+	// Skip if IPIP not available (kernel module not loaded)
+	if !a.ipipAvailable {
+		return nil
 	}
 
 	// Tunnel name based on peer ID (truncated for interface name limit)
@@ -2074,12 +2108,23 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Find target
+	// Find target (check if moving to self first, then search peers)
 	var target *Peer
-	for _, p := range a.state.Peers {
-		if p.Name == req.To || p.ID == req.To {
-			target = p
-			break
+	var targetIsSelf bool
+	if req.To == a.hwid || req.To == a.hostname {
+		target = &Peer{
+			ID:      a.hwid,
+			Name:    a.hostname,
+			IP:      a.ip,
+			Healthy: true,
+		}
+		targetIsSelf = true
+	} else {
+		for _, p := range a.state.Peers {
+			if p.Name == req.To || p.ID == req.To {
+				target = p
+				break
+			}
 		}
 	}
 	a.stateMu.RUnlock()
@@ -2097,45 +2142,118 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if we already own it (no-op)
+	if found.Owner == a.hwid && targetIsSelf {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"moved": "no-op", "reason": "already on target node"})
+		return
+	}
+
 	// Check if target is allowed to run this workload
 	if !a.isNodeAllowed(found, target.ID, target.Name) {
 		http.Error(w, "target node is not in allowed_nodes for this workload", 403)
 		return
 	}
 
-	// Blue-green deployment: deploy on target first (with move=true to allow IP overlap)
-	data, _ := json.Marshal(found)
-	url := a.getPeerAPIURL(target, "/api/workloads?move=true")
-	deployReq, _ := a.peerRequest("POST", url, strings.NewReader(string(data)))
-	resp, err := httpClient.Do(deployReq)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to deploy on target: %v", err), 502)
-		return
-	}
-	resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		http.Error(w, fmt.Sprintf("target rejected deployment (status %d)", resp.StatusCode), 500)
-		return
-	}
-
-	// Target is now running - remove from source
-	// If we own it, remove locally
-	if found.Owner == a.hwid {
-		a.removeWorkload(found)
-	} else if currentOwner != nil && currentOwner.Healthy {
-		// Proxy delete to current owner
-		deleteURL := a.getPeerAPIURL(currentOwner, "/api/workloads/"+name)
-		delReq, _ := a.peerRequest("DELETE", deleteURL, nil)
-		delResp, err := httpClient.Do(delReq)
-		if err != nil {
-			log.Printf("Warning: failed to remove workload from original owner: %v", err)
-		} else {
-			delResp.Body.Close()
+	// Blue-green deployment: deploy on target first
+	var newVersion int64
+	if targetIsSelf {
+		// Moving to self - deploy locally
+		// First, tell the current owner to remove it
+		if currentOwner != nil && currentOwner.Healthy {
+			deleteURL := a.getPeerAPIURL(currentOwner, "/api/workloads/"+name)
+			delReq, _ := a.peerRequest("DELETE", deleteURL, nil)
+			delResp, err := httpClient.Do(delReq)
+			if err != nil {
+				log.Printf("Warning: failed to remove workload from original owner: %v", err)
+			} else {
+				delResp.Body.Close()
+			}
 		}
+
+		// Deploy locally
+		newVersion = time.Now().Unix()
+		localWl := *found // Copy workload
+		localWl.Owner = a.hwid
+		localWl.Version = newVersion
+
+		if err := a.deployWorkload(&localWl); err != nil {
+			http.Error(w, fmt.Sprintf("local deploy failed: %v", err), 500)
+			return
+		}
+
+		// Update state
+		a.stateMu.Lock()
+		a.state.Workloads[found.IP] = &localWl
+		a.stateMu.Unlock()
+	} else {
+		// Moving to remote peer - deploy via API
+		data, _ := json.Marshal(found)
+		url := a.getPeerAPIURL(target, "/api/workloads?move=true")
+		deployReq, _ := a.peerRequest("POST", url, strings.NewReader(string(data)))
+		resp, err := httpClient.Do(deployReq)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to deploy on target: %v", err), 502)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			body, _ := io.ReadAll(resp.Body)
+			http.Error(w, fmt.Sprintf("target rejected deployment (status %d): %s", resp.StatusCode, body), 500)
+			return
+		}
+
+		// Parse response to get updated workload info (new owner, version)
+		var deployResult struct {
+			Name    string `json:"name"`
+			IP      string `json:"ip"`
+			Version int64  `json:"version"`
+			Owner   struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"owner"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&deployResult); err != nil {
+			log.Printf("Warning: could not parse deploy response: %v", err)
+		}
+		newVersion = deployResult.Version
+
+		// Target is now running - remove from source
+		// If we own it, remove locally (but don't delete from state yet - we'll update it)
+		if found.Owner == a.hwid {
+			a.removeWorkload(found)
+		} else if currentOwner != nil && currentOwner.Healthy {
+			// Proxy delete to current owner
+			deleteURL := a.getPeerAPIURL(currentOwner, "/api/workloads/"+name)
+			delReq, _ := a.peerRequest("DELETE", deleteURL, nil)
+			delResp, err := httpClient.Do(delReq)
+			if err != nil {
+				log.Printf("Warning: failed to remove workload from original owner: %v", err)
+			} else {
+				delResp.Body.Close()
+			}
+		}
+
+		// Update local state immediately to reflect new owner
+		// This prevents stale state issues during rapid moves
+		a.stateMu.Lock()
+		if wl, exists := a.state.Workloads[found.IP]; exists {
+			wl.Owner = target.ID
+			if newVersion > 0 {
+				wl.Version = newVersion
+			} else {
+				wl.Version = time.Now().Unix()
+			}
+		}
+		a.stateMu.Unlock()
 	}
 
-	log.Printf("Moved workload %s to %s (blue-green)", found.Name, target.Name)
+	a.updateHosts()
+	a.saveState()
+	a.broadcastState()
+
+	log.Printf("Moved workload %s to %s", found.Name, target.Name)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"moved": "ok", "to": target.Name})
 }
@@ -2541,6 +2659,14 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 
 	// Remove the peer
 	delete(a.state.Peers, foundID)
+	a.stateMu.Unlock()
+
+	// Clean up IPIP tunnel to this peer
+	a.removePeerTunnel(found.ID)
+
+	// Clean up routes for workloads that were owned by this peer
+	a.stateMu.Lock()
+	a.updateWorkloadRoutes()
 	a.stateMu.Unlock()
 
 	a.updateHosts()
