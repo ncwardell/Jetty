@@ -16,6 +16,7 @@ type NodeInfo struct {
 	ID   string `json:"id" example:"abc123def456"`
 	Name string `json:"name" example:"node1"`
 	IP   string `json:"ip" example:"100.96.0.1"`
+	Arch string `json:"arch" example:"amd64"`
 }
 
 // TunnelStatus represents Cloudflare tunnel status
@@ -36,6 +37,8 @@ type WorkloadRequest struct {
 	Name         string   `json:"name" example:"nginx"`
 	IP           string   `json:"ip,omitempty" example:"10.100.0.50"`
 	Compose      string   `json:"compose" example:"services:\n  web:\n    image: nginx"`
+	ComposeAmd64 string   `json:"compose_amd64,omitempty" example:"services:\n  web:\n    image: nginx:amd64"`
+	ComposeArm64 string   `json:"compose_arm64,omitempty" example:"services:\n  web:\n    image: nginx:arm64"`
 	Revive       bool     `json:"revive" example:"true"`
 	Autostart    bool     `json:"autostart" example:"true"`
 	AllowedNodes []string `json:"allowed_nodes,omitempty" example:"node1,node2"`
@@ -44,6 +47,8 @@ type WorkloadRequest struct {
 // WorkloadUpdateRequest represents a request to update a workload
 type WorkloadUpdateRequest struct {
 	Compose      *string   `json:"compose,omitempty"`
+	ComposeAmd64 *string   `json:"compose_amd64,omitempty"`
+	ComposeArm64 *string   `json:"compose_arm64,omitempty"`
 	IP           *string   `json:"ip,omitempty"`
 	Revive       *bool     `json:"revive,omitempty"`
 	Autostart    *bool     `json:"autostart,omitempty"`
@@ -103,6 +108,7 @@ type JoinRequest struct {
 	Name    string `json:"name"`
 	IP      string `json:"ip" example:"100.96.0.5"`
 	Version string `json:"version" example:"2.0.0"`
+	Arch    string `json:"arch" example:"amd64"`
 }
 
 // JoinResponse represents a successful join response
@@ -173,6 +179,7 @@ type NodeResponse struct {
 	LastSeen string `json:"last_seen" example:"2024-01-02T15:04:05Z"`
 	IsSelf   bool   `json:"is_self" example:"false"`
 	Version  string `json:"version" example:"2.0.0"`
+	Arch     string `json:"arch" example:"amd64"`
 }
 
 // NodeUpdateRequest represents a request to update a node
