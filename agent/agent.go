@@ -118,6 +118,11 @@ type Agent struct {
 	workloadRoutes   map[string]string // workload IP -> owner WARP IP (for remote workloads)
 	workloadRoutesMu sync.Mutex
 
+	// IPIP tunnel support
+	ipipAvailable     bool              // Whether kernel supports IPIP tunnels
+	ipipWarnedPeers   map[string]bool   // Peers we've already warned about IPIP failure
+	ipipWarnedPeersMu sync.Mutex
+
 	stopCh chan struct{}
 }
 
@@ -126,18 +131,19 @@ func New() (*Agent, error) {
 	os.MkdirAll(dataDir, 0755)
 
 	a := &Agent{
-		hostname:       getHostname(),
-		dataDir:        dataDir,
-		apiPort:        getEnvInt("JETTY_API_PORT", 6880),
-		serviceCIDR:    getEnv("JETTY_SERVICE_CIDR", "10.100.0.0/16"), // CIDR for workload IPs
-		joinURL:        getEnv("JETTY_JOIN", ""),
-		clusterSecret:  getEnv("JETTY_SECRET", ""),
-		tunnelDomain:   getEnv("JETTY_TUNNEL_DOMAIN", ""),            // e.g., "cluster.example.com" - Cloudflare tunnel for API access
-		tunnelHost:     getEnv("JETTY_TUNNEL_HOST", ""),              // e.g., "node1.cluster.example.com" - this node's specific subdomain
-		cfTunnelID:     getEnv("JETTY_CF_TUNNEL_ID", ""),             // WARP connector tunnel ID for route management
-		composeDir:     filepath.Join(dataDir, "compose"),
-		hostsFile:      "/etc/hosts",
-		workloadRoutes: make(map[string]string),
+		hostname:        getHostname(),
+		dataDir:         dataDir,
+		apiPort:         getEnvInt("JETTY_API_PORT", 6880),
+		serviceCIDR:     getEnv("JETTY_SERVICE_CIDR", "10.100.0.0/16"), // CIDR for workload IPs
+		joinURL:         getEnv("JETTY_JOIN", ""),
+		clusterSecret:   getEnv("JETTY_SECRET", ""),
+		tunnelDomain:    getEnv("JETTY_TUNNEL_DOMAIN", ""),            // e.g., "cluster.example.com" - Cloudflare tunnel for API access
+		tunnelHost:      getEnv("JETTY_TUNNEL_HOST", ""),              // e.g., "node1.cluster.example.com" - this node's specific subdomain
+		cfTunnelID:      getEnv("JETTY_CF_TUNNEL_ID", ""),             // WARP connector tunnel ID for route management
+		composeDir:      filepath.Join(dataDir, "compose"),
+		hostsFile:       "/etc/hosts",
+		workloadRoutes:  make(map[string]string),
+		ipipWarnedPeers: make(map[string]bool),
 		state: &State{
 			Peers:     make(map[string]*Peer),
 			Workloads: make(map[string]*Workload),
@@ -572,8 +578,31 @@ func (a *Agent) initNetwork() error {
 	// Enable forwarding for workload traffic
 	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
 
+	// Check if IPIP tunnels are available (requires kernel module)
+	a.ipipAvailable = a.checkIPIPAvailable()
+	if !a.ipipAvailable {
+		log.Printf("Warning: IPIP tunnels not available (kernel module not loaded) - cross-node workload routing disabled")
+	}
+
 	log.Printf("Network ready: %s (WARP), workload interface: jetty0", a.ip)
 	return nil
+}
+
+// checkIPIPAvailable tests if the kernel supports IPIP tunnels.
+func (a *Agent) checkIPIPAvailable() bool {
+	// Try to create a test tunnel
+	testName := "jetty_ipip_test"
+	exec.Command("ip", "tunnel", "del", testName).Run() // Clean up any existing
+
+	err := exec.Command("ip", "tunnel", "add", testName, "mode", "ipip",
+		"local", "127.0.0.1", "remote", "127.0.0.2").Run()
+	if err != nil {
+		return false
+	}
+
+	// Clean up test tunnel
+	exec.Command("ip", "tunnel", "del", testName).Run()
+	return true
 }
 
 // initWarpRules sets up nftables rules for WARP traffic routing.
@@ -619,6 +648,11 @@ func (a *Agent) initWarpRules() error {
 func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
 	if a.ip == "" || peerIP == "" {
 		return nil // Can't create tunnel without IPs
+	}
+
+	// Skip if IPIP not available (kernel module not loaded)
+	if !a.ipipAvailable {
+		return nil
 	}
 
 	// Tunnel name based on peer ID (truncated for interface name limit)
