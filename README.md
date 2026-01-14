@@ -67,8 +67,8 @@ Every node is equal. Any node can accept requests. Workloads failover automatica
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           CLOUDFLARE WARP MESH                               │
-│                        (encrypted overlay network)                           │
+│                           CLOUDFLARE WARP MESH                              │
+│                        (encrypted overlay network)                          │
 └─────────────────────────────────────────────────────────────────────────────┘
          ▲                         ▲                         ▲
          │                         │                         │
@@ -125,13 +125,13 @@ Before deploying, configure your WARP Connector in the Zero Trust Dashboard:
 ┌─────────────────────────────────────────────────────┐
 │  Traffic Routing                                    │
 │  ─────────────────                                  │
-│  ○ Exclude IPs and domains                          │
 │  ● Include IPs and domains  ← SELECT THIS           │
+│  ○ Exclude IPs and domains                          │
 │                                                     │
 │  Included IPs:                                      │
-│  ┌─────────────────────────────────────────────┐   │
-│  │ 100.96.0.0/16                               │   │
-│  └─────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────┐    │
+│  │ 100.96.0.0/16                               │    │
+│  └─────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────┘
 ```
 
