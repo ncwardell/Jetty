@@ -1,12 +1,15 @@
-# Build stage
-FROM golang:1.24-bookworm AS builder
+# Build stage - use BUILDPLATFORM for native compilation speed
+FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS builder
 ARG VERSION=dev
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 # Sync web UI and build with version injected via ldflags
-RUN go generate ./... && CGO_ENABLED=0 go build -ldflags="-X github.com/ncwardell/jetty/agent.Version=${VERSION}" -o jetty .
+# Cross-compile for target architecture
+RUN go generate ./... && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags="-X github.com/ncwardell/jetty/agent.Version=${VERSION}" -o jetty .
 
 # Runtime stage - using Debian for cloudflare-warp compatibility
 FROM debian:bookworm-slim

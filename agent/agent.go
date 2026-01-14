@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -60,12 +61,15 @@ type Peer struct {
 	Healthy  bool      `json:"healthy"`
 	LastSeen time.Time `json:"last_seen"`
 	Version  string    `json:"version"`   // Agent version
+	Arch     string    `json:"arch"`      // CPU architecture (amd64, arm64, etc.)
 }
 
 type Workload struct {
 	Name         string   `json:"name"`                    // DNS hostname
 	IP           string   `json:"ip"`                      // Service IP (routed via WARP)
-	Compose      string   `json:"compose"`
+	Compose      string   `json:"compose"`                 // Default compose (used if no arch-specific)
+	ComposeAmd64 string   `json:"compose_amd64,omitempty"` // Optional: amd64-specific compose
+	ComposeArm64 string   `json:"compose_arm64,omitempty"` // Optional: arm64-specific compose
 	Revive       bool     `json:"revive"`                  // Auto-failover to another node if owner dies
 	Autostart    bool     `json:"autostart"`               // Auto-start when Jetty starts up
 	AllowedNodes []string `json:"allowed_nodes,omitempty"` // Node whitelist: empty/["*"] = all, otherwise node names/IDs
@@ -766,8 +770,14 @@ func (a *Agent) isIPTaken(ipStr string) bool {
 }
 
 // isNodeAllowed checks if a node (by ID or name) is allowed to run a workload.
-// Empty or ["*"] allowed_nodes means all nodes are allowed.
-func (a *Agent) isNodeAllowed(wl *Workload, nodeID, nodeName string) bool {
+// Checks both the allowed_nodes list AND architecture compatibility.
+// Empty or ["*"] allowed_nodes means all nodes are allowed (but arch must still match).
+func (a *Agent) isNodeAllowed(wl *Workload, nodeID, nodeName, nodeArch string) bool {
+	// First check architecture compatibility
+	if nodeArch != "" && !wl.canRunOnArch(nodeArch) {
+		return false
+	}
+
 	// Empty list or nil means all nodes allowed
 	if len(wl.AllowedNodes) == 0 {
 		return true
@@ -788,7 +798,7 @@ func (a *Agent) isNodeAllowed(wl *Workload, nodeID, nodeName string) bool {
 
 // isThisNodeAllowed checks if this node is allowed to run a workload.
 func (a *Agent) isThisNodeAllowed(wl *Workload) bool {
-	return a.isNodeAllowed(wl, a.hwid, a.hostname)
+	return a.isNodeAllowed(wl, a.hwid, a.hostname, runtime.GOARCH)
 }
 
 // isWorkloadNameTaken checks if a workload name is already in use.
@@ -803,11 +813,12 @@ func (a *Agent) isWorkloadNameTaken(name string) bool {
 }
 
 // findAllowedNode finds a healthy peer that is allowed to run this workload.
+// Checks both allowed_nodes list and architecture compatibility.
 // Returns nil if no suitable node is found.
 // Caller must hold stateMu lock (read).
 func (a *Agent) findAllowedNode(wl *Workload) *Peer {
 	for _, p := range a.state.Peers {
-		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name) {
+		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name, p.Arch) {
 			return p
 		}
 	}
@@ -1046,6 +1057,7 @@ func (a *Agent) joinCluster() error {
 		"name":    a.hostname,
 		"ip":      a.ip, // WARP IP (may be empty, set after WARP connect)
 		"version": Version,
+		"arch":    runtime.GOARCH,
 	}
 
 	data, _ := json.Marshal(req)
@@ -1336,6 +1348,7 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 			"id":        a.hwid,
 			"name":      a.hostname,
 			"ip":        a.ip,
+			"arch":      runtime.GOARCH,
 			"healthy":   true, // Self is always healthy if we're responding
 			"last_seen": time.Now(),
 			"is_self":   true,
@@ -1488,8 +1501,13 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if wl.Name == "" || wl.Compose == "" {
-		http.Error(w, "name and compose required", 400)
+	// Require at least one compose file (default or architecture-specific)
+	if wl.Name == "" {
+		http.Error(w, "name required", 400)
+		return
+	}
+	if wl.Compose == "" && wl.ComposeAmd64 == "" && wl.ComposeArm64 == "" {
+		http.Error(w, "at least one compose file required (compose, compose_amd64, or compose_arm64)", 400)
 		return
 	}
 
@@ -1755,6 +1773,8 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	// Parse update request
 	var update struct {
 		Compose      *string   `json:"compose,omitempty"`
+		ComposeAmd64 *string   `json:"compose_amd64,omitempty"`
+		ComposeArm64 *string   `json:"compose_arm64,omitempty"`
 		IP           *string   `json:"ip,omitempty"`
 		Revive       *bool     `json:"revive,omitempty"`
 		Autostart    *bool     `json:"autostart,omitempty"`
@@ -1845,10 +1865,24 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		needsRedeploy = true
 	}
 
-	// Handle compose change
+	// Handle compose changes
 	if update.Compose != nil && *update.Compose != found.Compose {
 		found.Compose = *update.Compose
 		needsRedeploy = true
+	}
+	if update.ComposeAmd64 != nil && *update.ComposeAmd64 != found.ComposeAmd64 {
+		found.ComposeAmd64 = *update.ComposeAmd64
+		// Only redeploy if we're on amd64 and this is the active compose
+		if runtime.GOARCH == "amd64" {
+			needsRedeploy = true
+		}
+	}
+	if update.ComposeArm64 != nil && *update.ComposeArm64 != found.ComposeArm64 {
+		found.ComposeArm64 = *update.ComposeArm64
+		// Only redeploy if we're on arm64 and this is the active compose
+		if runtime.GOARCH == "arm64" {
+			needsRedeploy = true
+		}
 	}
 
 	// Handle metadata updates (no redeploy needed)
@@ -2133,6 +2167,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 			Name:    a.hostname,
 			IP:      a.ip,
 			Healthy: true,
+			Arch:    runtime.GOARCH,
 		}
 		targetIsSelf = true
 	} else {
@@ -2165,9 +2200,14 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if target is allowed to run this workload
-	if !a.isNodeAllowed(found, target.ID, target.Name) {
-		http.Error(w, "target node is not in allowed_nodes for this workload", 403)
+	// Check if target is allowed to run this workload (includes arch compatibility)
+	if !a.isNodeAllowed(found, target.ID, target.Name, target.Arch) {
+		// Provide a more specific error message
+		if !found.canRunOnArch(target.Arch) {
+			http.Error(w, fmt.Sprintf("workload has no compose file for target architecture (%s)", target.Arch), 400)
+		} else {
+			http.Error(w, "target node is not in allowed_nodes for this workload", 403)
+		}
 		return
 	}
 
@@ -2482,6 +2522,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		Name    string `json:"name"`
 		IP      string `json:"ip"`
 		Version string `json:"version"`
+		Arch    string `json:"arch"` // CPU architecture (amd64, arm64, etc.)
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
@@ -2527,6 +2568,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		Healthy:  true,
 		LastSeen: time.Now(),
 		Version:  req.Version,
+		Arch:     req.Arch,
 	}
 
 	a.stateMu.Lock()
@@ -2539,6 +2581,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		IP:      a.ip,
 		Healthy: true,
 		Version: Version,
+		Arch:    runtime.GOARCH,
 	}}
 	for _, p := range a.state.Peers {
 		if p.ID != req.ID {
@@ -2612,6 +2655,7 @@ func (a *Agent) apiListNodes(w http.ResponseWriter, r *http.Request) {
 			"last_seen": time.Now(),
 			"is_self":   true,
 			"version":   Version,
+			"arch":      runtime.GOARCH,
 		},
 	}
 	for _, p := range a.state.Peers {
@@ -2623,6 +2667,7 @@ func (a *Agent) apiListNodes(w http.ResponseWriter, r *http.Request) {
 			"last_seen": p.LastSeen,
 			"is_self":   false,
 			"version":   p.Version,
+			"arch":      p.Arch,
 		})
 	}
 	a.stateMu.RUnlock()
@@ -3779,13 +3824,57 @@ func (a *Agent) autostartWorkloads() {
 	}
 }
 
+// getComposeForArch returns the appropriate compose content for the current architecture.
+// Priority: arch-specific compose (compose_amd64/compose_arm64) > default compose
+func (wl *Workload) getComposeForArch() string {
+	arch := runtime.GOARCH
+	switch arch {
+	case "amd64":
+		if wl.ComposeAmd64 != "" {
+			return wl.ComposeAmd64
+		}
+	case "arm64":
+		if wl.ComposeArm64 != "" {
+			return wl.ComposeArm64
+		}
+	}
+	// Fall back to default compose
+	return wl.Compose
+}
+
+// canRunOnArch checks if a workload has a compose file that can run on the given architecture.
+// Returns true if:
+// - The default Compose field is set (works as fallback for any arch), OR
+// - An architecture-specific compose file exists for the given arch
+func (wl *Workload) canRunOnArch(arch string) bool {
+	// If there's a default compose, it can run on any architecture
+	if wl.Compose != "" {
+		return true
+	}
+	// Otherwise, check for arch-specific compose
+	switch arch {
+	case "amd64":
+		return wl.ComposeAmd64 != ""
+	case "arm64":
+		return wl.ComposeArm64 != ""
+	}
+	// Unknown architecture - no compose available
+	return false
+}
+
 func (a *Agent) deployWorkload(wl *Workload) error {
 	dir := filepath.Join(a.composeDir, wl.Name)
 	os.MkdirAll(dir, 0755)
 
+	// Select compose based on node architecture
+	composeContent := wl.getComposeForArch()
+	if composeContent == "" {
+		return fmt.Errorf("no compose file available for architecture %s", runtime.GOARCH)
+	}
+
 	// Write compose
 	path := filepath.Join(dir, "docker-compose.yml")
-	if err := os.WriteFile(path, []byte(wl.Compose), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(composeContent), 0644); err != nil {
 		return err
 	}
 
@@ -4367,9 +4456,11 @@ func (a *Agent) checkFailover() {
 }
 
 // shouldClaim determines if this node should claim an orphaned workload.
+// Considers both allowed_nodes and architecture compatibility.
 // NOTE: Caller must already hold stateMu lock.
 func (a *Agent) shouldClaim(wl *Workload) bool {
 	// First check if this node is even allowed to run the workload
+	// (this also checks architecture compatibility via runtime.GOARCH)
 	if !a.isThisNodeAllowed(wl) {
 		return false
 	}
@@ -4380,9 +4471,9 @@ func (a *Agent) shouldClaim(wl *Workload) bool {
 	// Add ourselves if allowed (we already checked above)
 	candidates = append(candidates, a.hwid)
 
-	// Add healthy peers that are allowed
+	// Add healthy peers that are allowed (and have compatible architecture)
 	for _, p := range a.state.Peers {
-		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name) {
+		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name, p.Arch) {
 			candidates = append(candidates, p.ID)
 		}
 	}
