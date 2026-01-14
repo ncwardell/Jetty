@@ -770,8 +770,14 @@ func (a *Agent) isIPTaken(ipStr string) bool {
 }
 
 // isNodeAllowed checks if a node (by ID or name) is allowed to run a workload.
-// Empty or ["*"] allowed_nodes means all nodes are allowed.
-func (a *Agent) isNodeAllowed(wl *Workload, nodeID, nodeName string) bool {
+// Checks both the allowed_nodes list AND architecture compatibility.
+// Empty or ["*"] allowed_nodes means all nodes are allowed (but arch must still match).
+func (a *Agent) isNodeAllowed(wl *Workload, nodeID, nodeName, nodeArch string) bool {
+	// First check architecture compatibility
+	if nodeArch != "" && !wl.canRunOnArch(nodeArch) {
+		return false
+	}
+
 	// Empty list or nil means all nodes allowed
 	if len(wl.AllowedNodes) == 0 {
 		return true
@@ -792,7 +798,7 @@ func (a *Agent) isNodeAllowed(wl *Workload, nodeID, nodeName string) bool {
 
 // isThisNodeAllowed checks if this node is allowed to run a workload.
 func (a *Agent) isThisNodeAllowed(wl *Workload) bool {
-	return a.isNodeAllowed(wl, a.hwid, a.hostname)
+	return a.isNodeAllowed(wl, a.hwid, a.hostname, runtime.GOARCH)
 }
 
 // isWorkloadNameTaken checks if a workload name is already in use.
@@ -807,11 +813,12 @@ func (a *Agent) isWorkloadNameTaken(name string) bool {
 }
 
 // findAllowedNode finds a healthy peer that is allowed to run this workload.
+// Checks both allowed_nodes list and architecture compatibility.
 // Returns nil if no suitable node is found.
 // Caller must hold stateMu lock (read).
 func (a *Agent) findAllowedNode(wl *Workload) *Peer {
 	for _, p := range a.state.Peers {
-		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name) {
+		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name, p.Arch) {
 			return p
 		}
 	}
@@ -2160,6 +2167,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 			Name:    a.hostname,
 			IP:      a.ip,
 			Healthy: true,
+			Arch:    runtime.GOARCH,
 		}
 		targetIsSelf = true
 	} else {
@@ -2192,9 +2200,14 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if target is allowed to run this workload
-	if !a.isNodeAllowed(found, target.ID, target.Name) {
-		http.Error(w, "target node is not in allowed_nodes for this workload", 403)
+	// Check if target is allowed to run this workload (includes arch compatibility)
+	if !a.isNodeAllowed(found, target.ID, target.Name, target.Arch) {
+		// Provide a more specific error message
+		if !found.canRunOnArch(target.Arch) {
+			http.Error(w, fmt.Sprintf("workload has no compose file for target architecture (%s)", target.Arch), 400)
+		} else {
+			http.Error(w, "target node is not in allowed_nodes for this workload", 403)
+		}
 		return
 	}
 
@@ -3829,6 +3842,26 @@ func (wl *Workload) getComposeForArch() string {
 	return wl.Compose
 }
 
+// canRunOnArch checks if a workload has a compose file that can run on the given architecture.
+// Returns true if:
+// - The default Compose field is set (works as fallback for any arch), OR
+// - An architecture-specific compose file exists for the given arch
+func (wl *Workload) canRunOnArch(arch string) bool {
+	// If there's a default compose, it can run on any architecture
+	if wl.Compose != "" {
+		return true
+	}
+	// Otherwise, check for arch-specific compose
+	switch arch {
+	case "amd64":
+		return wl.ComposeAmd64 != ""
+	case "arm64":
+		return wl.ComposeArm64 != ""
+	}
+	// Unknown architecture - no compose available
+	return false
+}
+
 func (a *Agent) deployWorkload(wl *Workload) error {
 	dir := filepath.Join(a.composeDir, wl.Name)
 	os.MkdirAll(dir, 0755)
@@ -4423,9 +4456,11 @@ func (a *Agent) checkFailover() {
 }
 
 // shouldClaim determines if this node should claim an orphaned workload.
+// Considers both allowed_nodes and architecture compatibility.
 // NOTE: Caller must already hold stateMu lock.
 func (a *Agent) shouldClaim(wl *Workload) bool {
 	// First check if this node is even allowed to run the workload
+	// (this also checks architecture compatibility via runtime.GOARCH)
 	if !a.isThisNodeAllowed(wl) {
 		return false
 	}
@@ -4436,9 +4471,9 @@ func (a *Agent) shouldClaim(wl *Workload) bool {
 	// Add ourselves if allowed (we already checked above)
 	candidates = append(candidates, a.hwid)
 
-	// Add healthy peers that are allowed
+	// Add healthy peers that are allowed (and have compatible architecture)
 	for _, p := range a.state.Peers {
-		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name) {
+		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name, p.Arch) {
 			candidates = append(candidates, p.ID)
 		}
 	}
