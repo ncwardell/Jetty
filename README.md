@@ -137,6 +137,18 @@ Before deploying, configure your WARP Connector in the Zero Trust Dashboard:
 
 This ensures WARP only routes traffic for the mesh network (`100.96.x.x` IPs) and doesn't mess with your regular internet traffic. Without this, your nodes will be trying to route everything through WARP like absolute maniacs.
 
+### ⚠️ Important: Host Networking Required
+
+> **Jetty MUST run with `--net host` and `--privileged`.**
+>
+> This isn't optional. Jetty needs to:
+> - Create network interfaces (`jetty0`)
+> - Set up IPIP tunnels between nodes
+> - Manipulate iptables/nftables rules
+> - Run WARP and bind to mesh IPs
+>
+> If you try to run it in bridge networking, it will not work. Don't even try. We've all been there.
+
 ### Bootstrap First Node
 
 ```bash
