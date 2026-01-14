@@ -46,6 +46,9 @@ var unhealthyPeerClient = &http.Client{
 // Valid workload name pattern (alphanumeric, dash, underscore only)
 var validNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// Version is the current Jetty agent version (set at build time via -ldflags or defaults to "dev")
+var Version = "2.0.0"
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -56,6 +59,7 @@ type Peer struct {
 	IP       string    `json:"ip"`        // WARP IP (100.96.x.x) - primary address for node communication
 	Healthy  bool      `json:"healthy"`
 	LastSeen time.Time `json:"last_seen"`
+	Version  string    `json:"version"`   // Agent version
 }
 
 type Workload struct {
@@ -1037,10 +1041,11 @@ func (a *Agent) joinCluster() error {
 	// Join request - IP may be empty if WARP not yet configured
 	// (will be set after we receive WARP token and connect)
 	req := map[string]string{
-		"secret": a.clusterSecret, // Cluster secret for authentication
-		"id":     a.hwid,
-		"name":   a.hostname,
-		"ip":     a.ip, // WARP IP (may be empty, set after WARP connect)
+		"secret":  a.clusterSecret, // Cluster secret for authentication
+		"id":      a.hwid,
+		"name":    a.hostname,
+		"ip":      a.ip, // WARP IP (may be empty, set after WARP connect)
+		"version": Version,
 	}
 
 	data, _ := json.Marshal(req)
@@ -1218,6 +1223,7 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/join", a.apiJoin).Methods("POST")
 	r.HandleFunc("/api/nodes", a.apiListNodes).Methods("GET")
 	r.HandleFunc("/api/nodes/{id}", a.apiRemoveNode).Methods("DELETE")
+	r.HandleFunc("/api/nodes/{id}/update", a.apiUpdateNode).Methods("POST")
 	r.HandleFunc("/api/health", a.apiHealth).Methods("GET")
 	r.HandleFunc("/api/sync", a.apiSync).Methods("GET")
 	r.HandleFunc("/api/tunnel", a.apiGetTunnel).Methods("GET")
@@ -2471,10 +2477,11 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 // @Router /join [post]
 func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Secret string `json:"secret"` // Cluster secret for authentication
-		ID     string `json:"id"`
-		Name   string `json:"name"`
-		IP     string `json:"ip"`
+		Secret  string `json:"secret"` // Cluster secret for authentication
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		IP      string `json:"ip"`
+		Version string `json:"version"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
@@ -2519,6 +2526,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		IP:       req.IP,
 		Healthy:  true,
 		LastSeen: time.Now(),
+		Version:  req.Version,
 	}
 
 	a.stateMu.Lock()
@@ -2530,6 +2538,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		Name:    a.hostname,
 		IP:      a.ip,
 		Healthy: true,
+		Version: Version,
 	}}
 	for _, p := range a.state.Peers {
 		if p.ID != req.ID {
@@ -2602,6 +2611,7 @@ func (a *Agent) apiListNodes(w http.ResponseWriter, r *http.Request) {
 			"healthy":   true,
 			"last_seen": time.Now(),
 			"is_self":   true,
+			"version":   Version,
 		},
 	}
 	for _, p := range a.state.Peers {
@@ -2612,6 +2622,7 @@ func (a *Agent) apiListNodes(w http.ResponseWriter, r *http.Request) {
 			"healthy":   p.Healthy,
 			"last_seen": p.LastSeen,
 			"is_self":   false,
+			"version":   p.Version,
 		})
 	}
 	a.stateMu.RUnlock()
@@ -2692,6 +2703,276 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 		"orphaned_workloads": orphanedWorkloads,
 		"message":            "node removed; orphaned workloads will failover if revive is enabled",
 	})
+}
+
+// apiUpdateNode godoc
+// @Summary Update a node (self-update)
+// @Description Triggers a self-update of the node by pulling a new Docker image and restarting. Only works on the target node itself - requests to other nodes will be proxied.
+// @Tags nodes
+// @Accept json
+// @Produce json
+// @Param id path string true "Node ID (HWID), name, or 'self'"
+// @Param request body NodeUpdateRequest true "Update request with image to pull"
+// @Success 200 {object} NodeUpdateResponse
+// @Failure 400 {object} ErrorResponse "Invalid request"
+// @Failure 404 {object} ErrorResponse "Node not found"
+// @Failure 500 {object} ErrorResponse "Update failed"
+// @Router /nodes/{id}/update [post]
+func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	nodeID := vars["id"]
+
+	// Parse request body
+	var req struct {
+		Image string `json:"image"` // Docker image to pull (e.g., "ghcr.io/ncwardell/jetty:2.1.0")
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", 400)
+		return
+	}
+
+	if req.Image == "" {
+		http.Error(w, "image is required", 400)
+		return
+	}
+
+	// Check if this is for self or another node
+	isSelf := nodeID == "self" || nodeID == a.hwid || nodeID == a.hostname
+
+	if !isSelf {
+		// Find the peer and proxy the request
+		a.stateMu.RLock()
+		var targetPeer *Peer
+		for _, p := range a.state.Peers {
+			if p.ID == nodeID || p.Name == nodeID {
+				targetPeer = p
+				break
+			}
+		}
+		a.stateMu.RUnlock()
+
+		if targetPeer == nil {
+			http.Error(w, "node not found", 404)
+			return
+		}
+
+		// Proxy request to target node
+		proxyURL := fmt.Sprintf("http://%s:%d/api/nodes/self/update", targetPeer.IP, a.apiPort)
+		reqBody, _ := json.Marshal(req)
+		proxyReq, _ := http.NewRequest("POST", proxyURL, strings.NewReader(string(reqBody)))
+		proxyReq.Header.Set("Content-Type", "application/json")
+		if a.clusterSecret != "" {
+			proxyReq.Header.Set("X-API-Key", a.clusterSecret)
+		}
+
+		resp, err := peerClient.Do(proxyReq)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to reach node: %v", err), 503)
+			return
+		}
+		defer resp.Body.Close()
+
+		// Forward response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	// Self-update: pull image and restart
+	log.Printf("Starting self-update to image: %s", req.Image)
+
+	// Step 1: Pull the new image
+	pullCmd := exec.Command("docker", "pull", req.Image)
+	pullOutput, err := pullCmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Failed to pull image %s: %v\nOutput: %s", req.Image, err, pullOutput)
+		http.Error(w, fmt.Sprintf("failed to pull image: %v", err), 500)
+		return
+	}
+	log.Printf("Pulled image: %s", req.Image)
+
+	// Step 2: Get our container ID
+	containerID, err := a.getSelfContainerID()
+	if err != nil {
+		log.Printf("Failed to get own container ID: %v", err)
+		http.Error(w, fmt.Sprintf("failed to get container ID: %v", err), 500)
+		return
+	}
+	log.Printf("Self container ID: %s", containerID)
+
+	// Step 3: Inspect self to get mounts and config
+	inspectCmd := exec.Command("docker", "inspect", containerID)
+	inspectOutput, err := inspectCmd.Output()
+	if err != nil {
+		log.Printf("Failed to inspect container: %v", err)
+		http.Error(w, fmt.Sprintf("failed to inspect container: %v", err), 500)
+		return
+	}
+
+	var containers []struct {
+		HostConfig struct {
+			Binds       []string `json:"Binds"`
+			NetworkMode string   `json:"NetworkMode"`
+			Privileged  bool     `json:"Privileged"`
+			CapAdd      []string `json:"CapAdd"`
+		} `json:"HostConfig"`
+		Config struct {
+			Env []string `json:"Env"`
+		} `json:"Config"`
+		Name string `json:"Name"`
+	}
+	if err := json.Unmarshal(inspectOutput, &containers); err != nil {
+		log.Printf("Failed to parse inspect output: %v", err)
+		http.Error(w, fmt.Sprintf("failed to parse container config: %v", err), 500)
+		return
+	}
+
+	if len(containers) == 0 {
+		http.Error(w, "container not found", 500)
+		return
+	}
+
+	container := containers[0]
+	containerName := strings.TrimPrefix(container.Name, "/")
+
+	// Step 4: Build docker run command for new container
+	args := []string{"run", "-d", "--name", containerName + "-update"}
+
+	// Add mounts
+	for _, bind := range container.HostConfig.Binds {
+		args = append(args, "-v", bind)
+	}
+
+	// Add network mode
+	if container.HostConfig.NetworkMode != "" {
+		args = append(args, "--network", string(container.HostConfig.NetworkMode))
+	}
+
+	// Add privileged if set
+	if container.HostConfig.Privileged {
+		args = append(args, "--privileged")
+	}
+
+	// Add capabilities
+	for _, cap := range container.HostConfig.CapAdd {
+		args = append(args, "--cap-add", cap)
+	}
+
+	// Add restart policy
+	args = append(args, "--restart", "unless-stopped")
+
+	// Add the image
+	args = append(args, req.Image)
+
+	log.Printf("Creating new container with: docker %v", args)
+
+	// Step 5: Create and start new container
+	createCmd := exec.Command("docker", args...)
+	createOutput, err := createCmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Failed to create new container: %v\nOutput: %s", err, createOutput)
+		http.Error(w, fmt.Sprintf("failed to create new container: %v", err), 500)
+		return
+	}
+	newContainerID := strings.TrimSpace(string(createOutput))
+	log.Printf("Created new container: %s", newContainerID)
+
+	// Step 6: Wait briefly for new container to start
+	time.Sleep(2 * time.Second)
+
+	// Step 7: Rename containers - old one gets -old suffix, new one gets original name
+	// First rename old container
+	renameOldCmd := exec.Command("docker", "rename", containerName, containerName+"-old")
+	if out, err := renameOldCmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: failed to rename old container: %v, output: %s", err, out)
+	}
+
+	// Rename new container to original name
+	renameNewCmd := exec.Command("docker", "rename", containerName+"-update", containerName)
+	if out, err := renameNewCmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: failed to rename new container: %v, output: %s", err, out)
+	}
+
+	// Respond before stopping self
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "updating",
+		"message": "new container started, stopping old container",
+		"image":   req.Image,
+		"old_id":  containerID,
+		"new_id":  newContainerID,
+	})
+
+	// Step 8: Stop old container (this will kill us)
+	go func() {
+		time.Sleep(1 * time.Second) // Give time for response to be sent
+		log.Printf("Stopping old container %s", containerID)
+		stopCmd := exec.Command("docker", "stop", containerID)
+		stopCmd.Run()
+		// If we get here, something went wrong - force exit
+		os.Exit(0)
+	}()
+}
+
+// getSelfContainerID returns this container's ID
+func (a *Agent) getSelfContainerID() (string, error) {
+	// Method 1: Check hostname (often the container ID)
+	hostname, _ := os.Hostname()
+	if len(hostname) == 12 || len(hostname) == 64 {
+		// Verify it's a valid container ID
+		cmd := exec.Command("docker", "inspect", hostname, "--format", "{{.Id}}")
+		if out, err := cmd.Output(); err == nil {
+			return strings.TrimSpace(string(out)), nil
+		}
+	}
+
+	// Method 2: Look for container with jetty in the name that's running
+	cmd := exec.Command("docker", "ps", "-q", "--filter", "name=jetty", "--filter", "status=running")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("docker ps failed: %w", err)
+	}
+
+	containers := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(containers) == 0 || containers[0] == "" {
+		return "", fmt.Errorf("no running jetty container found")
+	}
+
+	// If multiple, find the one whose PID 1 matches our process tree
+	if len(containers) == 1 {
+		return containers[0], nil
+	}
+
+	// Method 3: Check /proc/1/cpuset for container ID
+	cpuset, err := os.ReadFile("/proc/1/cpuset")
+	if err == nil {
+		// Format: /docker/<container_id>
+		parts := strings.Split(strings.TrimSpace(string(cpuset)), "/")
+		if len(parts) >= 3 && parts[1] == "docker" {
+			return parts[2], nil
+		}
+	}
+
+	// Method 4: Check cgroup
+	cgroup, err := os.ReadFile("/proc/self/cgroup")
+	if err == nil {
+		lines := strings.Split(string(cgroup), "\n")
+		for _, line := range lines {
+			// Look for docker in the cgroup path
+			if strings.Contains(line, "docker") {
+				parts := strings.Split(line, "/")
+				for _, p := range parts {
+					if len(p) == 64 {
+						return p, nil
+					}
+				}
+			}
+		}
+	}
+
+	// Return first container as fallback
+	return containers[0], nil
 }
 
 // apiHealth godoc

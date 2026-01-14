@@ -98,10 +98,11 @@ type ContainerInfo struct {
 
 // JoinRequest represents a cluster join request
 type JoinRequest struct {
-	Secret string `json:"secret"`
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	IP     string `json:"ip" example:"100.96.0.5"`
+	Secret  string `json:"secret"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	IP      string `json:"ip" example:"100.96.0.5"`
+	Version string `json:"version" example:"2.0.0"`
 }
 
 // JoinResponse represents a successful join response
@@ -171,6 +172,19 @@ type NodeResponse struct {
 	Healthy  bool   `json:"healthy" example:"true"`
 	LastSeen string `json:"last_seen" example:"2024-01-02T15:04:05Z"`
 	IsSelf   bool   `json:"is_self" example:"false"`
+	Version  string `json:"version" example:"2.0.0"`
+}
+
+// NodeUpdateRequest represents a request to update a node
+type NodeUpdateRequest struct {
+	Image string `json:"image" example:"ghcr.io/ncwardell/jetty:2.1.0"`
+}
+
+// NodeUpdateResponse represents the response from updating a node
+type NodeUpdateResponse struct {
+	Status  string `json:"status" example:"updating"`
+	Message string `json:"message" example:"pulling image and restarting"`
+	Image   string `json:"image" example:"ghcr.io/ncwardell/jetty:2.1.0"`
 }
 
 // RemoveNodeResponse represents the response when removing a node
