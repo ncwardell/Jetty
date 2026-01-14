@@ -532,6 +532,14 @@
             background: var(--accent-red);
         }
 
+        .workload-chip .status-indicator.remote {
+            background: var(--accent-blue);
+        }
+
+        .workload-chip .status-indicator.unknown {
+            background: var(--text-muted);
+        }
+
         /* Workloads Table */
         .table-container {
             overflow-x: auto;
@@ -584,6 +592,77 @@
         .status-badge.error {
             background: rgba(248, 81, 73, 0.2);
             color: var(--accent-red);
+        }
+
+        .status-badge.remote {
+            background: rgba(88, 166, 255, 0.2);
+            color: var(--accent-blue);
+        }
+
+        .status-badge.unknown {
+            background: rgba(110, 118, 129, 0.2);
+            color: var(--text-muted);
+        }
+
+        /* Resource Bars */
+        .resource-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+
+        .resource-item {
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+            padding: 12px;
+        }
+
+        .resource-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .resource-label {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        .resource-value {
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .resource-bar {
+            height: 8px;
+            background: var(--bg-primary);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .resource-bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+
+        .resource-bar-fill.low {
+            background: var(--accent-green);
+        }
+
+        .resource-bar-fill.medium {
+            background: var(--accent-yellow);
+        }
+
+        .resource-bar-fill.high {
+            background: var(--accent-red);
+        }
+
+        .resource-detail {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 6px;
         }
 
         .actions-cell {
@@ -999,6 +1078,37 @@
                     </div>
                 </div>
 
+                <div class="card" style="margin-bottom: 16px;">
+                    <div class="card-header">
+                        <h3 class="card-title">Cluster Resources</h3>
+                        <button class="btn btn-sm" onclick="refreshClusterHealth()">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="23 4 23 10 17 10"/>
+                                <polyline points="1 20 1 14 7 14"/>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                            </svg>
+                            Refresh
+                        </button>
+                    </div>
+                    <div class="card-body" id="clusterResourcesOverview">
+                        <div class="empty-state" style="padding: 20px;">
+                            <p>Connect to a cluster to see resources</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card" style="margin-bottom: 16px;">
+                    <div class="card-header">
+                        <h3 class="card-title">Cluster Nodes</h3>
+                        <button class="btn btn-sm" onclick="showPage('nodes')">View All</button>
+                    </div>
+                    <div class="card-body" id="clusterNodesOverview">
+                        <div class="empty-state">
+                            <p>Connect to a cluster to see nodes</p>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="card">
                     <div class="card-header">
                         <h3 class="card-title">Recent Workloads</h3>
@@ -1254,6 +1364,22 @@
         </div>
     </div>
 
+    <!-- Node Detail Panel -->
+    <div class="detail-panel" id="nodeDetailPanel">
+        <div class="detail-header">
+            <h2 class="detail-title" id="nodeDetailTitle">Node Details</h2>
+            <button class="modal-close" onclick="closeNodeDetailPanel()">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="18" y1="6" x2="6" y2="18"/>
+                    <line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+            </button>
+        </div>
+        <div class="detail-body" id="nodeDetailBody">
+            <!-- Populated dynamically -->
+        </div>
+    </div>
+
     <!-- Toast Container -->
     <div class="toast-container" id="toastContainer"></div>
 
@@ -1267,10 +1393,67 @@
             peers: [],
             workloads: [],
             tunnel: { configured: false, running: false },
-            warp: { enabled: false, ip: '' }
+            warp: { enabled: false, ip: '' },
+            clusterHealth: null // Cluster health/resources data
         };
 
         let draggedWorkload = null;
+
+        // Helper function to get CSS class for workload status
+        function getStatusClass(status) {
+            switch (status) {
+                case 'running': return 'running';
+                case 'stopped': return 'stopped';
+                case 'remote': return 'remote';
+                case 'error': return 'error';
+                case 'unknown': return 'unknown';
+                default: return 'unknown';
+            }
+        }
+
+        // Helper function to get display text for workload status
+        function getStatusText(status) {
+            switch (status) {
+                case 'running': return 'Running';
+                case 'stopped': return 'Stopped';
+                case 'remote': return 'Remote';
+                case 'error': return 'Error';
+                case 'unknown': return 'Unknown';
+                default: return 'Unknown';
+            }
+        }
+
+        // Helper function to format relative time
+        function formatRelativeTime(dateString) {
+            if (!dateString) return 'Unknown';
+            const date = new Date(dateString);
+            const now = new Date();
+            const diffMs = now - date;
+            const diffSecs = Math.floor(diffMs / 1000);
+            const diffMins = Math.floor(diffSecs / 60);
+            const diffHours = Math.floor(diffMins / 60);
+            const diffDays = Math.floor(diffHours / 24);
+
+            if (diffSecs < 10) return 'Just now';
+            if (diffSecs < 60) return `${diffSecs}s ago`;
+            if (diffMins < 60) return `${diffMins}m ago`;
+            if (diffHours < 24) return `${diffHours}h ago`;
+            return `${diffDays}d ago`;
+        }
+
+        // Helper function to get resource bar fill class based on percentage
+        function getResourceBarClass(percent) {
+            const value = parseFloat(percent) || 0;
+            if (value >= 80) return 'high';
+            if (value >= 50) return 'medium';
+            return 'low';
+        }
+
+        // Helper function to parse percentage string to number
+        function parsePercent(str) {
+            if (!str) return 0;
+            return parseFloat(str.replace('%', '')) || 0;
+        }
 
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
@@ -1328,6 +1511,8 @@
                 saveConnection();
                 closeConnectModal();
                 showToast('Connected to Jetty cluster', 'success');
+                // Fetch cluster health data for resource display
+                refreshClusterHealth();
             } catch (error) {
                 state.connected = false;
                 updateConnectionStatus();
@@ -1415,11 +1600,186 @@
         // UI Updates
         function updateUI() {
             updateStats();
+            updateClusterResourcesOverview();
+            updateClusterNodesOverview();
             updateNodesGrid();
             updateWorkloadsTable();
             updateOrchestrateGrid();
             updateRecentWorkloads();
             updateConnectionStatus();
+        }
+
+        // Fetch cluster health data from API
+        async function refreshClusterHealth() {
+            if (!state.connected) return;
+            try {
+                const health = await apiCall('/health');
+                state.clusterHealth = health;
+                updateClusterResourcesOverview();
+            } catch (error) {
+                console.error('Failed to fetch cluster health:', error);
+            }
+        }
+
+        // Update cluster resources overview section
+        function updateClusterResourcesOverview() {
+            const container = document.getElementById('clusterResourcesOverview');
+
+            if (!state.clusterHealth || !state.clusterHealth.nodes || state.clusterHealth.nodes.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state" style="padding: 20px;">
+                        <p>Connect to a cluster to see resources</p>
+                    </div>
+                `;
+                return;
+            }
+
+            const nodes = state.clusterHealth.nodes;
+
+            // Calculate aggregate stats
+            let totalCpu = 0, totalMem = 0, totalDisk = 0;
+            let cpuCount = 0, memCount = 0, diskCount = 0;
+
+            nodes.forEach(node => {
+                if (node.system) {
+                    if (node.system.cpu_percent) {
+                        totalCpu += parsePercent(node.system.cpu_percent);
+                        cpuCount++;
+                    }
+                    if (node.system.memory_percent) {
+                        totalMem += parsePercent(node.system.memory_percent);
+                        memCount++;
+                    }
+                    if (node.system.disk_percent) {
+                        totalDisk += parsePercent(node.system.disk_percent);
+                        diskCount++;
+                    }
+                }
+            });
+
+            const avgCpu = cpuCount > 0 ? (totalCpu / cpuCount).toFixed(1) : 0;
+            const avgMem = memCount > 0 ? (totalMem / memCount).toFixed(1) : 0;
+            const avgDisk = diskCount > 0 ? (totalDisk / diskCount).toFixed(1) : 0;
+
+            container.innerHTML = `
+                <div class="resource-grid">
+                    <div class="resource-item">
+                        <div class="resource-header">
+                            <span class="resource-label">Average CPU</span>
+                            <span class="resource-value">${avgCpu}%</span>
+                        </div>
+                        <div class="resource-bar">
+                            <div class="resource-bar-fill ${getResourceBarClass(avgCpu)}" style="width: ${Math.min(avgCpu, 100)}%"></div>
+                        </div>
+                        <div class="resource-detail">Across ${cpuCount} node(s)</div>
+                    </div>
+                    <div class="resource-item">
+                        <div class="resource-header">
+                            <span class="resource-label">Average Memory</span>
+                            <span class="resource-value">${avgMem}%</span>
+                        </div>
+                        <div class="resource-bar">
+                            <div class="resource-bar-fill ${getResourceBarClass(avgMem)}" style="width: ${Math.min(avgMem, 100)}%"></div>
+                        </div>
+                        <div class="resource-detail">Across ${memCount} node(s)</div>
+                    </div>
+                    <div class="resource-item">
+                        <div class="resource-header">
+                            <span class="resource-label">Average Disk</span>
+                            <span class="resource-value">${avgDisk}%</span>
+                        </div>
+                        <div class="resource-bar">
+                            <div class="resource-bar-fill ${getResourceBarClass(avgDisk)}" style="width: ${Math.min(avgDisk, 100)}%"></div>
+                        </div>
+                        <div class="resource-detail">Across ${diskCount} node(s)</div>
+                    </div>
+                </div>
+                <div style="margin-top: 16px;">
+                    <div class="node-workloads-title" style="margin-bottom: 8px;">Per-Node Resources</div>
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Node</th>
+                                    <th>CPU</th>
+                                    <th>Memory</th>
+                                    <th>Disk</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${nodes.map(node => {
+                                    const cpu = node.system?.cpu_percent || 'N/A';
+                                    const mem = node.system?.memory_percent || 'N/A';
+                                    const disk = node.system?.disk_percent || 'N/A';
+                                    const statusClass = node.status === 'healthy' ? 'running' : (node.status === 'medium' ? 'stopped' : 'error');
+                                    const statusText = node.status || 'Unknown';
+                                    return `
+                                        <tr onclick="showNodeDetail('${node.id}')" style="cursor: pointer;">
+                                            <td>${node.name || node.id.substring(0, 8)}</td>
+                                            <td>${cpu}</td>
+                                            <td>${mem}</td>
+                                            <td>${disk}</td>
+                                            <td><span class="status-badge ${statusClass}">${statusText}</span></td>
+                                        </tr>
+                                    `;
+                                }).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        function updateClusterNodesOverview() {
+            const container = document.getElementById('clusterNodesOverview');
+            const allNodes = [state.node, ...state.peers].filter(Boolean);
+
+            if (allNodes.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state" style="padding: 20px;">
+                        <p>Connect to a cluster to see nodes</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = `
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Node</th>
+                                <th>Status</th>
+                                <th>Mesh IP</th>
+                                <th>Last Seen</th>
+                                <th>Workloads</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${allNodes.map(node => {
+                                const isCurrentNode = node.id === state.node?.id || node.is_self;
+                                const healthClass = node.healthy !== false ? 'running' : 'error';
+                                const healthText = node.healthy !== false ? 'Healthy' : 'Unhealthy';
+                                const lastSeen = formatRelativeTime(node.last_seen);
+                                const nodeWorkloads = state.workloads.filter(w => w.owner?.id === node.id);
+                                return `
+                                    <tr onclick="showNodeDetail('${node.id}')" style="cursor: pointer;">
+                                        <td>
+                                            ${node.name || node.id.substring(0, 8)}
+                                            ${isCurrentNode ? ' <span class="node-badge">Current</span>' : ''}
+                                        </td>
+                                        <td><span class="status-badge ${healthClass}">${healthText}</span></td>
+                                        <td><code>${node.ip || 'N/A'}</code></td>
+                                        <td>${lastSeen}</td>
+                                        <td>${nodeWorkloads.length}</td>
+                                    </tr>
+                                `;
+                            }).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `;
         }
 
         function updateStats() {
@@ -1452,24 +1812,36 @@
             }
 
             grid.innerHTML = allNodes.map(node => {
-                const isCurrentNode = node.id === state.node?.id;
+                const isCurrentNode = node.id === state.node?.id || node.is_self;
                 const nodeWorkloads = state.workloads.filter(w => w.owner?.id === node.id);
                 const healthClass = node.healthy !== false ? 'healthy' : 'unhealthy';
+                const lastSeen = formatRelativeTime(node.last_seen);
 
                 return `
-                    <div class="node-card">
+                    <div class="node-card" onclick="showNodeDetail('${node.id}')" style="cursor: pointer;">
                         <div class="node-header">
                             <div class="node-name">
                                 ${node.name || node.id.substring(0, 8)}
                                 ${isCurrentNode ? '<span class="node-badge">Current</span>' : ''}
                             </div>
-                            <div class="node-health ${healthClass}">
-                                <span class="status-dot ${healthClass === 'healthy' ? 'connected' : ''}"></span>
-                                ${healthClass === 'healthy' ? 'Healthy' : 'Unhealthy'}
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <div class="node-health ${healthClass}">
+                                    <span class="status-dot ${healthClass === 'healthy' ? 'connected' : ''}"></span>
+                                    ${healthClass === 'healthy' ? 'Healthy' : 'Unhealthy'}
+                                </div>
+                                ${!isCurrentNode ? `
+                                    <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteNode('${node.id}')" title="Remove node">
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <polyline points="3 6 5 6 21 6"/>
+                                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                                        </svg>
+                                    </button>
+                                ` : ''}
                             </div>
                         </div>
                         <div class="node-details">
                             <p><strong>Mesh IP:</strong> ${node.ip || 'N/A'}</p>
+                            <p><strong>Last Seen:</strong> ${lastSeen}</p>
                             ${node.warp_ip || node.warpIP ? `<p><strong>WARP IP:</strong> ${node.warp_ip || node.warpIP}</p>` : ''}
                             ${node.tunnel_host || node.tunnelHost ? `<p><strong>Tunnel:</strong> ${node.tunnel_host || node.tunnelHost}</p>` : ''}
                         </div>
@@ -1477,10 +1849,9 @@
                             <div class="node-workloads-title">Workloads (${nodeWorkloads.length})</div>
                             <div class="node-workloads-list">
                                 ${nodeWorkloads.map(w => {
-                                    const isRunning = w.status === 'running';
-                                    const statusClass = isRunning ? 'running' : 'stopped';
+                                    const statusClass = getStatusClass(w.status);
                                     return `
-                                        <div class="workload-chip" onclick="showWorkloadDetail('${w.name}')">
+                                        <div class="workload-chip" onclick="event.stopPropagation(); showWorkloadDetail('${w.name}')">
                                             <span class="status-indicator ${statusClass}"></span>
                                             ${w.name}
                                         </div>
@@ -1509,10 +1880,11 @@
             }
 
             tbody.innerHTML = state.workloads.map(w => {
-                const isRunning = w.status === 'running';
-                const statusClass = isRunning ? 'running' : 'stopped';
-                const statusText = isRunning ? 'Running' : 'Stopped';
+                const statusClass = getStatusClass(w.status);
+                const statusText = getStatusText(w.status);
                 const ownerName = w.owner?.name || w.owner?.id?.substring(0, 8) || 'Unknown';
+                const isLocal = w.status !== 'remote';
+                const isRunning = w.status === 'running';
 
                 return `
                     <tr>
@@ -1531,7 +1903,7 @@
                         <td>${ownerName}</td>
                         <td>${w.revive ? 'Yes' : 'No'}</td>
                         <td class="actions-cell">
-                            ${isRunning ? `
+                            ${isLocal ? (isRunning ? `
                                 <button class="btn btn-sm" onclick="stopWorkload('${w.name}')" title="Stop">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                         <rect x="6" y="6" width="12" height="12"/>
@@ -1543,7 +1915,7 @@
                                         <polygon points="5 3 19 12 5 21 5 3"/>
                                     </svg>
                                 </button>
-                            `}
+                            `) : ''}
                             <button class="btn btn-sm" onclick="openMoveModal('${w.name}')" title="Move">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <polyline points="5 9 2 12 5 15"/>
@@ -1621,8 +1993,7 @@
                             <div class="node-workloads-title">Drag workloads here (${nodeWorkloads.length})</div>
                             <div class="node-workloads-list">
                                 ${nodeWorkloads.map(w => {
-                                    const isRunning = w.status === 'running';
-                                    const statusClass = isRunning ? 'running' : 'stopped';
+                                    const statusClass = getStatusClass(w.status);
                                     return `
                                         <div class="workload-chip"
                                              draggable="true"
@@ -1671,13 +2042,13 @@
                         </thead>
                         <tbody>
                             ${state.workloads.slice(0, 5).map(w => {
-                                const isRunning = w.status === 'running';
-                                const statusClass = isRunning ? 'running' : 'stopped';
+                                const statusClass = getStatusClass(w.status);
+                                const statusText = getStatusText(w.status);
                                 const ownerName = w.owner?.name || w.owner?.id?.substring(0, 8) || 'Unknown';
                                 return `
                                     <tr onclick="showWorkloadDetail('${w.name}')" style="cursor: pointer;">
                                         <td>${w.name}</td>
-                                        <td><span class="status-badge ${statusClass}">${isRunning ? 'Running' : 'Stopped'}</span></td>
+                                        <td><span class="status-badge ${statusClass}">${statusText}</span></td>
                                         <td><code>${w.ip}</code></td>
                                         <td>${ownerName}</td>
                                     </tr>
@@ -1797,6 +2168,32 @@
             }
         }
 
+        async function deleteNode(nodeId) {
+            const node = state.peers.find(p => p.id === nodeId);
+            const nodeName = node?.name || nodeId.substring(0, 8);
+            const nodeWorkloads = state.workloads.filter(w => w.owner?.id === nodeId);
+
+            let message = `Are you sure you want to remove node "${nodeName}" from the cluster?`;
+            if (nodeWorkloads.length > 0) {
+                message += `\n\nThis node owns ${nodeWorkloads.length} workload(s) which will be orphaned.`;
+                if (nodeWorkloads.some(w => w.revive)) {
+                    message += ' Workloads with revive enabled will be migrated to another node.';
+                }
+            }
+
+            if (!confirm(message)) {
+                return;
+            }
+
+            try {
+                await apiCall(`/nodes/${nodeId}`, 'DELETE');
+                showToast(`Node "${nodeName}" removed from cluster`, 'success');
+                await refreshStatus();
+            } catch (error) {
+                showToast(`Failed to remove node: ${error.message}`, 'error');
+            }
+        }
+
         // Move Workload
         let workloadToMove = null;
 
@@ -1894,9 +2291,16 @@
             try {
                 const workload = await apiCall(`/workloads/${name}`);
                 const ownerName = workload.owner?.name || workload.owner?.id?.substring(0, 8) || 'Unknown';
+                const isLocal = workload.is_local !== false;
                 const isRunning = workload.containers?.some(c => c.running);
+                const hasError = workload.error;
 
                 body.innerHTML = `
+                    ${hasError ? `
+                    <div style="background: rgba(248, 81, 73, 0.1); border: 1px solid var(--accent-red); border-radius: 6px; padding: 12px; margin-bottom: 16px; color: var(--accent-red); font-size: 13px;">
+                        <strong>Note:</strong> ${escapeHtml(workload.error)}
+                    </div>
+                    ` : ''}
                     <div class="detail-section">
                         <div class="detail-section-title">Configuration</div>
                         <div class="detail-row">
@@ -1909,7 +2313,7 @@
                         </div>
                         <div class="detail-row">
                             <span class="detail-label">Owner Node</span>
-                            <span class="detail-value">${ownerName}</span>
+                            <span class="detail-value">${ownerName}${isLocal ? ' <span class="node-badge">Local</span>' : ''}</span>
                         </div>
                         <div class="detail-row">
                             <span class="detail-label">Revive</span>
@@ -1943,7 +2347,7 @@
                                     ${c.uptime ? `<span><strong>Uptime:</strong> ${c.uptime}</span>` : ''}
                                 </div>
                             </div>
-                        `).join('') || '<p style="color: var(--text-muted);">No containers</p>'}
+                        `).join('') || '<p style="color: var(--text-muted);">No container information available</p>'}
                     </div>
 
                     <div class="detail-section">
@@ -1952,12 +2356,13 @@
                     </div>
 
                     <div class="detail-actions">
-                        ${isRunning ? `
+                        ${isLocal ? (isRunning ? `
                             <button class="btn" onclick="stopWorkload('${name}')">Stop</button>
                         ` : `
                             <button class="btn btn-success" onclick="startWorkload('${name}')">Start</button>
-                        `}
-                        <button class="btn" onclick="viewLogs('${name}')">View Logs</button>
+                        `) : ''}
+                        ${isLocal ? `<button class="btn" onclick="viewLogs('${name}')">View Logs</button>` : ''}
+                        <button class="btn" onclick="openMoveModal('${name}')">Move</button>
                         <button class="btn btn-danger" onclick="deleteWorkload('${name}'); closeDetailPanel();">Delete</button>
                     </div>
                 `;
@@ -1968,6 +2373,154 @@
 
         function closeDetailPanel() {
             document.getElementById('detailPanel').classList.remove('open');
+        }
+
+        // Node Detail Panel
+        async function showNodeDetail(nodeId) {
+            const panel = document.getElementById('nodeDetailPanel');
+            const title = document.getElementById('nodeDetailTitle');
+            const body = document.getElementById('nodeDetailBody');
+
+            // Find node in state
+            const allNodes = [state.node, ...state.peers].filter(Boolean);
+            const node = allNodes.find(n => n.id === nodeId);
+            const nodeName = node?.name || nodeId.substring(0, 8);
+
+            title.textContent = nodeName;
+            body.innerHTML = '<div style="text-align: center; padding: 40px;"><div class="spinner"></div></div>';
+            panel.classList.add('open');
+
+            try {
+                // Fetch health for this specific node
+                const health = await apiCall(`/health?node=${nodeId}`);
+                const nodeHealth = health.nodes?.find(n => n.id === nodeId) || health.nodes?.[0];
+
+                if (!nodeHealth) {
+                    throw new Error('Node not found');
+                }
+
+                const isCurrentNode = nodeHealth.id === state.node?.id;
+                const nodeWorkloads = state.workloads.filter(w => w.owner?.id === nodeId);
+                const sys = nodeHealth.system || {};
+
+                body.innerHTML = `
+                    <div class="detail-section">
+                        <div class="detail-section-title">Node Information</div>
+                        <div class="detail-row">
+                            <span class="detail-label">Name</span>
+                            <span class="detail-value">${nodeHealth.name || 'Unknown'}${isCurrentNode ? ' <span class="node-badge">Current</span>' : ''}</span>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">ID</span>
+                            <span class="detail-value"><code>${nodeHealth.id}</code></span>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Mesh IP</span>
+                            <span class="detail-value"><code>${nodeHealth.ip || 'N/A'}</code></span>
+                        </div>
+                        ${nodeHealth.public_ip ? `
+                        <div class="detail-row">
+                            <span class="detail-label">Public IP</span>
+                            <span class="detail-value"><code>${nodeHealth.public_ip}</code></span>
+                        </div>
+                        ` : ''}
+                        <div class="detail-row">
+                            <span class="detail-label">Status</span>
+                            <span class="detail-value">
+                                <span class="status-badge ${nodeHealth.status === 'healthy' ? 'running' : (nodeHealth.status === 'medium' ? 'stopped' : 'error')}">
+                                    ${nodeHealth.status || 'Unknown'}
+                                </span>
+                            </span>
+                        </div>
+                        ${sys.uptime ? `
+                        <div class="detail-row">
+                            <span class="detail-label">Uptime</span>
+                            <span class="detail-value">${sys.uptime}</span>
+                        </div>
+                        ` : ''}
+                        ${sys.load_average ? `
+                        <div class="detail-row">
+                            <span class="detail-label">Load Average</span>
+                            <span class="detail-value">${sys.load_average}</span>
+                        </div>
+                        ` : ''}
+                    </div>
+
+                    <div class="detail-section">
+                        <div class="detail-section-title">Resources</div>
+                        <div class="resource-grid" style="margin-top: 12px;">
+                            <div class="resource-item">
+                                <div class="resource-header">
+                                    <span class="resource-label">CPU</span>
+                                    <span class="resource-value">${sys.cpu_percent || 'N/A'}</span>
+                                </div>
+                                ${sys.cpu_percent ? `
+                                <div class="resource-bar">
+                                    <div class="resource-bar-fill ${getResourceBarClass(sys.cpu_percent)}" style="width: ${Math.min(parsePercent(sys.cpu_percent), 100)}%"></div>
+                                </div>
+                                ` : ''}
+                            </div>
+                            <div class="resource-item">
+                                <div class="resource-header">
+                                    <span class="resource-label">Memory</span>
+                                    <span class="resource-value">${sys.memory_percent || 'N/A'}</span>
+                                </div>
+                                ${sys.memory_percent ? `
+                                <div class="resource-bar">
+                                    <div class="resource-bar-fill ${getResourceBarClass(sys.memory_percent)}" style="width: ${Math.min(parsePercent(sys.memory_percent), 100)}%"></div>
+                                </div>
+                                ` : ''}
+                                ${sys.memory_used && sys.memory_total ? `
+                                <div class="resource-detail">${sys.memory_used} / ${sys.memory_total}</div>
+                                ` : ''}
+                            </div>
+                            <div class="resource-item">
+                                <div class="resource-header">
+                                    <span class="resource-label">Disk</span>
+                                    <span class="resource-value">${sys.disk_percent || 'N/A'}</span>
+                                </div>
+                                ${sys.disk_percent ? `
+                                <div class="resource-bar">
+                                    <div class="resource-bar-fill ${getResourceBarClass(sys.disk_percent)}" style="width: ${Math.min(parsePercent(sys.disk_percent), 100)}%"></div>
+                                </div>
+                                ` : ''}
+                                ${sys.disk_used && sys.disk_total ? `
+                                <div class="resource-detail">${sys.disk_used} / ${sys.disk_total}</div>
+                                ` : ''}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="detail-section">
+                        <div class="detail-section-title">Workloads (${nodeWorkloads.length})</div>
+                        ${nodeWorkloads.length > 0 ? `
+                            <div class="node-workloads-list" style="margin-top: 8px;">
+                                ${nodeWorkloads.map(w => {
+                                    const statusClass = getStatusClass(w.status);
+                                    return `
+                                        <div class="workload-chip" onclick="closeNodeDetailPanel(); showWorkloadDetail('${w.name}')">
+                                            <span class="status-indicator ${statusClass}"></span>
+                                            ${w.name}
+                                        </div>
+                                    `;
+                                }).join('')}
+                            </div>
+                        ` : '<p style="color: var(--text-muted); margin-top: 8px;">No workloads on this node</p>'}
+                    </div>
+
+                    ${!isCurrentNode ? `
+                    <div class="detail-actions">
+                        <button class="btn btn-danger" onclick="deleteNode('${nodeId}'); closeNodeDetailPanel();">Remove Node</button>
+                    </div>
+                    ` : ''}
+                `;
+            } catch (error) {
+                body.innerHTML = `<div class="empty-state"><p>Failed to load node details: ${error.message}</p></div>`;
+            }
+        }
+
+        function closeNodeDetailPanel() {
+            document.getElementById('nodeDetailPanel').classList.remove('open');
         }
 
         async function viewLogs(name) {

@@ -4,7 +4,8 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o jetty .
+# Sync web UI and build
+RUN go generate ./... && CGO_ENABLED=0 go build -o jetty .
 
 # Runtime stage - using Debian for cloudflare-warp compatibility
 FROM debian:bookworm-slim
