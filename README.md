@@ -59,7 +59,7 @@ Every node is equal. Any node can accept requests. Workloads failover automatica
 | 🔵 **Zero-Downtime Moves** | Blue-green deployment when moving workloads. Old one keeps running until new one is healthy. |
 | 🌍 **Cloudflare Tunnel** | Optional external access. One domain, all nodes, Cloudflare handles the load balancing. |
 | 📊 **Web Dashboard** | Built-in UI because `curl` gets old. |
-| 📜 **Swagger Docs** | Full OpenAPI spec at `/swagger/`. We're professionals here. |
+| 📜 **Swagger Docs** | Full OpenAPI spec. [Live docs here](https://nodes.secretcult.network/swagger/index.html). We're professionals. |
 
 ---
 
@@ -112,6 +112,30 @@ You'll need:
 1. **Cloudflare account** (free tier works)
 2. **WARP Connector Token** — Create in Zero Trust Dashboard → Networks → Tunnels → Create Tunnel (WARP Connector)
 3. **Tunnel Token** (optional) — For external API access
+
+### Cloudflare WARP Setup
+
+Before deploying, configure your WARP Connector in the Zero Trust Dashboard:
+
+1. Go to **Networks** → **Tunnels** → Select your WARP Connector
+2. Under **Traffic routing**, set the mode to **"Include IPs and domains"**
+3. Add the WARP CIDR: `100.96.0.0/16`
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Traffic Routing                                    │
+│  ─────────────────                                  │
+│  ○ Exclude IPs and domains                          │
+│  ● Include IPs and domains  ← SELECT THIS           │
+│                                                     │
+│  Included IPs:                                      │
+│  ┌─────────────────────────────────────────────┐   │
+│  │ 100.96.0.0/16                               │   │
+│  └─────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+```
+
+This ensures WARP only routes traffic for the mesh network (`100.96.x.x` IPs) and doesn't mess with your regular internet traffic. Without this, your nodes will be trying to route everything through WARP like absolute maniacs.
 
 ### Bootstrap First Node
 
@@ -179,7 +203,7 @@ Jetty will:
 
 ## 📡 API
 
-Full Swagger docs at `http://your-node:6880/swagger/`
+Full Swagger docs at [`/swagger/index.html`](https://nodes.secretcult.network/swagger/index.html)
 
 ### Status & Health
 ```bash
