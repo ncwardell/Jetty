@@ -164,6 +164,65 @@ const docTemplate = `{
                 }
             }
         },
+        "/nodes/{id}/update": {
+            "post": {
+                "description": "Triggers a self-update of the node by pulling a new Docker image and restarting. Only works on the target node itself - requests to other nodes will be proxied.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "nodes"
+                ],
+                "summary": "Update a node (self-update)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Node ID (HWID), name, or 'self'",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Update request with image to pull",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/agent.NodeUpdateRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.NodeUpdateResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid request",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Node not found",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Update failed",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/status": {
             "get": {
                 "description": "Returns full cluster status including node info, peers, workloads, and connectivity status",
@@ -708,6 +767,10 @@ const docTemplate = `{
                 },
                 "secret": {
                     "type": "string"
+                },
+                "version": {
+                    "type": "string",
+                    "example": "2.0.0"
                 }
             }
         },
@@ -809,6 +872,32 @@ const docTemplate = `{
                 }
             }
         },
+        "agent.NodeUpdateRequest": {
+            "type": "object",
+            "properties": {
+                "image": {
+                    "type": "string",
+                    "example": "ghcr.io/ncwardell/jetty:2.1.0"
+                }
+            }
+        },
+        "agent.NodeUpdateResponse": {
+            "type": "object",
+            "properties": {
+                "image": {
+                    "type": "string",
+                    "example": "ghcr.io/ncwardell/jetty:2.1.0"
+                },
+                "message": {
+                    "type": "string",
+                    "example": "pulling image and restarting"
+                },
+                "status": {
+                    "type": "string",
+                    "example": "updating"
+                }
+            }
+        },
         "agent.Peer": {
             "type": "object",
             "properties": {
@@ -828,6 +917,10 @@ const docTemplate = `{
                 },
                 "name": {
                     "description": "Hostname",
+                    "type": "string"
+                },
+                "version": {
+                    "description": "Agent version",
                     "type": "string"
                 }
             }
