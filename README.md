@@ -43,7 +43,7 @@
 
 Every node is equal. Any node can accept requests. Workloads failover automatically. It's like a boat without a captain, except it actually works.
 
-> *"It's giving container orchestration but make it ghetto"* — someone, probably
+> *"It's container orchestration but ghetto"* — someone, probably
 
 ---
 
