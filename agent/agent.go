@@ -25,6 +25,8 @@ import (
 	httpSwagger "github.com/swaggo/http-swagger"
 )
 
+// Embedded dashboard UI - automatically synced from web-ui/index.html during build
+//go:generate cp ../web-ui/index.html dashboard.html
 //go:embed dashboard.html
 var dashboardHTML []byte
 
