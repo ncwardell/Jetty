@@ -966,6 +966,11 @@ func (a *Agent) updateWorkloadRoutes() {
 		return
 	}
 
+	// Skip if IPIP tunnels are not available (no routes possible)
+	if !a.ipipAvailable {
+		return
+	}
+
 	// Build map of desired routes: workload IP -> owner ID
 	// Also ensure tunnels exist to owners
 	desiredRoutes := make(map[string]string) // wlIP -> ownerID
