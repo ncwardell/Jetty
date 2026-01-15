@@ -1,8 +1,10 @@
 # Build stage - use BUILDPLATFORM for native compilation speed
-FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS builder
+# Default to linux/amd64 for legacy docker build compatibility
+ARG BUILDPLATFORM=linux/amd64
+FROM --platform=${BUILDPLATFORM} golang:1.24-bookworm AS builder
 ARG VERSION=dev
-ARG TARGETOS
-ARG TARGETARCH
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
