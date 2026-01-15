@@ -18,6 +18,19 @@ setup_tun() {
     fi
 }
 
+# Load kernel modules needed for cross-node routing
+# IPIP and GRE tunnels encapsulate workload traffic (10.100.x.x) inside WARP traffic (100.96.x.x)
+load_tunnel_modules() {
+    # Try to load IPIP module (most efficient for IP-in-IP encapsulation)
+    if modprobe ipip 2>/dev/null; then
+        log "Loaded ipip kernel module"
+    fi
+    # Try to load GRE module as fallback
+    if modprobe ip_gre 2>/dev/null; then
+        log "Loaded ip_gre kernel module"
+    fi
+}
+
 # Start dbus (required for WARP)
 start_dbus() {
     if [ ! -d /run/dbus ]; then
@@ -201,6 +214,10 @@ main() {
         sleep 2
         log "Cloudflare Tunnel started (PID: $TUNNEL_PID)"
     fi
+
+    # Load tunnel kernel modules for cross-node workload routing
+    # This needs to happen before Jetty starts so it can detect available tunnel modes
+    load_tunnel_modules
 
     # Execute the main command (jetty or whatever was passed)
     log "Starting Jetty..."
