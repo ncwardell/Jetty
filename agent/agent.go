@@ -142,9 +142,9 @@ type Agent struct {
 	workloadRoutes   map[string]string // workload IP -> owner WARP IP (for remote workloads)
 	workloadRoutesMu sync.Mutex
 
-	// IPIP tunnel support
-	ipipAvailable     bool              // Whether kernel supports IPIP tunnels
-	ipipWarnedPeers   map[string]bool   // Peers we've already warned about IPIP failure
+	// Tunnel support for cross-node routing
+	tunnelMode        string            // "ipip", "gre", or "" (none available)
+	ipipWarnedPeers   map[string]bool   // Peers we've already warned about tunnel failure
 	ipipWarnedPeersMu sync.Mutex
 
 	stopCh chan struct{}
@@ -621,9 +621,10 @@ func (a *Agent) initNetwork() error {
 	// Enable forwarding for workload traffic
 	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
 
-	// Check if IPIP tunnels are available (requires kernel module)
-	a.ipipAvailable = a.checkIPIPAvailable()
-	if !a.ipipAvailable {
+	// Check which tunnel mode is available for cross-node routing
+	// Try IPIP first (most efficient), then GRE as fallback
+	a.tunnelMode = a.detectTunnelMode()
+	if a.tunnelMode == "" {
 		log.Printf("Warning: IPIP tunnels not available (kernel module not loaded) - cross-node workload routing disabled")
 	}
 
@@ -631,21 +632,37 @@ func (a *Agent) initNetwork() error {
 	return nil
 }
 
-// checkIPIPAvailable tests if the kernel supports IPIP tunnels.
-func (a *Agent) checkIPIPAvailable() bool {
-	// Try to create a test tunnel
-	testName := "jetty_ipip_test"
+// detectTunnelMode checks which tunnel modes are available and returns the best one.
+// Tries to load kernel modules if needed, then tests IPIP first (most efficient), then GRE.
+// Returns "ipip", "gre", or "" if no tunnel mode is available.
+func (a *Agent) detectTunnelMode() string {
+	// Try to load kernel modules (requires CAP_SYS_MODULE or running as root)
+	// This is often needed in containers where modules aren't auto-loaded
+	exec.Command("modprobe", "ipip").Run()
+	exec.Command("modprobe", "ip_gre").Run()
+
+	testName := "jetty_tun_test"
 	exec.Command("ip", "tunnel", "del", testName).Run() // Clean up any existing
 
+	// Try IPIP first (most efficient)
 	err := exec.Command("ip", "tunnel", "add", testName, "mode", "ipip",
 		"local", "127.0.0.1", "remote", "127.0.0.2").Run()
-	if err != nil {
-		return false
+	if err == nil {
+		exec.Command("ip", "tunnel", "del", testName).Run()
+		return "ipip"
 	}
 
-	// Clean up test tunnel
-	exec.Command("ip", "tunnel", "del", testName).Run()
-	return true
+	// Try GRE as fallback (uses different kernel module)
+	err = exec.Command("ip", "tunnel", "add", testName, "mode", "gre",
+		"local", "127.0.0.1", "remote", "127.0.0.2").Run()
+	if err == nil {
+		exec.Command("ip", "tunnel", "del", testName).Run()
+		log.Printf("Using GRE tunnels for cross-node routing (IPIP unavailable)")
+		return "gre"
+	}
+
+	// No tunnel mode available
+	return ""
 }
 
 // initWarpRules sets up nftables rules for WARP traffic routing.
@@ -685,7 +702,8 @@ func (a *Agent) initWarpRules() error {
 // IPIP Tunnels (for workload routing between nodes)
 // =============================================================================
 
-// ensurePeerTunnel creates an IPIP tunnel to a peer if it doesn't exist.
+// ensurePeerTunnel creates a tunnel to a peer if it doesn't exist.
+// Uses IPIP or GRE depending on what's available (detected at startup).
 // This allows routing workload IPs (10.100.x.x) through WARP by encapsulating
 // them in packets addressed to the peer's WARP IP (100.96.x.x).
 func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
@@ -693,8 +711,8 @@ func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
 		return nil // Can't create tunnel without IPs
 	}
 
-	// Skip if IPIP not available (kernel module not loaded)
-	if !a.ipipAvailable {
+	// Skip if no tunnel mode available (kernel modules not loaded)
+	if a.tunnelMode == "" {
 		return nil
 	}
 
@@ -710,11 +728,11 @@ func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
 	// Delete existing tunnel if it has wrong config
 	exec.Command("ip", "tunnel", "del", tunName).Run()
 
-	// Create IPIP tunnel: local=our WARP IP, remote=peer's WARP IP
-	cmd := exec.Command("ip", "tunnel", "add", tunName, "mode", "ipip",
+	// Create tunnel using detected mode (ipip or gre): local=our WARP IP, remote=peer's WARP IP
+	cmd := exec.Command("ip", "tunnel", "add", tunName, "mode", a.tunnelMode,
 		"local", a.ip, "remote", peerIP)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("create tunnel to %s: %s", peerIP, strings.TrimSpace(string(out)))
+		return fmt.Errorf("create %s tunnel to %s: %s", a.tunnelMode, peerIP, strings.TrimSpace(string(out)))
 	}
 
 	// Bring up the tunnel interface
@@ -724,7 +742,7 @@ func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
 		return fmt.Errorf("bring up tunnel %s: %s", tunName, strings.TrimSpace(string(out)))
 	}
 
-	log.Printf("Created IPIP tunnel %s to peer %s (%s)", tunName, peerID[:8], peerIP)
+	log.Printf("Created %s tunnel %s to peer %s (%s)", strings.ToUpper(a.tunnelMode), tunName, peerID[:8], peerIP)
 	return nil
 }
 
@@ -1008,7 +1026,7 @@ func (a *Agent) updateHosts() {
 }
 
 // updateWorkloadRoutes adds/removes routes for remote workloads.
-// Routes go through IPIP tunnels to the owner node, which then DNATs to the container.
+// Routes go through IPIP/GRE tunnels to the owner node, which then DNATs to the container.
 // This must be called with stateMu held (at least RLock).
 func (a *Agent) updateWorkloadRoutes() {
 	// Skip if WARP is not connected
@@ -1016,15 +1034,15 @@ func (a *Agent) updateWorkloadRoutes() {
 		return
 	}
 
-	// Skip if IPIP tunnels are not available (no routes possible)
-	if !a.ipipAvailable {
+	// Skip if no tunnel mode available (no routes possible)
+	if a.tunnelMode == "" {
 		return
 	}
 
-	// IMPORTANT: Ensure IPIP tunnels exist to ALL healthy peers, not just workload owners.
-	// IPIP requires bidirectional tunnels - if peer A routes to peer B, peer B needs a
+	// IMPORTANT: Ensure tunnels exist to ALL healthy peers, not just workload owners.
+	// IPIP/GRE requires bidirectional tunnels - if peer A routes to peer B, peer B needs a
 	// tunnel back to A for decapsulation. By creating tunnels to all peers, any node
-	// can receive IPIP traffic from any other node.
+	// can receive encapsulated traffic from any other node.
 	for _, peer := range a.state.Peers {
 		if peer.IP != "" && peer.Healthy {
 			if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {

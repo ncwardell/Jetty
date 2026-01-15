@@ -163,6 +163,7 @@ docker run -d \
   --privileged \
   --net host \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /lib/modules:/lib/modules:ro \
   -v jetty-data:/data \
   -e JETTY_SECRET=your-super-secret-password \
   -e JETTY_WARP_CONNECTOR_TOKEN=your-warp-connector-token \
@@ -178,6 +179,7 @@ docker run -d \
   --privileged \
   --net host \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /lib/modules:/lib/modules:ro \
   -v jetty-data:/data \
   -e JETTY_SECRET=your-super-secret-password \
   -e JETTY_JOIN=https://your-tunnel-domain.com \
