@@ -226,3 +226,26 @@ type WorkloadUpdateResponse struct {
 	Version      int64     `json:"version" example:"1704067200"`
 	Redeployed   bool      `json:"redeployed" example:"true"`
 }
+
+// EnvListResponse represents the list of environment variable keys
+type EnvListResponse struct {
+	Keys  []string `json:"keys" example:"DB_HOST,DB_PASSWORD,API_KEY"`
+	Count int      `json:"count" example:"3"`
+}
+
+// EnvSetRequest represents a request to set environment variables
+type EnvSetRequest struct {
+	Env map[string]string `json:"env" example:"DB_HOST:localhost,DB_PASSWORD:secret123"`
+}
+
+// EnvSetResponse represents the response after setting environment variables
+type EnvSetResponse struct {
+	Added   []string `json:"added" example:"DB_HOST,DB_PASSWORD"`
+	Updated []string `json:"updated" example:"API_KEY"`
+}
+
+// EnvGetResponse represents a single environment variable
+type EnvGetResponse struct {
+	Key   string `json:"key" example:"DB_PASSWORD"`
+	Value string `json:"value" example:"secret123"`
+}
