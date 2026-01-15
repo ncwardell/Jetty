@@ -2994,8 +2994,17 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	args := []string{"run", "-d", "--name", containerName + "-update"}
 
 	// Add bind mounts (WARP state is persisted in /data/warp via symlink)
+	hasLibModules := false
 	for _, bind := range container.HostConfig.Binds {
 		args = append(args, "-v", bind)
+		if strings.HasPrefix(bind, "/lib/modules:") {
+			hasLibModules = true
+		}
+	}
+
+	// Ensure /lib/modules is mounted for kernel module loading (IPIP/GRE tunnels)
+	if !hasLibModules {
+		args = append(args, "-v", "/lib/modules:/lib/modules:ro")
 	}
 
 	// Add network mode
@@ -3014,6 +3023,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Pass the cluster secret key to the new container
+	// Other secrets (WARP token, etc.) are persisted in /data and read by entrypoint
 	if a.clusterSecret != "" {
 		args = append(args, "-e", "JETTY_SECRET="+a.clusterSecret)
 	}

@@ -1527,6 +1527,39 @@
         </div>
     </div>
 
+    <!-- Update Node Modal -->
+    <div class="modal-overlay hidden" id="updateNodeModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title">Update Node</h2>
+                <button class="modal-close" onclick="closeUpdateNodeModal()">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body">
+                <p style="margin-bottom: 16px;">Update <strong id="updateNodeName"></strong> to a new image:</p>
+                <div class="form-group">
+                    <label class="form-label">Docker Image</label>
+                    <input type="text" class="form-input" id="updateNodeImage" placeholder="ghcr.io/ncwardell/jetty:latest">
+                    <div class="form-hint">The node will pull this image and restart with the new version</div>
+                </div>
+                <div id="updateNodeStatus" style="margin-top: 12px; display: none;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div class="spinner" style="width: 16px; height: 16px;"></div>
+                        <span id="updateNodeStatusText">Updating...</span>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeUpdateNodeModal()">Cancel</button>
+                <button class="btn btn-primary" id="updateNodeBtn" onclick="updateNode()">Update</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Workload Detail Panel -->
     <div class="detail-panel" id="detailPanel">
         <div class="detail-header">
@@ -2174,6 +2207,7 @@
                         </div>
                         <div class="node-details">
                             <p><strong>WARP IP:</strong> ${node.ip || 'N/A'}</p>
+                            <p><strong>Arch:</strong> ${node.arch || 'N/A'}${node.version ? ` <span style="color: var(--text-muted)">v${node.version}</span>` : ''}</p>
                             <p><strong>Last Seen:</strong> <span data-timestamp="${node.last_seen || ''}">${formatRelativeTime(node.last_seen)}</span></p>
                             ${node.tunnel_host || node.tunnelHost ? `<p><strong>Tunnel:</strong> ${node.tunnel_host || node.tunnelHost}</p>` : ''}
                         </div>
@@ -2769,6 +2803,14 @@
                                 </span>
                             </span>
                         </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Architecture</span>
+                            <span class="detail-value"><code>${nodeHealth.arch || node?.arch || 'N/A'}</code></span>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Version</span>
+                            <span class="detail-value"><code>${nodeHealth.version || node?.version || 'N/A'}</code></span>
+                        </div>
                         ${sys.uptime ? `
                         <div class="detail-row">
                             <span class="detail-label">Uptime</span>
@@ -2845,11 +2887,19 @@
                         ` : '<p style="color: var(--text-muted); margin-top: 8px;">No workloads on this node</p>'}
                     </div>
 
-                    ${!isCurrentNode ? `
                     <div class="detail-actions">
+                        <button class="btn btn-primary" onclick="showUpdateNodeModal('${nodeId}', '${nodeName}')">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                <polyline points="7 10 12 15 17 10"/>
+                                <line x1="12" y1="15" x2="12" y2="3"/>
+                            </svg>
+                            Update Node
+                        </button>
+                        ${!isCurrentNode ? `
                         <button class="btn btn-danger" onclick="deleteNode('${nodeId}'); closeNodeDetailPanel();">Remove Node</button>
+                        ` : ''}
                     </div>
-                    ` : ''}
                 `;
             } catch (error) {
                 body.innerHTML = `<div class="empty-state"><p>Failed to load node details: ${error.message}</p></div>`;
@@ -3091,6 +3141,55 @@
                 await refreshSecrets();
             } catch (error) {
                 showToast(`Failed to delete secret: ${error.message}`, 'error');
+            }
+        }
+
+        // Update Node Functions
+        let updateNodeId = null;
+
+        function showUpdateNodeModal(nodeId, nodeName) {
+            updateNodeId = nodeId;
+            document.getElementById('updateNodeName').textContent = nodeName;
+            document.getElementById('updateNodeImage').value = 'ghcr.io/ncwardell/jetty:latest';
+            document.getElementById('updateNodeStatus').style.display = 'none';
+            document.getElementById('updateNodeBtn').disabled = false;
+            document.getElementById('updateNodeModal').classList.remove('hidden');
+        }
+
+        function closeUpdateNodeModal() {
+            document.getElementById('updateNodeModal').classList.add('hidden');
+            updateNodeId = null;
+        }
+
+        async function updateNode() {
+            const image = document.getElementById('updateNodeImage').value.trim();
+            if (!image) {
+                showToast('Please enter a Docker image', 'error');
+                return;
+            }
+
+            const statusDiv = document.getElementById('updateNodeStatus');
+            const statusText = document.getElementById('updateNodeStatusText');
+            const updateBtn = document.getElementById('updateNodeBtn');
+
+            statusDiv.style.display = 'block';
+            statusText.textContent = 'Pulling image and restarting...';
+            updateBtn.disabled = true;
+
+            try {
+                await apiCall(`/nodes/${updateNodeId}/update`, 'POST', { image });
+                statusText.textContent = 'Update initiated! Node will restart shortly.';
+                showToast('Node update initiated. The node will restart with the new image.', 'success');
+
+                // Close modal after a brief delay
+                setTimeout(() => {
+                    closeUpdateNodeModal();
+                    closeNodeDetailPanel();
+                }, 2000);
+            } catch (error) {
+                statusDiv.style.display = 'none';
+                updateBtn.disabled = false;
+                showToast(`Failed to update node: ${error.message}`, 'error');
             }
         }
 
