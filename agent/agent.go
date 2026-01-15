@@ -3139,8 +3139,9 @@ func (a *Agent) getSelfContainerID() (string, error) {
 		}
 	}
 
-	// Method 2: Look for container with jetty in the name that's running
-	cmd := exec.Command("docker", "ps", "-q", "--filter", "name=jetty", "--filter", "status=running")
+	// Method 2: Look for container named exactly "jetty" that's running
+	// Use ^jetty$ to match exactly - prevents matching workload containers like jetty_nginx
+	cmd := exec.Command("docker", "ps", "-q", "--filter", "name=^jetty$", "--filter", "status=running")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("docker ps failed: %w", err)
@@ -5177,11 +5178,16 @@ func (a *Agent) loadState() {
 		a.state.CFToken = envCFToken
 	}
 
-	// Initialize EnvData map if nil (for backwards compatibility)
+	// Initialize maps if nil (for backwards compatibility or corrupted state)
+	if a.state.Peers == nil {
+		a.state.Peers = make(map[string]*Peer)
+	}
+	if a.state.Workloads == nil {
+		a.state.Workloads = make(map[string]*Workload)
+	}
 	if a.state.EnvData == nil {
 		a.state.EnvData = make(map[string]string)
 	}
-	// Initialize DeletedWorkloads map if nil (for backwards compatibility)
 	if a.state.DeletedWorkloads == nil {
 		a.state.DeletedWorkloads = make(map[string]*DeletedWorkload)
 	}
