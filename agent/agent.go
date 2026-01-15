@@ -176,6 +176,18 @@ func New() (*Agent, error) {
 // cleanupOrphanedState cleans up any leftover state from previous unclean shutdowns.
 // This prevents accumulation of orphaned WARP devices in Cloudflare dashboard.
 func (a *Agent) cleanupOrphanedState() {
+	// Clean up old Jetty container from previous update
+	// The update process renames the old container to {name}-old before stopping it
+	output, err := exec.Command("docker", "ps", "-a", "--filter", "name=-old$", "--format", "{{.Names}}").CombinedOutput()
+	if err == nil {
+		for _, name := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+			if name != "" && strings.HasSuffix(name, "-old") {
+				log.Printf("Removing old container from previous update: %s", name)
+				exec.Command("docker", "rm", "-f", name).Run()
+			}
+		}
+	}
+
 	// Check if there's orphaned jetty0 interface from previous run
 	if err := exec.Command("ip", "link", "show", "jetty0").Run(); err == nil {
 		log.Printf("Found orphaned jetty0 interface from previous run, cleaning up...")
