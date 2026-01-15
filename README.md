@@ -61,8 +61,10 @@ Every node is equal. Any node can accept requests. Workloads failover automatica
 | 🔵 **Zero-Downtime Moves** | Blue-green deployment when moving workloads. Old one keeps running until new one is healthy. |
 | 🌍 **Cloudflare Tunnel** | Optional external access. One domain, all nodes, Cloudflare handles the load balancing. |
 | 🏗️ **Multi-Architecture** | Mix AMD64 and ARM64 nodes. Workloads can have arch-specific compose files. Pi cluster? No problem. |
-| 📊 **Web Dashboard** | Built-in UI because `curl` gets old. |
+| 🔐 **Encrypted Secrets** | Store environment variables encrypted with AES-256-GCM. Secrets are synced cluster-wide and injected at deploy time. |
+| 📊 **Web Dashboard** | Built-in UI because `curl` gets old. Manage workloads, nodes, and secrets all in one place. |
 | 📜 **Swagger Docs** | Full OpenAPI spec. [Live docs here](https://nodes.secretcult.network/swagger/index.html). We're professionals. |
+| 🔄 **Node Updates** | Rolling updates with `POST /api/nodes/{id}/update`. Pull new images and restart without losing state. |
 
 ---
 
@@ -275,11 +277,27 @@ POST   /api/workloads/{name}/move        # Move to another node (blue-green)
 GET    /api/workloads/{name}/logs        # Container logs
 ```
 
-### Cluster
+### Cluster & Nodes
 ```bash
 POST   /api/join             # Join cluster
 GET    /api/nodes            # List nodes
 DELETE /api/nodes/{id}       # Remove node
+POST   /api/nodes/{id}/update # Update node (pull new image, restart)
+```
+
+### Environment Variables
+```bash
+GET    /api/env              # List all env variable keys
+POST   /api/env              # Set env variables (batch)
+GET    /api/env/{key}        # Get decrypted value
+DELETE /api/env/{key}        # Delete env variable
+```
+
+### Cloudflare Tunnel
+```bash
+GET    /api/tunnel           # Get tunnel status
+POST   /api/tunnel           # Configure tunnel with token
+DELETE /api/tunnel           # Remove tunnel
 ```
 
 ---
@@ -407,14 +425,78 @@ volumes:
 
 ```
 /data/
-├── state.json           # The source of truth
+├── state.json           # The source of truth (peers, workloads, env vars)
 ├── hwid                 # This node's hardware ID (used for elections)
+├── warp/                # WARP connector state (persisted across updates)
 └── compose/
     └── {workload}/
         └── docker-compose.yml
 ```
 
 State syncs via gossip. Every node has a copy. Higher `version` wins conflicts.
+
+The `state.json` file contains:
+- **Peers**: List of all known nodes in the cluster
+- **Workloads**: All workload configurations and ownership
+- **EnvData**: Encrypted environment variables (AES-256-GCM)
+
+---
+
+## 🔐 Encrypted Environment Variables
+
+Store sensitive configuration (API keys, passwords, connection strings) encrypted at rest and sync them across your cluster.
+
+### Setting Variables
+
+```bash
+# Set multiple variables at once
+curl -X POST http://localhost:6880/api/env \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret" \
+  -d '{
+    "env": {
+      "DATABASE_URL": "postgres://user:pass@postgres:5432/db",
+      "REDIS_PASSWORD": "supersecret",
+      "API_KEY": "sk-12345"
+    }
+  }'
+```
+
+### Using Variables in Workloads
+
+Environment variables are automatically injected when deploying workloads:
+
+```yaml
+# docker-compose.yml
+services:
+  app:
+    image: myapp:latest
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+```
+
+### How It Works
+
+1. Variables are encrypted with **AES-256-GCM** using a key derived from `JETTY_SECRET`
+2. Encrypted values are stored in `state.json` and synced to all nodes
+3. When a workload deploys, variables are decrypted and injected as environment variables
+4. Values are never logged or exposed in plain text (except via explicit `GET /api/env/{key}`)
+
+### Managing Variables
+
+```bash
+# List all variable keys (values not shown)
+curl http://localhost:6880/api/env -H "X-API-Key: your-secret"
+
+# Get a specific variable's decrypted value
+curl http://localhost:6880/api/env/DATABASE_URL -H "X-API-Key: your-secret"
+
+# Delete a variable
+curl -X DELETE http://localhost:6880/api/env/OLD_KEY -H "X-API-Key: your-secret"
+```
+
+> **Security Note:** All nodes in the cluster must use the same `JETTY_SECRET` to decrypt values. Changing the secret will make existing encrypted values unreadable.
 
 ---
 
