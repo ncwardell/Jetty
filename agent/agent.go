@@ -3001,8 +3001,18 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Creating new container with: docker %v", args)
 
-	// Step 5: Create and start new container
-	createCmd := exec.Command("docker", args...)
+	// Step 5: Create new container (but don't start it yet - avoids port conflict)
+	// Change "run" to "create" so we can control when it starts
+	args[0] = "create" // Replace "run" with "create"
+	// Remove -d flag since create doesn't use it
+	newArgs := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg != "-d" {
+			newArgs = append(newArgs, arg)
+		}
+	}
+
+	createCmd := exec.Command("docker", newArgs...)
 	createOutput, err := createCmd.CombinedOutput()
 	if err != nil {
 		log.Printf("Failed to create new container: %v\nOutput: %s", err, createOutput)
@@ -3010,41 +3020,55 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	newContainerID := strings.TrimSpace(string(createOutput))
-	log.Printf("Created new container: %s", newContainerID)
+	log.Printf("Created new container (not started): %s", newContainerID)
 
-	// Step 6: Wait briefly for new container to start
-	time.Sleep(2 * time.Second)
-
-	// Step 7: Rename containers - old one gets -old suffix, new one gets original name
-	// First rename old container
-	renameOldCmd := exec.Command("docker", "rename", containerName, containerName+"-old")
-	if out, err := renameOldCmd.CombinedOutput(); err != nil {
-		log.Printf("Warning: failed to rename old container: %v, output: %s", err, out)
-	}
-
-	// Rename new container to original name
-	renameNewCmd := exec.Command("docker", "rename", containerName+"-update", containerName)
-	if out, err := renameNewCmd.CombinedOutput(); err != nil {
-		log.Printf("Warning: failed to rename new container: %v, output: %s", err, out)
-	}
-
-	// Respond before stopping self
+	// Respond before stopping self - the actual switch happens in the goroutine
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "updating",
-		"message": "new container started, stopping old container",
+		"message": "new container created, switching over",
 		"image":   req.Image,
 		"old_id":  containerID,
 		"new_id":  newContainerID,
 	})
 
-	// Step 8: Stop old container (this will kill us)
+	// Step 6: Perform the actual switch in a goroutine after response is sent
+	// CRITICAL: Stop old container BEFORE starting new one to avoid port conflicts
 	go func() {
-		time.Sleep(1 * time.Second) // Give time for response to be sent
+		time.Sleep(500 * time.Millisecond) // Give time for response to be sent
+
+		// Rename old container first (while it's still running)
+		log.Printf("Renaming old container %s to %s-old", containerName, containerName)
+		renameOldCmd := exec.Command("docker", "rename", containerName, containerName+"-old")
+		if out, err := renameOldCmd.CombinedOutput(); err != nil {
+			log.Printf("Warning: failed to rename old container: %v, output: %s", err, out)
+		}
+
+		// Rename new container to original name (while it's stopped)
+		log.Printf("Renaming new container to %s", containerName)
+		renameNewCmd := exec.Command("docker", "rename", containerName+"-update", containerName)
+		if out, err := renameNewCmd.CombinedOutput(); err != nil {
+			log.Printf("Warning: failed to rename new container: %v, output: %s", err, out)
+		}
+
+		// Stop old container FIRST to release the port
 		log.Printf("Stopping old container %s", containerID)
-		stopCmd := exec.Command("docker", "stop", containerID)
-		stopCmd.Run()
-		// If we get here, something went wrong - force exit
+		stopCmd := exec.Command("docker", "stop", "-t", "5", containerID)
+		if out, err := stopCmd.CombinedOutput(); err != nil {
+			log.Printf("Warning: failed to stop old container: %v, output: %s", err, out)
+		}
+
+		// NOW start the new container (port is free)
+		log.Printf("Starting new container %s", newContainerID)
+		startCmd := exec.Command("docker", "start", newContainerID)
+		if out, err := startCmd.CombinedOutput(); err != nil {
+			log.Printf("CRITICAL: Failed to start new container: %v, output: %s", err, out)
+			// Try to restart old container as fallback
+			log.Printf("Attempting to restart old container as fallback...")
+			exec.Command("docker", "start", containerID).Run()
+		}
+
+		// If we get here and old container didn't stop us, force exit
 		os.Exit(0)
 	}()
 }
