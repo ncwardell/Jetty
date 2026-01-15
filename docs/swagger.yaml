@@ -1,5 +1,54 @@
 basePath: /api
 definitions:
+  agent.EnvGetResponse:
+    properties:
+      key:
+        example: DB_PASSWORD
+        type: string
+      value:
+        example: secret123
+        type: string
+    type: object
+  agent.EnvListResponse:
+    properties:
+      count:
+        example: 3
+        type: integer
+      keys:
+        example:
+        - DB_HOST
+        - DB_PASSWORD
+        - API_KEY
+        items:
+          type: string
+        type: array
+    type: object
+  agent.EnvSetRequest:
+    properties:
+      env:
+        additionalProperties:
+          type: string
+        example:
+          DB_HOST: localhost
+          DB_PASSWORD: secret123
+        type: object
+    type: object
+  agent.EnvSetResponse:
+    properties:
+      added:
+        example:
+        - DB_HOST
+        - DB_PASSWORD
+        items:
+          type: string
+        type: array
+      updated:
+        example:
+        - API_KEY
+        items:
+          type: string
+        type: array
+    type: object
   agent.ErrorResponse:
     properties:
       error:
@@ -59,6 +108,9 @@ definitions:
     type: object
   agent.JoinRequest:
     properties:
+      arch:
+        example: amd64
+        type: string
       id:
         type: string
       ip:
@@ -130,6 +182,9 @@ definitions:
     type: object
   agent.NodeInfo:
     properties:
+      arch:
+        example: amd64
+        type: string
       id:
         example: abc123def456
         type: string
@@ -160,6 +215,9 @@ definitions:
     type: object
   agent.Peer:
     properties:
+      arch:
+        description: CPU architecture (amd64, arm64, etc.)
+        type: string
       healthy:
         type: boolean
       id:
@@ -221,6 +279,13 @@ definitions:
         description: Auto-start when Jetty starts up
         type: boolean
       compose:
+        description: Default compose (used if no arch-specific)
+        type: string
+      compose_amd64:
+        description: 'Optional: amd64-specific compose'
+        type: string
+      compose_arm64:
+        description: 'Optional: arm64-specific compose'
         type: string
       ip:
         description: Service IP (routed via WARP)
@@ -256,6 +321,18 @@ definitions:
             web:
               image: nginx
         type: string
+      compose_amd64:
+        example: |-
+          services:
+            web:
+              image: nginx:amd64
+        type: string
+      compose_arm64:
+        example: |-
+          services:
+            web:
+              image: nginx:arm64
+        type: string
       ip:
         example: 10.100.0.50
         type: string
@@ -279,6 +356,91 @@ info:
   title: Jetty API
   version: "2.0"
 paths:
+  /env:
+    get:
+      description: Returns all stored environment variable keys (values are encrypted)
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.EnvListResponse'
+      summary: List environment variables
+      tags:
+      - env
+    post:
+      consumes:
+      - application/json
+      description: Stores encrypted environment variables (existing keys are overwritten)
+      parameters:
+      - description: Environment variables to set
+        in: body
+        name: env
+        required: true
+        schema:
+          $ref: '#/definitions/agent.EnvSetRequest'
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.EnvSetResponse'
+        "400":
+          description: Invalid request
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "500":
+          description: Encryption error
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Set environment variables
+      tags:
+      - env
+  /env/{key}:
+    delete:
+      description: Removes an environment variable from storage
+      parameters:
+      - description: Environment variable key
+        in: path
+        name: key
+        required: true
+        type: string
+      responses:
+        "204":
+          description: Variable deleted
+        "404":
+          description: Key not found
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Delete environment variable
+      tags:
+      - env
+    get:
+      description: Returns the decrypted value of a specific environment variable
+      parameters:
+      - description: Environment variable key
+        in: path
+        name: key
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.EnvGetResponse'
+        "404":
+          description: Key not found
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "500":
+          description: Decryption error
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Get environment variable
+      tags:
+      - env
   /health:
     get:
       description: Returns health status of this node or the entire cluster. Use node=local
