@@ -45,27 +45,11 @@ const (
 // HTTP Clients
 // =============================================================================
 
-// HTTPClients holds pre-configured HTTP clients with different timeouts
-type HTTPClients struct {
-	Default   *http.Client // For general requests (30s timeout)
-	Peer      *http.Client // For peer communication (5s timeout)
-	Unhealthy *http.Client // For known-unhealthy peers (1s timeout)
-}
-
-// NewHTTPClients creates the standard HTTP client configuration
-func NewHTTPClients() *HTTPClients {
-	return &HTTPClients{
-		Default:   &http.Client{Timeout: DefaultHTTPTimeout},
-		Peer:      &http.Client{Timeout: PeerHTTPTimeout},
-		Unhealthy: &http.Client{Timeout: UnhealthyPeerTimeout},
-	}
-}
-
-// Global HTTP clients (for backwards compatibility during refactor)
+// Global HTTP clients with different timeouts for different use cases
 var (
-	httpClient          = &http.Client{Timeout: DefaultHTTPTimeout}
-	peerClient          = &http.Client{Timeout: PeerHTTPTimeout}
-	unhealthyPeerClient = &http.Client{Timeout: UnhealthyPeerTimeout}
+	httpClient          = &http.Client{Timeout: DefaultHTTPTimeout}   // General requests (30s)
+	peerClient          = &http.Client{Timeout: PeerHTTPTimeout}      // Peer communication (5s)
+	unhealthyPeerClient = &http.Client{Timeout: UnhealthyPeerTimeout} // Known-unhealthy peers (1s)
 )
 
 // =============================================================================

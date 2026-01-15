@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"time"
 )
 
 // =============================================================================
@@ -325,30 +324,3 @@ func (a *Agent) broadcastState() {
 	}
 }
 
-// =============================================================================
-// Tombstone Garbage Collection
-// =============================================================================
-
-// cleanupTombstones removes tombstones older than TombstoneMaxAge.
-// Should be called periodically to prevent unbounded state growth.
-func (a *Agent) cleanupTombstones() {
-	now := time.Now()
-	cutoff := now.Add(-TombstoneMaxAge).Unix()
-
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
-
-	// Clean up workload tombstones
-	for ip, dw := range a.state.DeletedWorkloads {
-		if dw.Version < cutoff {
-			delete(a.state.DeletedWorkloads, ip)
-		}
-	}
-
-	// Clean up env key tombstones
-	for key, dek := range a.state.DeletedEnvKeys {
-		if dek.Version < cutoff {
-			delete(a.state.DeletedEnvKeys, key)
-		}
-	}
-}
