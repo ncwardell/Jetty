@@ -1505,17 +1505,17 @@
             <div class="modal-body">
                 <div class="form-group">
                     <label class="form-label">Key</label>
-                    <input type="text" class="form-input" id="secretKey" placeholder="DATABASE_URL">
+                    <input type="text" class="form-input" id="envKeyInput" placeholder="DATABASE_URL">
                     <div class="form-hint">Must start with a letter or underscore, followed by letters, numbers, or underscores</div>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Value</label>
-                    <input type="password" class="form-input" id="secretValue" placeholder="Your secret value">
+                    <input type="password" class="form-input" id="envValueInput" placeholder="Your secret value">
                     <div class="form-hint">This value will be encrypted with AES-256-GCM</div>
                 </div>
                 <div class="form-group">
                     <label class="form-checkbox">
-                        <input type="checkbox" id="showSecretValue" onchange="toggleSecretVisibility()">
+                        <input type="checkbox" id="showEnvValue" onchange="toggleSecretVisibility()">
                         <span>Show value</span>
                     </label>
                 </div>
@@ -3057,11 +3057,11 @@
             }
             editingSecretKey = null;
             document.getElementById('secretModalTitle').textContent = 'Add Secret';
-            document.getElementById('secretKey').value = '';
-            document.getElementById('secretKey').disabled = false;
-            document.getElementById('secretValue').value = '';
-            document.getElementById('showSecretValue').checked = false;
-            document.getElementById('secretValue').type = 'password';
+            document.getElementById('envKeyInput').value = '';
+            document.getElementById('envKeyInput').disabled = false;
+            document.getElementById('envValueInput').value = '';
+            document.getElementById('showEnvValue').checked = false;
+            document.getElementById('envValueInput').type = 'password';
             document.getElementById('secretModal').classList.remove('hidden');
         }
 
@@ -3072,18 +3072,18 @@
             }
             editingSecretKey = key;
             document.getElementById('secretModalTitle').textContent = 'Edit Secret';
-            document.getElementById('secretKey').value = key;
-            document.getElementById('secretKey').disabled = true;
+            document.getElementById('envKeyInput').value = key;
+            document.getElementById('envKeyInput').disabled = true;
 
             try {
                 const data = await apiCall(`/env/${encodeURIComponent(key)}`);
-                document.getElementById('secretValue').value = data.value;
+                document.getElementById('envValueInput').value = data.value;
             } catch (error) {
-                document.getElementById('secretValue').value = '';
+                document.getElementById('envValueInput').value = '';
             }
 
-            document.getElementById('showSecretValue').checked = false;
-            document.getElementById('secretValue').type = 'password';
+            document.getElementById('showEnvValue').checked = false;
+            document.getElementById('envValueInput').type = 'password';
             document.getElementById('secretModal').classList.remove('hidden');
         }
 
@@ -3093,14 +3093,14 @@
         }
 
         function toggleSecretVisibility() {
-            const input = document.getElementById('secretValue');
-            const checkbox = document.getElementById('showSecretValue');
+            const input = document.getElementById('envValueInput');
+            const checkbox = document.getElementById('showEnvValue');
             input.type = checkbox.checked ? 'text' : 'password';
         }
 
         async function saveSecret() {
-            const key = document.getElementById('secretKey').value.trim();
-            const value = document.getElementById('secretValue').value;
+            const key = document.getElementById('envKeyInput').value.trim();
+            const value = document.getElementById('envValueInput').value;
 
             if (!key) {
                 showToast('Please enter a key', 'error');
