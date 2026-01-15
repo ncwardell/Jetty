@@ -997,6 +997,451 @@
             color: var(--text-muted);
             font-size: 12px;
         }
+
+        /* Cluster Health Banner */
+        .health-banner {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px 20px;
+            margin-bottom: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 24px;
+        }
+
+        .health-banner-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .health-indicator {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .health-indicator.healthy {
+            background: rgba(63, 185, 80, 0.2);
+            color: var(--accent-green);
+        }
+
+        .health-indicator.degraded {
+            background: rgba(210, 153, 34, 0.2);
+            color: var(--accent-yellow);
+        }
+
+        .health-indicator.critical {
+            background: rgba(248, 81, 73, 0.2);
+            color: var(--accent-red);
+        }
+
+        .health-indicator svg {
+            width: 24px;
+            height: 24px;
+        }
+
+        .health-info h3 {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .health-info p {
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin: 0;
+        }
+
+        .health-metrics {
+            display: flex;
+            gap: 24px;
+        }
+
+        .health-metric {
+            text-align: center;
+            min-width: 80px;
+        }
+
+        .health-metric-value {
+            font-size: 24px;
+            font-weight: 600;
+            line-height: 1;
+        }
+
+        .health-metric-label {
+            font-size: 11px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            margin-top: 4px;
+        }
+
+        /* Activity Timeline */
+        .activity-timeline {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .activity-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 12px 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .activity-item:last-child {
+            border-bottom: none;
+        }
+
+        .activity-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .activity-icon.deploy {
+            background: rgba(88, 166, 255, 0.2);
+            color: var(--accent-blue);
+        }
+
+        .activity-icon.start {
+            background: rgba(63, 185, 80, 0.2);
+            color: var(--accent-green);
+        }
+
+        .activity-icon.stop {
+            background: rgba(210, 153, 34, 0.2);
+            color: var(--accent-yellow);
+        }
+
+        .activity-icon.error {
+            background: rgba(248, 81, 73, 0.2);
+            color: var(--accent-red);
+        }
+
+        .activity-icon.move {
+            background: rgba(163, 113, 247, 0.2);
+            color: var(--accent-purple);
+        }
+
+        .activity-icon.node {
+            background: rgba(240, 136, 62, 0.2);
+            color: var(--accent-orange);
+        }
+
+        .activity-icon svg {
+            width: 16px;
+            height: 16px;
+        }
+
+        .activity-content {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .activity-title {
+            font-size: 13px;
+            font-weight: 500;
+            margin-bottom: 2px;
+        }
+
+        .activity-detail {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .activity-time {
+            font-size: 11px;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+
+        /* Search Input */
+        .search-input-wrapper {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+
+        .search-input-wrapper svg {
+            position: absolute;
+            left: 12px;
+            width: 16px;
+            height: 16px;
+            color: var(--text-muted);
+        }
+
+        .search-input {
+            width: 100%;
+            padding: 10px 12px 10px 38px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 14px;
+        }
+
+        .search-input:focus {
+            outline: none;
+            border-color: var(--accent-blue);
+        }
+
+        .search-input::placeholder {
+            color: var(--text-muted);
+        }
+
+        /* Filter Pills */
+        .filter-pills {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .filter-pill {
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            border: 1px solid var(--border-color);
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            transition: all 0.2s;
+        }
+
+        .filter-pill:hover {
+            border-color: var(--accent-blue);
+            color: var(--text-primary);
+        }
+
+        .filter-pill.active {
+            background: var(--accent-blue);
+            border-color: var(--accent-blue);
+            color: white;
+        }
+
+        /* Mini Resource Bars */
+        .mini-resource-bar {
+            height: 4px;
+            background: var(--bg-primary);
+            border-radius: 2px;
+            overflow: hidden;
+            margin-top: 4px;
+        }
+
+        .mini-resource-bar-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.3s ease;
+        }
+
+        /* Network Status Card */
+        .network-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+        }
+
+        .network-item {
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+            padding: 12px;
+        }
+
+        .network-item-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .network-item-status {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+
+        .network-item-status.active {
+            background: var(--accent-green);
+        }
+
+        .network-item-status.inactive {
+            background: var(--accent-red);
+        }
+
+        .network-item-status.warning {
+            background: var(--accent-yellow);
+        }
+
+        .network-item-title {
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .network-item-value {
+            font-size: 12px;
+            color: var(--text-secondary);
+            font-family: 'Monaco', 'Menlo', monospace;
+        }
+
+        /* Enhanced Logs */
+        .logs-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+            gap: 12px;
+        }
+
+        .logs-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .logs-container.auto-scroll {
+            scroll-behavior: smooth;
+        }
+
+        .log-line {
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .log-line.highlight {
+            background: rgba(88, 166, 255, 0.2);
+        }
+
+        /* Uptime Badge */
+        .uptime-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .uptime-badge svg {
+            width: 14px;
+            height: 14px;
+        }
+
+        /* Keyboard Shortcut Hints */
+        .kbd {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 20px;
+            padding: 2px 6px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        /* Quick Stats Row */
+        .quick-stats {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .quick-stat {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .quick-stat-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+        }
+
+        /* Sparkline Chart */
+        .sparkline {
+            height: 24px;
+            display: flex;
+            align-items: flex-end;
+            gap: 1px;
+        }
+
+        .sparkline-bar {
+            flex: 1;
+            background: var(--accent-blue);
+            border-radius: 1px;
+            min-width: 3px;
+            transition: height 0.3s;
+        }
+
+        /* Container Stats Grid */
+        .container-stats {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .container-stat {
+            background: var(--bg-primary);
+            padding: 8px;
+            border-radius: 4px;
+        }
+
+        .container-stat-label {
+            font-size: 10px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+        }
+
+        .container-stat-value {
+            font-size: 14px;
+            font-weight: 600;
+            margin-top: 2px;
+        }
+
+        /* Help Modal */
+        .shortcuts-list {
+            display: grid;
+            gap: 8px;
+        }
+
+        .shortcut-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .shortcut-item:last-child {
+            border-bottom: none;
+        }
+
+        .shortcut-keys {
+            display: flex;
+            gap: 4px;
+        }
     </style>
 </head>
 <body>
@@ -1124,14 +1569,57 @@
             <div class="page active" id="page-overview">
                 <div class="page-header">
                     <h1 class="page-title">Cluster Overview</h1>
-                    <button class="btn" onclick="refreshStatus()">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <polyline points="23 4 23 10 17 10"/>
-                            <polyline points="1 20 1 14 7 14"/>
-                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
-                        </svg>
-                        Refresh
-                    </button>
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                        <div class="uptime-badge" id="clusterUptime" style="display: none;">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"/>
+                                <polyline points="12 6 12 12 16 14"/>
+                            </svg>
+                            <span id="uptimeValue">--</span>
+                        </div>
+                        <button class="btn" onclick="refreshStatus()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="23 4 23 10 17 10"/>
+                                <polyline points="1 20 1 14 7 14"/>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                            </svg>
+                            Refresh
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Cluster Health Banner -->
+                <div class="health-banner" id="healthBanner" style="display: none;">
+                    <div class="health-banner-left">
+                        <div class="health-indicator" id="healthIndicator">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                                <polyline points="22 4 12 14.01 9 11.01"/>
+                            </svg>
+                        </div>
+                        <div class="health-info">
+                            <h3 id="healthTitle">Cluster Healthy</h3>
+                            <p id="healthSubtitle">All systems operational</p>
+                        </div>
+                    </div>
+                    <div class="health-metrics" id="healthMetrics">
+                        <div class="health-metric">
+                            <div class="health-metric-value green" id="metric-uptime">100%</div>
+                            <div class="health-metric-label">Uptime</div>
+                        </div>
+                        <div class="health-metric">
+                            <div class="health-metric-value" id="metric-cpu">--</div>
+                            <div class="health-metric-label">Avg CPU</div>
+                        </div>
+                        <div class="health-metric">
+                            <div class="health-metric-value" id="metric-mem">--</div>
+                            <div class="health-metric-label">Avg Memory</div>
+                        </div>
+                        <div class="health-metric">
+                            <div class="health-metric-value blue" id="metric-workloads">0</div>
+                            <div class="health-metric-label">Running</div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="stats-grid" id="statsGrid">
@@ -1188,17 +1676,78 @@
                     </div>
                 </div>
 
-                <div class="card">
+                <!-- Two Column Layout for Recent Workloads and Activity -->
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                    <div class="card">
+                        <div class="card-header">
+                            <h3 class="card-title">Recent Workloads</h3>
+                            <button class="btn btn-sm" onclick="showPage('workloads')">View All</button>
+                        </div>
+                        <div class="card-body">
+                            <div id="recentWorkloads" class="empty-state">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                                </svg>
+                                <h3>No workloads yet</h3>
+                                <p>Connect to a Jetty cluster to see workloads</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h3 class="card-title">Recent Activity</h3>
+                            <button class="btn btn-sm" onclick="clearActivityLog()">Clear</button>
+                        </div>
+                        <div class="card-body">
+                            <div class="activity-timeline" id="activityTimeline">
+                                <div class="empty-state" style="padding: 20px;">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 32px; height: 32px;">
+                                        <circle cx="12" cy="12" r="10"/>
+                                        <polyline points="12 6 12 12 16 14"/>
+                                    </svg>
+                                    <p style="margin-top: 8px;">Activity will appear here</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Network Status Card -->
+                <div class="card" style="margin-top: 16px;">
                     <div class="card-header">
-                        <h3 class="card-title">Recent Workloads</h3>
+                        <h3 class="card-title">Network Status</h3>
                     </div>
                     <div class="card-body">
-                        <div id="recentWorkloads" class="empty-state">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
-                            </svg>
-                            <h3>No workloads yet</h3>
-                            <p>Connect to a Jetty cluster to see workloads</p>
+                        <div class="network-grid" id="networkStatus">
+                            <div class="network-item">
+                                <div class="network-item-header">
+                                    <span class="network-item-status" id="warpStatus"></span>
+                                    <span class="network-item-title">WARP Mesh</span>
+                                </div>
+                                <div class="network-item-value" id="warpIP">Not connected</div>
+                            </div>
+                            <div class="network-item">
+                                <div class="network-item-header">
+                                    <span class="network-item-status" id="tunnelStatusDot"></span>
+                                    <span class="network-item-title">Cloudflare Tunnel</span>
+                                </div>
+                                <div class="network-item-value" id="tunnelDomain">Not configured</div>
+                            </div>
+                            <div class="network-item">
+                                <div class="network-item-header">
+                                    <span class="network-item-status active"></span>
+                                    <span class="network-item-title">Service Network</span>
+                                </div>
+                                <div class="network-item-value">10.100.0.0/16</div>
+                            </div>
+                            <div class="network-item">
+                                <div class="network-item-header">
+                                    <span class="network-item-status" id="peerConnStatus"></span>
+                                    <span class="network-item-title">Peer Connections</span>
+                                </div>
+                                <div class="network-item-value" id="peerConnCount">0 peers</div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1216,6 +1765,36 @@
                         </svg>
                         Refresh
                     </button>
+                </div>
+
+                <!-- Search and Filter Bar -->
+                <div class="card" style="margin-bottom: 16px;">
+                    <div class="card-body" style="padding: 12px 16px;">
+                        <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+                            <div class="search-input-wrapper" style="flex: 1; min-width: 200px; max-width: 300px;">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="11" cy="11" r="8"/>
+                                    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                                </svg>
+                                <input type="text" class="search-input" id="nodeSearch" placeholder="Search nodes..." oninput="filterNodes()">
+                            </div>
+                            <div class="filter-pills" id="nodeFilters">
+                                <button class="filter-pill active" data-filter="all" onclick="setNodeFilter('all')">All</button>
+                                <button class="filter-pill" data-filter="healthy" onclick="setNodeFilter('healthy')">Healthy</button>
+                                <button class="filter-pill" data-filter="unhealthy" onclick="setNodeFilter('unhealthy')">Unhealthy</button>
+                            </div>
+                            <div class="quick-stats" id="nodeQuickStats">
+                                <div class="quick-stat">
+                                    <span class="quick-stat-dot" style="background: var(--accent-green);"></span>
+                                    <span id="ns-healthy">0</span> healthy
+                                </div>
+                                <div class="quick-stat">
+                                    <span class="quick-stat-dot" style="background: var(--accent-red);"></span>
+                                    <span id="ns-unhealthy">0</span> unhealthy
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="nodes-grid" id="nodesGrid">
@@ -1250,6 +1829,37 @@
                             </svg>
                             Deploy Workload
                         </button>
+                    </div>
+                </div>
+
+                <!-- Search and Filter Bar -->
+                <div class="card" style="margin-bottom: 16px;">
+                    <div class="card-body" style="padding: 12px 16px;">
+                        <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+                            <div class="search-input-wrapper" style="flex: 1; min-width: 200px; max-width: 300px;">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="11" cy="11" r="8"/>
+                                    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                                </svg>
+                                <input type="text" class="search-input" id="workloadSearch" placeholder="Search workloads..." oninput="filterWorkloads()">
+                            </div>
+                            <div class="filter-pills" id="workloadFilters">
+                                <button class="filter-pill active" data-filter="all" onclick="setWorkloadFilter('all')">All</button>
+                                <button class="filter-pill" data-filter="running" onclick="setWorkloadFilter('running')">Running</button>
+                                <button class="filter-pill" data-filter="stopped" onclick="setWorkloadFilter('stopped')">Stopped</button>
+                                <button class="filter-pill" data-filter="remote" onclick="setWorkloadFilter('remote')">Remote</button>
+                            </div>
+                            <div class="quick-stats" id="workloadQuickStats">
+                                <div class="quick-stat">
+                                    <span class="quick-stat-dot" style="background: var(--accent-green);"></span>
+                                    <span id="qs-running">0</span> running
+                                </div>
+                                <div class="quick-stat">
+                                    <span class="quick-stat-dot" style="background: var(--accent-yellow);"></span>
+                                    <span id="qs-stopped">0</span> stopped
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -1592,6 +2202,61 @@
         </div>
     </div>
 
+    <!-- Keyboard Shortcuts Modal -->
+    <div class="modal-overlay hidden" id="shortcutsModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title">Keyboard Shortcuts</h2>
+                <button class="modal-close" onclick="closeShortcutsModal()">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="shortcuts-list">
+                    <div class="shortcut-item">
+                        <span>Show keyboard shortcuts</span>
+                        <div class="shortcut-keys"><span class="kbd">?</span></div>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>Refresh data</span>
+                        <div class="shortcut-keys"><span class="kbd">R</span></div>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>Go to Overview</span>
+                        <div class="shortcut-keys"><span class="kbd">G</span> <span class="kbd">O</span></div>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>Go to Nodes</span>
+                        <div class="shortcut-keys"><span class="kbd">G</span> <span class="kbd">N</span></div>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>Go to Workloads</span>
+                        <div class="shortcut-keys"><span class="kbd">G</span> <span class="kbd">W</span></div>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>Go to Secrets</span>
+                        <div class="shortcut-keys"><span class="kbd">G</span> <span class="kbd">S</span></div>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>Deploy new workload</span>
+                        <div class="shortcut-keys"><span class="kbd">N</span></div>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>Focus search</span>
+                        <div class="shortcut-keys"><span class="kbd">/</span></div>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>Close panel/modal</span>
+                        <div class="shortcut-keys"><span class="kbd">Esc</span></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast Container -->
     <div class="toast-container" id="toastContainer"></div>
 
@@ -1610,6 +2275,21 @@
         };
 
         let draggedWorkload = null;
+
+        // Activity log state
+        let activityLog = [];
+        const maxActivityItems = 50;
+
+        // Filter state
+        let workloadFilter = 'all';
+        let nodeFilter = 'all';
+
+        // Keyboard navigation state
+        let keySequence = '';
+        let keySequenceTimeout = null;
+
+        // Connection start time (for uptime)
+        let connectionStartTime = null;
 
         // Auto-refresh state
         let refreshState = {
@@ -1703,7 +2383,388 @@
         setInterval(() => {
             updateLastRefreshedDisplay();
             updateAllTimestamps();
+            updateUptimeDisplay();
         }, 1000);
+
+        // =====================================================================
+        // NEW FEATURES: Activity Log, Filters, Keyboard Shortcuts, Health Banner
+        // =====================================================================
+
+        // Activity Log Functions
+        function addActivity(type, title, detail) {
+            const activity = {
+                type,
+                title,
+                detail,
+                time: new Date()
+            };
+            activityLog.unshift(activity);
+            if (activityLog.length > maxActivityItems) {
+                activityLog = activityLog.slice(0, maxActivityItems);
+            }
+            // Save to localStorage
+            localStorage.setItem('jetty-activity-log', JSON.stringify(activityLog.slice(0, 20)));
+            updateActivityTimeline();
+        }
+
+        function loadActivityLog() {
+            try {
+                const saved = localStorage.getItem('jetty-activity-log');
+                if (saved) {
+                    activityLog = JSON.parse(saved);
+                }
+            } catch (e) {
+                activityLog = [];
+            }
+            updateActivityTimeline();
+        }
+
+        function clearActivityLog() {
+            activityLog = [];
+            localStorage.removeItem('jetty-activity-log');
+            updateActivityTimeline();
+            showToast('Activity log cleared', 'success');
+        }
+
+        function updateActivityTimeline() {
+            const container = document.getElementById('activityTimeline');
+            if (!container) return;
+
+            if (activityLog.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state" style="padding: 20px;">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 32px; height: 32px;">
+                            <circle cx="12" cy="12" r="10"/>
+                            <polyline points="12 6 12 12 16 14"/>
+                        </svg>
+                        <p style="margin-top: 8px;">Activity will appear here</p>
+                    </div>
+                `;
+                return;
+            }
+
+            const iconMap = {
+                deploy: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>`,
+                start: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>`,
+                stop: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12"/></svg>`,
+                error: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>`,
+                move: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="5 9 2 12 5 15"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/></svg>`,
+                node: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/></svg>`,
+                delete: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`,
+                connect: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>`
+            };
+
+            container.innerHTML = activityLog.map(item => `
+                <div class="activity-item">
+                    <div class="activity-icon ${item.type}">
+                        ${iconMap[item.type] || iconMap.node}
+                    </div>
+                    <div class="activity-content">
+                        <div class="activity-title">${escapeHtml(item.title)}</div>
+                        <div class="activity-detail">${escapeHtml(item.detail || '')}</div>
+                    </div>
+                    <div class="activity-time">${formatRelativeTime(item.time)}</div>
+                </div>
+            `).join('');
+        }
+
+        // Health Banner Functions
+        function updateHealthBanner() {
+            const banner = document.getElementById('healthBanner');
+            const indicator = document.getElementById('healthIndicator');
+            const title = document.getElementById('healthTitle');
+            const subtitle = document.getElementById('healthSubtitle');
+
+            if (!state.connected || !state.node) {
+                banner.style.display = 'none';
+                return;
+            }
+
+            banner.style.display = 'flex';
+
+            const allNodes = [state.node, ...state.peers].filter(Boolean);
+            const healthyNodes = allNodes.filter(n => n.healthy !== false);
+            const runningWorkloads = state.workloads.filter(w => w.status === 'running');
+            const healthPercent = allNodes.length > 0 ? Math.round((healthyNodes.length / allNodes.length) * 100) : 100;
+
+            // Update health indicator
+            indicator.classList.remove('healthy', 'degraded', 'critical');
+            if (healthPercent === 100 && healthyNodes.length > 0) {
+                indicator.classList.add('healthy');
+                indicator.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`;
+                title.textContent = 'Cluster Healthy';
+                subtitle.textContent = `All ${allNodes.length} node(s) operational`;
+            } else if (healthPercent >= 50) {
+                indicator.classList.add('degraded');
+                indicator.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`;
+                title.textContent = 'Cluster Degraded';
+                subtitle.textContent = `${healthyNodes.length}/${allNodes.length} node(s) healthy`;
+            } else {
+                indicator.classList.add('critical');
+                indicator.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>`;
+                title.textContent = 'Cluster Critical';
+                subtitle.textContent = `Only ${healthyNodes.length}/${allNodes.length} node(s) healthy`;
+            }
+
+            // Update metrics
+            document.getElementById('metric-uptime').textContent = healthPercent + '%';
+            document.getElementById('metric-uptime').className = `health-metric-value ${healthPercent >= 80 ? 'green' : healthPercent >= 50 ? 'yellow' : 'red'}`;
+            document.getElementById('metric-workloads').textContent = runningWorkloads.length;
+
+            // Update CPU/Memory from cluster health if available
+            if (state.clusterHealth && state.clusterHealth.nodes) {
+                let totalCpu = 0, totalMem = 0, count = 0;
+                state.clusterHealth.nodes.forEach(node => {
+                    if (node.system) {
+                        if (node.system.cpu_percent) {
+                            totalCpu += parsePercent(node.system.cpu_percent);
+                            count++;
+                        }
+                        if (node.system.memory_percent) {
+                            totalMem += parsePercent(node.system.memory_percent);
+                        }
+                    }
+                });
+                if (count > 0) {
+                    const avgCpu = Math.round(totalCpu / count);
+                    const avgMem = Math.round(totalMem / count);
+                    document.getElementById('metric-cpu').textContent = avgCpu + '%';
+                    document.getElementById('metric-cpu').className = `health-metric-value ${avgCpu < 50 ? 'green' : avgCpu < 80 ? 'yellow' : 'red'}`;
+                    document.getElementById('metric-mem').textContent = avgMem + '%';
+                    document.getElementById('metric-mem').className = `health-metric-value ${avgMem < 50 ? 'green' : avgMem < 80 ? 'yellow' : 'red'}`;
+                }
+            }
+        }
+
+        // Network Status Functions
+        function updateNetworkStatus() {
+            const warpStatus = document.getElementById('warpStatus');
+            const warpIP = document.getElementById('warpIP');
+            const tunnelStatusDot = document.getElementById('tunnelStatusDot');
+            const tunnelDomain = document.getElementById('tunnelDomain');
+            const peerConnStatus = document.getElementById('peerConnStatus');
+            const peerConnCount = document.getElementById('peerConnCount');
+
+            // WARP status
+            if (state.warp?.enabled && state.warp?.ip) {
+                warpStatus.classList.add('active');
+                warpStatus.classList.remove('inactive');
+                warpIP.textContent = state.warp.ip;
+            } else {
+                warpStatus.classList.remove('active');
+                warpStatus.classList.add('inactive');
+                warpIP.textContent = 'Not connected';
+            }
+
+            // Tunnel status
+            if (state.tunnel?.running) {
+                tunnelStatusDot.classList.add('active');
+                tunnelStatusDot.classList.remove('inactive');
+                tunnelDomain.textContent = state.node?.tunnelHost || state.node?.tunnel_host || 'Running';
+            } else if (state.tunnel?.configured) {
+                tunnelStatusDot.classList.remove('active');
+                tunnelStatusDot.classList.add('warning');
+                tunnelDomain.textContent = 'Configured (not running)';
+            } else {
+                tunnelStatusDot.classList.remove('active');
+                tunnelStatusDot.classList.add('inactive');
+                tunnelDomain.textContent = 'Not configured';
+            }
+
+            // Peer connections
+            const healthyPeers = state.peers.filter(p => p.healthy !== false);
+            peerConnCount.textContent = `${healthyPeers.length}/${state.peers.length} peers`;
+            if (healthyPeers.length === state.peers.length && state.peers.length > 0) {
+                peerConnStatus.classList.add('active');
+                peerConnStatus.classList.remove('inactive', 'warning');
+            } else if (healthyPeers.length > 0) {
+                peerConnStatus.classList.remove('active', 'inactive');
+                peerConnStatus.classList.add('warning');
+            } else if (state.peers.length === 0) {
+                peerConnStatus.classList.add('active');
+                peerConnStatus.classList.remove('inactive', 'warning');
+                peerConnCount.textContent = 'Single node';
+            } else {
+                peerConnStatus.classList.add('inactive');
+                peerConnStatus.classList.remove('active', 'warning');
+            }
+        }
+
+        // Uptime Display
+        function updateUptimeDisplay() {
+            if (!connectionStartTime || !state.connected) {
+                document.getElementById('clusterUptime').style.display = 'none';
+                return;
+            }
+
+            document.getElementById('clusterUptime').style.display = 'flex';
+            const diff = Date.now() - connectionStartTime;
+            const hours = Math.floor(diff / 3600000);
+            const minutes = Math.floor((diff % 3600000) / 60000);
+            const seconds = Math.floor((diff % 60000) / 1000);
+
+            let uptimeStr = '';
+            if (hours > 0) {
+                uptimeStr = `${hours}h ${minutes}m`;
+            } else if (minutes > 0) {
+                uptimeStr = `${minutes}m ${seconds}s`;
+            } else {
+                uptimeStr = `${seconds}s`;
+            }
+            document.getElementById('uptimeValue').textContent = uptimeStr + ' connected';
+        }
+
+        // Filter Functions
+        function setWorkloadFilter(filter) {
+            workloadFilter = filter;
+            document.querySelectorAll('#workloadFilters .filter-pill').forEach(pill => {
+                pill.classList.toggle('active', pill.dataset.filter === filter);
+            });
+            filterWorkloads();
+        }
+
+        function filterWorkloads() {
+            const searchTerm = document.getElementById('workloadSearch')?.value?.toLowerCase() || '';
+            const rows = document.querySelectorAll('#workloadsTableBody tr');
+
+            let runningCount = 0;
+            let stoppedCount = 0;
+
+            rows.forEach(row => {
+                if (row.querySelector('.empty-state')) return;
+
+                const name = row.cells[0]?.textContent?.toLowerCase() || '';
+                const status = row.cells[1]?.textContent?.toLowerCase() || '';
+                const owner = row.cells[3]?.textContent?.toLowerCase() || '';
+
+                // Count for quick stats
+                if (status.includes('running')) runningCount++;
+                if (status.includes('stopped')) stoppedCount++;
+
+                // Apply filters
+                const matchesSearch = name.includes(searchTerm) || owner.includes(searchTerm);
+                const matchesFilter = workloadFilter === 'all' || status.includes(workloadFilter);
+
+                row.style.display = (matchesSearch && matchesFilter) ? '' : 'none';
+            });
+
+            // Update quick stats
+            document.getElementById('qs-running').textContent = state.workloads.filter(w => w.status === 'running').length;
+            document.getElementById('qs-stopped').textContent = state.workloads.filter(w => w.status === 'stopped').length;
+        }
+
+        function setNodeFilter(filter) {
+            nodeFilter = filter;
+            document.querySelectorAll('#nodeFilters .filter-pill').forEach(pill => {
+                pill.classList.toggle('active', pill.dataset.filter === filter);
+            });
+            filterNodes();
+        }
+
+        function filterNodes() {
+            const searchTerm = document.getElementById('nodeSearch')?.value?.toLowerCase() || '';
+            const cards = document.querySelectorAll('#nodesGrid .node-card');
+
+            cards.forEach(card => {
+                const name = card.querySelector('.node-name')?.textContent?.toLowerCase() || '';
+                const ip = card.querySelector('.node-details')?.textContent?.toLowerCase() || '';
+                const isHealthy = card.querySelector('.node-health.healthy') !== null;
+
+                const matchesSearch = name.includes(searchTerm) || ip.includes(searchTerm);
+                const matchesFilter = nodeFilter === 'all' ||
+                    (nodeFilter === 'healthy' && isHealthy) ||
+                    (nodeFilter === 'unhealthy' && !isHealthy);
+
+                card.style.display = (matchesSearch && matchesFilter) ? '' : 'none';
+            });
+
+            // Update quick stats
+            const allNodes = [state.node, ...state.peers].filter(Boolean);
+            document.getElementById('ns-healthy').textContent = allNodes.filter(n => n.healthy !== false).length;
+            document.getElementById('ns-unhealthy').textContent = allNodes.filter(n => n.healthy === false).length;
+        }
+
+        // Keyboard Shortcuts
+        function setupKeyboardShortcuts() {
+            document.addEventListener('keydown', (e) => {
+                // Don't trigger shortcuts when typing in inputs
+                if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') {
+                    if (e.key === 'Escape') {
+                        e.target.blur();
+                    }
+                    return;
+                }
+
+                // Clear key sequence after timeout
+                if (keySequenceTimeout) clearTimeout(keySequenceTimeout);
+                keySequenceTimeout = setTimeout(() => { keySequence = ''; }, 1000);
+
+                // Single key shortcuts
+                if (e.key === '?') {
+                    e.preventDefault();
+                    openShortcutsModal();
+                    return;
+                }
+                if (e.key === 'r' || e.key === 'R') {
+                    e.preventDefault();
+                    refreshStatus();
+                    refreshClusterHealth();
+                    return;
+                }
+                if (e.key === 'n' || e.key === 'N') {
+                    e.preventDefault();
+                    openDeployModal();
+                    return;
+                }
+                if (e.key === '/') {
+                    e.preventDefault();
+                    const searchInput = document.getElementById('workloadSearch') || document.getElementById('nodeSearch');
+                    if (searchInput) searchInput.focus();
+                    return;
+                }
+                if (e.key === 'Escape') {
+                    closeDetailPanel();
+                    closeNodeDetailPanel();
+                    closeConnectModal();
+                    closeDeployModal();
+                    closeMoveModal();
+                    closeSecretModal();
+                    closeUpdateNodeModal();
+                    closeShortcutsModal();
+                    return;
+                }
+
+                // Two-key shortcuts (g + letter)
+                keySequence += e.key.toLowerCase();
+                if (keySequence === 'go') {
+                    e.preventDefault();
+                    showPage('overview');
+                    keySequence = '';
+                } else if (keySequence === 'gn') {
+                    e.preventDefault();
+                    showPage('nodes');
+                    keySequence = '';
+                } else if (keySequence === 'gw') {
+                    e.preventDefault();
+                    showPage('workloads');
+                    keySequence = '';
+                } else if (keySequence === 'gs') {
+                    e.preventDefault();
+                    showPage('secrets');
+                    keySequence = '';
+                } else if (keySequence.length > 2) {
+                    keySequence = '';
+                }
+            });
+        }
+
+        function openShortcutsModal() {
+            document.getElementById('shortcutsModal').classList.remove('hidden');
+        }
+
+        function closeShortcutsModal() {
+            document.getElementById('shortcutsModal').classList.add('hidden');
+        }
 
         // Helper function to get CSS class for workload status
         function getStatusClass(status) {
@@ -1784,6 +2845,8 @@
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
             loadSavedConnection();
+            loadActivityLog();
+            setupKeyboardShortcuts();
             if (state.apiUrl && state.secretKey) {
                 connect();
             }
@@ -1833,6 +2896,7 @@
             try {
                 await refreshStatus();
                 state.connected = true;
+                connectionStartTime = Date.now();
                 // Fetch cluster health data for resource display
                 await refreshClusterHealth();
                 // Fetch secrets data
@@ -1844,6 +2908,7 @@
                 saveConnection();
                 closeConnectModal();
                 showToast('Connected to Jetty cluster', 'success');
+                addActivity('connect', 'Connected to cluster', `${state.node?.name || 'Cluster'} at ${state.apiUrl}`);
             } catch (error) {
                 state.connected = false;
                 updateConnectionStatus();
@@ -1945,6 +3010,8 @@
         // UI Updates
         function updateUI() {
             updateStats();
+            updateHealthBanner();
+            updateNetworkStatus();
             updateClusterResourcesOverview();
             updateClusterNodesOverview();
             updateNodesGrid();
@@ -1952,6 +3019,8 @@
             updateOrchestrateGrid();
             updateRecentWorkloads();
             updateConnectionStatus();
+            filterWorkloads();
+            filterNodes();
         }
 
         // Fetch cluster health data from API
@@ -2489,6 +3558,7 @@
             try {
                 await apiCall('/workloads', 'POST', payload);
                 showToast(`Workload "${name}" deployed successfully`, 'success');
+                addActivity('deploy', `Deployed workload "${name}"`, meshIp ? `Service IP: ${meshIp}` : 'Auto-assigned IP');
                 closeDeployModal();
 
                 // Clear form
@@ -2502,6 +3572,7 @@
                 await refreshStatus();
             } catch (error) {
                 showToast(`Deploy failed: ${error.message}`, 'error');
+                addActivity('error', `Failed to deploy "${name}"`, error.message);
             }
         }
 
@@ -2509,9 +3580,11 @@
             try {
                 await apiCall(`/workloads/${name}/start`, 'POST');
                 showToast(`Workload "${name}" started`, 'success');
+                addActivity('start', `Started workload "${name}"`, '');
                 await refreshStatus();
             } catch (error) {
                 showToast(`Failed to start: ${error.message}`, 'error');
+                addActivity('error', `Failed to start "${name}"`, error.message);
             }
         }
 
@@ -2519,9 +3592,11 @@
             try {
                 await apiCall(`/workloads/${name}/stop`, 'POST');
                 showToast(`Workload "${name}" stopped`, 'success');
+                addActivity('stop', `Stopped workload "${name}"`, '');
                 await refreshStatus();
             } catch (error) {
                 showToast(`Failed to stop: ${error.message}`, 'error');
+                addActivity('error', `Failed to stop "${name}"`, error.message);
             }
         }
 
@@ -2533,9 +3608,11 @@
             try {
                 await apiCall(`/workloads/${name}`, 'DELETE');
                 showToast(`Workload "${name}" deleted`, 'success');
+                addActivity('delete', `Deleted workload "${name}"`, '');
                 await refreshStatus();
             } catch (error) {
                 showToast(`Failed to delete: ${error.message}`, 'error');
+                addActivity('error', `Failed to delete "${name}"`, error.message);
             }
         }
 
@@ -2590,16 +3667,19 @@
 
         async function confirmMoveWorkload() {
             const targetNode = document.getElementById('moveTargetNode').value;
+            const targetNodeName = document.getElementById('moveTargetNode').selectedOptions[0]?.text || targetNode;
 
             if (!workloadToMove || !targetNode) return;
 
             try {
                 await apiCall(`/workloads/${workloadToMove}/move`, 'POST', { to: targetNode });
                 showToast(`Workload "${workloadToMove}" moved successfully`, 'success');
+                addActivity('move', `Moved workload "${workloadToMove}"`, `Target: ${targetNodeName}`);
                 closeMoveModal();
                 await refreshStatus();
             } catch (error) {
                 showToast(`Move failed: ${error.message}`, 'error');
+                addActivity('error', `Failed to move "${workloadToMove}"`, error.message);
             }
         }
 
@@ -2910,11 +3990,18 @@
             document.getElementById('nodeDetailPanel').classList.remove('open');
         }
 
+        // Current logs state
+        let currentLogsWorkload = null;
+        let currentLogsContent = '';
+        let logsAutoScroll = true;
+        let logsSearchTerm = '';
+
         async function viewLogs(name) {
             const panel = document.getElementById('detailPanel');
             const title = document.getElementById('detailTitle');
             const body = document.getElementById('detailBody');
 
+            currentLogsWorkload = name;
             title.textContent = `${name} - Logs`;
             body.innerHTML = '<div style="text-align: center; padding: 40px;"><div class="spinner"></div></div>';
             panel.classList.add('open');
@@ -2929,27 +4016,141 @@
                     throw new Error(await response.text() || `HTTP ${response.status}`);
                 }
                 const logs = await response.text() || 'No logs available';
+                currentLogsContent = logs;
+                const lineCount = logs.split('\\n').length;
 
                 body.innerHTML = `
                     <div class="detail-section">
                         <div class="detail-section-title">Container Logs</div>
-                        <button class="btn btn-sm" onclick="viewLogs('${name}')" style="margin-bottom: 12px;">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <polyline points="23 4 23 10 17 10"/>
-                                <polyline points="1 20 1 14 7 14"/>
-                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
-                            </svg>
-                            Refresh
-                        </button>
-                        <div class="logs-container">${escapeHtml(logs)}</div>
+                        <div class="logs-header">
+                            <div class="search-input-wrapper" style="flex: 1; max-width: 300px;">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="11" cy="11" r="8"/>
+                                    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                                </svg>
+                                <input type="text" class="search-input" id="logsSearch" placeholder="Search logs..." oninput="searchLogs()" value="${escapeHtml(logsSearchTerm)}">
+                            </div>
+                            <div class="logs-actions">
+                                <label class="form-checkbox" style="font-size: 12px; cursor: pointer;">
+                                    <input type="checkbox" id="logsAutoScroll" ${logsAutoScroll ? 'checked' : ''} onchange="toggleLogsAutoScroll()">
+                                    <span>Auto-scroll</span>
+                                </label>
+                                <button class="btn btn-sm" onclick="viewLogs('${name}')" title="Refresh">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <polyline points="23 4 23 10 17 10"/>
+                                        <polyline points="1 20 1 14 7 14"/>
+                                        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                                    </svg>
+                                </button>
+                                <button class="btn btn-sm" onclick="downloadLogs('${name}')" title="Download">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                        <polyline points="7 10 12 15 17 10"/>
+                                        <line x1="12" y1="15" x2="12" y2="3"/>
+                                    </svg>
+                                </button>
+                                <button class="btn btn-sm" onclick="copyLogs()" title="Copy to clipboard">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                                    </svg>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="quick-stats" style="margin-bottom: 8px;">
+                            <span id="logsLineCount">${lineCount} lines</span>
+                            <span id="logsMatchCount" style="display: none;"></span>
+                        </div>
+                        <div class="logs-container ${logsAutoScroll ? 'auto-scroll' : ''}" id="logsContainer">${formatLogs(logs, logsSearchTerm)}</div>
                     </div>
                     <div class="detail-actions">
                         <button class="btn" onclick="showWorkloadDetail('${name}')">Back to Details</button>
                     </div>
                 `;
+
+                // Auto-scroll to bottom
+                if (logsAutoScroll) {
+                    const container = document.getElementById('logsContainer');
+                    if (container) {
+                        container.scrollTop = container.scrollHeight;
+                    }
+                }
             } catch (error) {
                 body.innerHTML = `<div class="empty-state"><p>Failed to load logs: ${error.message}</p></div>`;
             }
+        }
+
+        function formatLogs(logs, searchTerm) {
+            if (!searchTerm) {
+                return escapeHtml(logs);
+            }
+
+            const escaped = escapeHtml(logs);
+            const regex = new RegExp(`(${escapeRegex(searchTerm)})`, 'gi');
+            return escaped.replace(regex, '<mark style="background: var(--accent-yellow); color: var(--bg-primary); padding: 0 2px; border-radius: 2px;">$1</mark>');
+        }
+
+        function escapeRegex(string) {
+            return string.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+        }
+
+        function searchLogs() {
+            const searchInput = document.getElementById('logsSearch');
+            logsSearchTerm = searchInput?.value || '';
+
+            const container = document.getElementById('logsContainer');
+            const matchCountEl = document.getElementById('logsMatchCount');
+
+            if (container && currentLogsContent) {
+                container.innerHTML = formatLogs(currentLogsContent, logsSearchTerm);
+
+                // Count matches
+                if (logsSearchTerm && matchCountEl) {
+                    const regex = new RegExp(escapeRegex(logsSearchTerm), 'gi');
+                    const matches = (currentLogsContent.match(regex) || []).length;
+                    matchCountEl.textContent = `${matches} match${matches !== 1 ? 'es' : ''}`;
+                    matchCountEl.style.display = 'inline';
+                } else if (matchCountEl) {
+                    matchCountEl.style.display = 'none';
+                }
+            }
+        }
+
+        function toggleLogsAutoScroll() {
+            const checkbox = document.getElementById('logsAutoScroll');
+            logsAutoScroll = checkbox?.checked || false;
+            const container = document.getElementById('logsContainer');
+            if (container) {
+                container.classList.toggle('auto-scroll', logsAutoScroll);
+                if (logsAutoScroll) {
+                    container.scrollTop = container.scrollHeight;
+                }
+            }
+        }
+
+        function downloadLogs(name) {
+            if (!currentLogsContent) return;
+
+            const blob = new Blob([currentLogsContent], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${name}-logs-${new Date().toISOString().slice(0,19).replace(/:/g, '-')}.txt`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            showToast('Logs downloaded', 'success');
+        }
+
+        function copyLogs() {
+            if (!currentLogsContent) return;
+
+            navigator.clipboard.writeText(currentLogsContent).then(() => {
+                showToast('Logs copied to clipboard', 'success');
+            }).catch(() => {
+                showToast('Failed to copy logs', 'error');
+            });
         }
 
         // Secrets Management
