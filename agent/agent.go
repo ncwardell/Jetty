@@ -3083,7 +3083,9 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Step 6: Perform the actual switch in a goroutine after response is sent
-	// CRITICAL: Stop old container BEFORE starting new one to avoid port conflicts
+	// CRITICAL: We spawn a helper container to orchestrate the restart because
+	// when we call "docker stop" on ourselves, this process dies before it can
+	// start the new container. The helper runs independently and survives our death.
 	go func() {
 		time.Sleep(500 * time.Millisecond) // Give time for response to be sent
 
@@ -3101,28 +3103,49 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Warning: failed to rename new container: %v, output: %s", err, out)
 		}
 
-		// Stop old container FIRST to release the port
-		log.Printf("Stopping old container %s", containerID)
-		stopCmd := exec.Command("docker", "stop", "-t", "5", containerID)
-		if out, err := stopCmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to stop old container: %v, output: %s", err, out)
-		}
+		// Spawn a helper container to do the actual stop/start sequence
+		// This helper runs independently and will complete even after we're killed
+		// Use the same image we just pulled - it has docker CLI installed
+		// The script: stops old container, starts new one, cleans up old container
+		restartScript := fmt.Sprintf(
+			"sleep 1 && docker stop -t 5 %s && docker start %s && docker rm %s",
+			containerID, newContainerID, containerID)
 
-		// NOW start the new container (port is free)
-		log.Printf("Starting new container %s", newContainerID)
-		startCmd := exec.Command("docker", "start", newContainerID)
-		if out, err := startCmd.CombinedOutput(); err != nil {
-			log.Printf("CRITICAL: Failed to start new container: %v, output: %s", err, out)
-			// Try to restart old container as fallback
-			log.Printf("Attempting to restart old container as fallback...")
-			exec.Command("docker", "start", containerID).Run()
+		log.Printf("Spawning helper container to orchestrate restart")
+		helperCmd := exec.Command("docker", "run", "--rm", "-d",
+			"--entrypoint", "sh",
+			"-v", "/var/run/docker.sock:/var/run/docker.sock",
+			req.Image, "-c", restartScript)
+
+		if out, err := helperCmd.CombinedOutput(); err != nil {
+			log.Printf("Warning: failed to spawn helper container: %v, output: %s", err, out)
+			// Fallback: try docker:cli image (smaller, commonly available)
+			log.Printf("Trying docker:cli as fallback helper...")
+			helperCmd = exec.Command("docker", "run", "--rm", "-d",
+				"-v", "/var/run/docker.sock:/var/run/docker.sock",
+				"docker:cli", "sh", "-c", restartScript)
+			if out, err := helperCmd.CombinedOutput(); err != nil {
+				log.Printf("Warning: docker:cli also failed: %v, output: %s", err, out)
+				log.Printf("Falling back to direct restart (may fail)")
+
+				// Last resort: non-blocking commands
+				log.Printf("Stopping old container %s", containerID)
+				stopCmd := exec.Command("docker", "stop", "-t", "5", containerID)
+				stopCmd.Start() // Non-blocking - don't wait
+
+				time.Sleep(100 * time.Millisecond)
+				log.Printf("Starting new container %s", newContainerID)
+				startCmd := exec.Command("docker", "start", newContainerID)
+				startCmd.Start() // Non-blocking
+			} else {
+				log.Printf("Helper container (docker:cli) spawned successfully, exiting...")
+			}
 		} else {
-			// New container started successfully - remove the old one
-			log.Printf("Removing old container %s", containerID)
-			exec.Command("docker", "rm", containerID).Run()
+			log.Printf("Helper container spawned successfully, exiting...")
 		}
 
-		// If we get here and old container didn't stop us, force exit
+		// Give commands time to be sent to Docker daemon before we exit
+		time.Sleep(200 * time.Millisecond)
 		os.Exit(0)
 	}()
 }
