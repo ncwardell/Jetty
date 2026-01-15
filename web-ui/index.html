@@ -1260,7 +1260,7 @@
                                 <tr>
                                     <th>Name</th>
                                     <th>Status</th>
-                                    <th>Mesh IP</th>
+                                    <th>Service IP</th>
                                     <th>Owner Node</th>
                                     <th>Revive</th>
                                     <th>Actions</th>
@@ -1427,9 +1427,9 @@
                     <div class="form-hint">Alphanumeric characters, dashes, and underscores only</div>
                 </div>
                 <div class="form-group">
-                    <label class="form-label">Mesh IP (optional)</label>
+                    <label class="form-label">Service IP (optional)</label>
                     <input type="text" class="form-input" id="workloadMeshIp" placeholder="10.100.50.1">
-                    <div class="form-hint">Leave empty to auto-assign an IP from the mesh network</div>
+                    <div class="form-hint">Leave empty to auto-assign an IP from the service network (10.100.x.x)</div>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Docker Compose YAML</label>
@@ -2085,7 +2085,7 @@
                             <tr>
                                 <th>Node</th>
                                 <th>Status</th>
-                                <th>Mesh IP</th>
+                                <th>WARP IP</th>
                                 <th>Last Seen</th>
                                 <th>Workloads</th>
                             </tr>
@@ -2173,9 +2173,8 @@
                             </div>
                         </div>
                         <div class="node-details">
-                            <p><strong>Mesh IP:</strong> ${node.ip || 'N/A'}</p>
+                            <p><strong>WARP IP:</strong> ${node.ip || 'N/A'}</p>
                             <p><strong>Last Seen:</strong> <span data-timestamp="${node.last_seen || ''}">${formatRelativeTime(node.last_seen)}</span></p>
-                            ${node.warp_ip || node.warpIP ? `<p><strong>WARP IP:</strong> ${node.warp_ip || node.warpIP}</p>` : ''}
                             ${node.tunnel_host || node.tunnelHost ? `<p><strong>Tunnel:</strong> ${node.tunnel_host || node.tunnelHost}</p>` : ''}
                         </div>
                         <div class="node-workloads">
@@ -2320,7 +2319,7 @@
                             </div>
                         </div>
                         <div class="node-details">
-                            <p><strong>Mesh IP:</strong> ${node.ip || 'N/A'}</p>
+                            <p><strong>WARP IP:</strong> ${node.ip || 'N/A'}</p>
                         </div>
                         <div class="node-workloads">
                             <div class="node-workloads-title">Drag workloads here (${nodeWorkloads.length})</div>
@@ -2369,7 +2368,7 @@
                             <tr>
                                 <th>Name</th>
                                 <th>Status</th>
-                                <th>Mesh IP</th>
+                                <th>Service IP</th>
                                 <th>Owner</th>
                             </tr>
                         </thead>
@@ -2646,7 +2645,7 @@
                             <span class="detail-value">${workload.name}</span>
                         </div>
                         <div class="detail-row">
-                            <span class="detail-label">Mesh IP</span>
+                            <span class="detail-label">Service IP</span>
                             <span class="detail-value"><code>${workload.ip}</code></span>
                         </div>
                         <div class="detail-row">
@@ -2753,7 +2752,7 @@
                             <span class="detail-value"><code>${nodeHealth.id}</code></span>
                         </div>
                         <div class="detail-row">
-                            <span class="detail-label">Mesh IP</span>
+                            <span class="detail-label">WARP IP</span>
                             <span class="detail-value"><code>${nodeHealth.ip || 'N/A'}</code></span>
                         </div>
                         ${nodeHealth.public_ip ? `
