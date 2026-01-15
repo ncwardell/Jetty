@@ -2140,33 +2140,20 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 
 	// Build peer info maps for enrichment
 	peerIDToInfo := make(map[string]map[string]string)
+	peersByID := make(map[string]*Peer)
 	for _, p := range a.state.Peers {
 		peerIDToInfo[p.ID] = map[string]string{
 			"id":   p.ID,
 			"name": p.Name,
 			"ip":   p.IP,
 		}
+		peersByID[p.ID] = p
 	}
 	// Add local node to owner info map
 	peerIDToInfo[a.hwid] = map[string]string{
 		"id":   a.hwid,
 		"name": a.hostname,
 		"ip":   a.ip,
-	}
-
-	// Helper to get workload status
-	getStatus := func(wl *Workload) string {
-		if wl.Owner != a.hwid {
-			return "remote" // Can't check status of remote workloads
-		}
-		out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
-		if err != nil {
-			return "unknown"
-		}
-		if len(strings.TrimSpace(string(out))) > 0 {
-			return "running"
-		}
-		return "stopped"
 	}
 
 	// Build enriched workloads with owner info and status
@@ -2182,27 +2169,122 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 		Status       string            `json:"status"`
 	}
 
-	workloads := make([]EnrichedWorkload, 0, len(a.state.Workloads))
+	// Collect workload data - we'll fetch remote statuses after releasing the lock
+	type workloadData struct {
+		wl        *Workload
+		ownerInfo map[string]string
+		ownerPeer *Peer
+		isLocal   bool
+	}
+	workloadInfos := make([]workloadData, 0, len(a.state.Workloads))
 	for _, wl := range a.state.Workloads {
 		ownerInfo := peerIDToInfo[wl.Owner]
 		if ownerInfo == nil {
 			ownerInfo = map[string]string{"id": wl.Owner, "name": "unknown", "ip": "unknown"}
 		}
-		workloads = append(workloads, EnrichedWorkload{
-			Name:         wl.Name,
-			IP:           wl.IP,
-			Compose:      wl.Compose,
-			Revive:       wl.Revive,
-			Autostart:    wl.Autostart,
-			AllowedNodes: wl.AllowedNodes,
-			Owner:        ownerInfo,
-			Version:      wl.Version,
-			Status:       getStatus(wl),
+		isLocal := wl.Owner == a.hwid
+		var ownerPeer *Peer
+		if !isLocal {
+			ownerPeer = peersByID[wl.Owner]
+		}
+		workloadInfos = append(workloadInfos, workloadData{
+			wl:        wl,
+			ownerInfo: ownerInfo,
+			ownerPeer: ownerPeer,
+			isLocal:   isLocal,
 		})
 	}
 
 	hasTunnel := a.state.CFToken != ""
 	a.stateMu.RUnlock()
+
+	// Helper to get local workload status
+	getLocalStatus := func(name string) string {
+		out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+name).Output()
+		if err != nil {
+			return "unknown"
+		}
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return "running"
+		}
+		return "stopped"
+	}
+
+	// Fetch remote workload statuses in parallel with 2 second timeout
+	statusClient := &http.Client{Timeout: 2 * time.Second}
+	statuses := make(map[string]string)
+	var statusMu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, info := range workloadInfos {
+		if info.isLocal {
+			statuses[info.wl.Name] = getLocalStatus(info.wl.Name)
+		} else if info.ownerPeer != nil && info.ownerPeer.Healthy {
+			wg.Add(1)
+			go func(wl *Workload, peer *Peer) {
+				defer wg.Done()
+				status := "remote" // Default fallback
+
+				url := a.getPeerAPIURL(peer, "/api/workloads/"+wl.Name)
+				if url != "" {
+					req, err := a.peerRequest("GET", url, nil)
+					if err == nil {
+						resp, err := statusClient.Do(req)
+						if err == nil {
+							defer resp.Body.Close()
+							if resp.StatusCode == 200 {
+								var data map[string]interface{}
+								if json.NewDecoder(resp.Body).Decode(&data) == nil {
+									// Check containers array for running status
+									if containers, ok := data["containers"].([]interface{}); ok && len(containers) > 0 {
+										hasRunning := false
+										for _, c := range containers {
+											if cm, ok := c.(map[string]interface{}); ok {
+												if running, ok := cm["running"].(bool); ok && running {
+													hasRunning = true
+													break
+												}
+											}
+										}
+										if hasRunning {
+											status = "running"
+										} else {
+											status = "stopped"
+										}
+									} else {
+										status = "stopped"
+									}
+								}
+							}
+						}
+					}
+				}
+
+				statusMu.Lock()
+				statuses[wl.Name] = status
+				statusMu.Unlock()
+			}(info.wl, info.ownerPeer)
+		} else {
+			statuses[info.wl.Name] = "remote"
+		}
+	}
+	wg.Wait()
+
+	// Build final workloads list
+	workloads := make([]EnrichedWorkload, 0, len(workloadInfos))
+	for _, info := range workloadInfos {
+		workloads = append(workloads, EnrichedWorkload{
+			Name:         info.wl.Name,
+			IP:           info.wl.IP,
+			Compose:      info.wl.Compose,
+			Revive:       info.wl.Revive,
+			Autostart:    info.wl.Autostart,
+			AllowedNodes: info.wl.AllowedNodes,
+			Owner:        info.ownerInfo,
+			Version:      info.wl.Version,
+			Status:       statuses[info.wl.Name],
+		})
+	}
 
 	resp := map[string]interface{}{
 		"node": map[string]interface{}{
@@ -2243,6 +2325,7 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 	// Build peer info maps for enrichment and filtering
 	peerNameToID := make(map[string]string)
 	peerIDToInfo := make(map[string]map[string]string)
+	peersByID := make(map[string]*Peer)
 	for _, p := range a.state.Peers {
 		peerNameToID[p.Name] = p.ID
 		peerIDToInfo[p.ID] = map[string]string{
@@ -2250,6 +2333,7 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 			"name": p.Name,
 			"ip":   p.IP,
 		}
+		peersByID[p.ID] = p
 	}
 
 	// Add local node to owner info map
@@ -2271,22 +2355,14 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 		Status       string            `json:"status"`
 	}
 
-	// Helper to get workload status
-	getStatus := func(wl *Workload) string {
-		if wl.Owner != a.hwid {
-			return "remote" // Can't check status of remote workloads
-		}
-		out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
-		if err != nil {
-			return "unknown"
-		}
-		if len(strings.TrimSpace(string(out))) > 0 {
-			return "running"
-		}
-		return "stopped"
+	// Collect workload data - we'll fetch remote statuses after releasing the lock
+	type workloadData struct {
+		wl        *Workload
+		ownerInfo map[string]string
+		ownerPeer *Peer
+		isLocal   bool
 	}
-
-	var workloads []WorkloadResponse
+	var workloadInfos []workloadData
 
 	for _, wl := range a.state.Workloads {
 		// Apply node filter if specified
@@ -2322,19 +2398,107 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 			ownerInfo = map[string]string{"id": wl.Owner, "name": "unknown", "ip": "unknown"}
 		}
 
-		workloads = append(workloads, WorkloadResponse{
-			Name:         wl.Name,
-			IP:           wl.IP,
-			Compose:      wl.Compose,
-			Revive:       wl.Revive,
-			Autostart:    wl.Autostart,
-			AllowedNodes: wl.AllowedNodes,
-			Owner:        ownerInfo,
-			Version:      wl.Version,
-			Status:       getStatus(wl),
+		isLocal := wl.Owner == a.hwid
+		var ownerPeer *Peer
+		if !isLocal {
+			ownerPeer = peersByID[wl.Owner]
+		}
+		workloadInfos = append(workloadInfos, workloadData{
+			wl:        wl,
+			ownerInfo: ownerInfo,
+			ownerPeer: ownerPeer,
+			isLocal:   isLocal,
 		})
 	}
 	a.stateMu.RUnlock()
+
+	// Helper to get local workload status
+	getLocalStatus := func(name string) string {
+		out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+name).Output()
+		if err != nil {
+			return "unknown"
+		}
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return "running"
+		}
+		return "stopped"
+	}
+
+	// Fetch remote workload statuses in parallel with 2 second timeout
+	statusClient := &http.Client{Timeout: 2 * time.Second}
+	statuses := make(map[string]string)
+	var statusMu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, info := range workloadInfos {
+		if info.isLocal {
+			statuses[info.wl.Name] = getLocalStatus(info.wl.Name)
+		} else if info.ownerPeer != nil && info.ownerPeer.Healthy {
+			wg.Add(1)
+			go func(wl *Workload, peer *Peer) {
+				defer wg.Done()
+				status := "remote" // Default fallback
+
+				url := a.getPeerAPIURL(peer, "/api/workloads/"+wl.Name)
+				if url != "" {
+					req, err := a.peerRequest("GET", url, nil)
+					if err == nil {
+						resp, err := statusClient.Do(req)
+						if err == nil {
+							defer resp.Body.Close()
+							if resp.StatusCode == 200 {
+								var data map[string]interface{}
+								if json.NewDecoder(resp.Body).Decode(&data) == nil {
+									// Check containers array for running status
+									if containers, ok := data["containers"].([]interface{}); ok && len(containers) > 0 {
+										hasRunning := false
+										for _, c := range containers {
+											if cm, ok := c.(map[string]interface{}); ok {
+												if running, ok := cm["running"].(bool); ok && running {
+													hasRunning = true
+													break
+												}
+											}
+										}
+										if hasRunning {
+											status = "running"
+										} else {
+											status = "stopped"
+										}
+									} else {
+										status = "stopped"
+									}
+								}
+							}
+						}
+					}
+				}
+
+				statusMu.Lock()
+				statuses[wl.Name] = status
+				statusMu.Unlock()
+			}(info.wl, info.ownerPeer)
+		} else {
+			statuses[info.wl.Name] = "remote"
+		}
+	}
+	wg.Wait()
+
+	// Build final workloads list
+	workloads := make([]WorkloadResponse, 0, len(workloadInfos))
+	for _, info := range workloadInfos {
+		workloads = append(workloads, WorkloadResponse{
+			Name:         info.wl.Name,
+			IP:           info.wl.IP,
+			Compose:      info.wl.Compose,
+			Revive:       info.wl.Revive,
+			Autostart:    info.wl.Autostart,
+			AllowedNodes: info.wl.AllowedNodes,
+			Owner:        info.ownerInfo,
+			Version:      info.wl.Version,
+			Status:       statuses[info.wl.Name],
+		})
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(workloads)
