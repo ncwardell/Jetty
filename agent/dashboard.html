@@ -942,6 +942,61 @@
                 width: 100%;
             }
         }
+
+        /* Auto-refresh controls */
+        .refresh-controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 6px 12px;
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+            font-size: 13px;
+        }
+
+        .refresh-status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text-secondary);
+        }
+
+        .refresh-status .refresh-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--text-muted);
+            transition: background 0.3s;
+        }
+
+        .refresh-status .refresh-dot.active {
+            background: var(--accent-green);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .refresh-select {
+            padding: 4px 8px;
+            border-radius: 4px;
+            border: 1px solid var(--border-color);
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        .refresh-select:hover {
+            border-color: var(--accent-blue);
+        }
+
+        .last-updated {
+            color: var(--text-muted);
+            font-size: 12px;
+        }
     </style>
 </head>
 <body>
@@ -959,6 +1014,19 @@
             <div class="connection-status">
                 <span class="status-dot" id="connectionDot"></span>
                 <span id="connectionText">Disconnected</span>
+            </div>
+            <div class="refresh-controls" id="refreshControls" style="display: none;">
+                <div class="refresh-status">
+                    <span class="refresh-dot" id="refreshDot"></span>
+                    <span id="lastUpdated">--</span>
+                </div>
+                <select class="refresh-select" id="refreshInterval" onchange="setRefreshInterval(this.value)">
+                    <option value="0">Auto-refresh: Off</option>
+                    <option value="5000">Every 5s</option>
+                    <option value="10000" selected>Every 10s</option>
+                    <option value="30000">Every 30s</option>
+                    <option value="60000">Every 60s</option>
+                </select>
             </div>
         </div>
         <div class="header-right">
@@ -1399,6 +1467,87 @@
 
         let draggedWorkload = null;
 
+        // Auto-refresh state
+        let refreshState = {
+            intervalId: null,
+            intervalMs: 10000, // Default 10 seconds
+            lastRefresh: null,
+            isRefreshing: false
+        };
+
+        // Update last-refreshed time display
+        function updateLastRefreshedDisplay() {
+            const lastUpdatedEl = document.getElementById('lastUpdated');
+            const refreshDot = document.getElementById('refreshDot');
+
+            if (!refreshState.lastRefresh) {
+                lastUpdatedEl.textContent = '--';
+                return;
+            }
+
+            const seconds = Math.floor((Date.now() - refreshState.lastRefresh) / 1000);
+            if (seconds < 5) {
+                lastUpdatedEl.textContent = 'Just now';
+            } else if (seconds < 60) {
+                lastUpdatedEl.textContent = `${seconds}s ago`;
+            } else {
+                const minutes = Math.floor(seconds / 60);
+                lastUpdatedEl.textContent = `${minutes}m ago`;
+            }
+
+            // Show active dot if auto-refresh is enabled
+            if (refreshState.intervalMs > 0) {
+                refreshDot.classList.add('active');
+            } else {
+                refreshDot.classList.remove('active');
+            }
+        }
+
+        // Set refresh interval
+        function setRefreshInterval(ms) {
+            refreshState.intervalMs = parseInt(ms);
+
+            // Clear existing interval
+            if (refreshState.intervalId) {
+                clearInterval(refreshState.intervalId);
+                refreshState.intervalId = null;
+            }
+
+            // Set new interval if not disabled
+            if (refreshState.intervalMs > 0 && state.connected) {
+                refreshState.intervalId = setInterval(performAutoRefresh, refreshState.intervalMs);
+            }
+
+            updateLastRefreshedDisplay();
+        }
+
+        // Perform auto-refresh of all data
+        async function performAutoRefresh() {
+            if (!state.connected || refreshState.isRefreshing) return;
+
+            refreshState.isRefreshing = true;
+            const refreshDot = document.getElementById('refreshDot');
+            refreshDot.style.background = 'var(--accent-blue)';
+
+            try {
+                await Promise.all([
+                    refreshStatus(),
+                    refreshClusterHealth()
+                ]);
+                refreshState.lastRefresh = Date.now();
+            } catch (error) {
+                console.error('Auto-refresh failed:', error);
+                state.connected = false;
+                updateConnectionStatus();
+            } finally {
+                refreshState.isRefreshing = false;
+                updateLastRefreshedDisplay();
+            }
+        }
+
+        // Start auto-refresh timer display update
+        setInterval(updateLastRefreshedDisplay, 1000);
+
         // Helper function to get CSS class for workload status
         function getStatusClass(status) {
             switch (status) {
@@ -1507,12 +1656,15 @@
             try {
                 await refreshStatus();
                 state.connected = true;
+                // Fetch cluster health data for resource display
+                await refreshClusterHealth();
+                // Set initial refresh timestamp
+                refreshState.lastRefresh = Date.now();
+                updateLastRefreshedDisplay();
                 updateConnectionStatus();
                 saveConnection();
                 closeConnectModal();
                 showToast('Connected to Jetty cluster', 'success');
-                // Fetch cluster health data for resource display
-                refreshClusterHealth();
             } catch (error) {
                 state.connected = false;
                 updateConnectionStatus();
@@ -1524,16 +1676,30 @@
             const dot = document.getElementById('connectionDot');
             const text = document.getElementById('connectionText');
             const tunnelStatus = document.getElementById('tunnelStatus');
+            const refreshControls = document.getElementById('refreshControls');
 
             if (state.connected) {
                 dot.classList.add('connected');
                 text.textContent = state.node ? state.node.name : 'Connected';
                 tunnelStatus.style.display = 'flex';
+                refreshControls.style.display = 'flex';
                 updateTunnelStatus();
+
+                // Start auto-refresh if not already running
+                if (!refreshState.intervalId && refreshState.intervalMs > 0) {
+                    refreshState.intervalId = setInterval(performAutoRefresh, refreshState.intervalMs);
+                }
             } else {
                 dot.classList.remove('connected');
                 text.textContent = 'Disconnected';
                 tunnelStatus.style.display = 'none';
+                refreshControls.style.display = 'none';
+
+                // Stop auto-refresh
+                if (refreshState.intervalId) {
+                    clearInterval(refreshState.intervalId);
+                    refreshState.intervalId = null;
+                }
             }
         }
 
@@ -2598,16 +2764,6 @@
                 toast.remove();
             }, 5000);
         }
-
-        // Auto-refresh every 30 seconds if connected
-        setInterval(() => {
-            if (state.connected) {
-                refreshStatus().catch(() => {
-                    state.connected = false;
-                    updateConnectionStatus();
-                });
-            }
-        }, 30000);
     </script>
 </body>
 </html>
