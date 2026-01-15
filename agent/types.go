@@ -120,10 +120,24 @@ func NewState() *State {
 // TCP Proxy Types (for userspace tunneling)
 // =============================================================================
 
+// tunnelConn wraps a WebSocket connection with a write mutex to prevent
+// concurrent writes which would cause a panic in gorilla/websocket.
+type tunnelConn struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+}
+
+// WriteMessage sends a message through the WebSocket with proper synchronization.
+func (tc *tunnelConn) WriteMessage(messageType int, data []byte) error {
+	tc.writeMu.Lock()
+	defer tc.writeMu.Unlock()
+	return tc.conn.WriteMessage(messageType, data)
+}
+
 // tcpProxyConn represents an active TCP proxy connection through the tunnel.
 type tcpProxyConn struct {
-	conn      net.Conn        // TCP connection to the workload
-	wsConn    *websocket.Conn // WebSocket connection back to the tunnel peer
+	conn      net.Conn    // TCP connection to the workload
+	wsConn    *tunnelConn // WebSocket connection back to the tunnel peer (with write mutex)
 	srcIP     net.IP          // Original source IP
 	srcPort   uint16          // Original source port
 	dstIP     net.IP          // Destination IP (workload)

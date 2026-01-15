@@ -885,6 +885,9 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 	defer conn.Close()
 
+	// Wrap the websocket connection with a write mutex to prevent concurrent write panics
+	tc := &tunnelConn{conn: conn}
+
 	for {
 		msgType, packet, err := conn.ReadMessage()
 		if err != nil {
@@ -937,14 +940,14 @@ func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 		// Handle by protocol
 		switch protocol {
 		case 1: // ICMP - proxy at application level
-			go a.proxyICMP(conn, packet, srcIP, dstIP, ihl)
+			go a.proxyICMP(tc, packet, srcIP, dstIP, ihl)
 		case 6: // TCP - proxy connections
 			// Copy packet data since goroutine may outlive this iteration
 			tcpPacket := make([]byte, len(packet))
 			copy(tcpPacket, packet)
-			go a.proxyTCP(conn, tcpPacket, srcIP, dstIP, ihl)
+			go a.proxyTCP(tc, tcpPacket, srcIP, dstIP, ihl)
 		case 17: // UDP - proxy datagrams
-			go a.proxyUDP(conn, packet, srcIP, dstIP, ihl)
+			go a.proxyUDP(tc, packet, srcIP, dstIP, ihl)
 		default:
 			log.Printf("WS tunnel proxy: unsupported protocol %d", protocol)
 		}
@@ -952,7 +955,7 @@ func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 }
 
 // proxyICMP proxies an ICMP packet by sending our own request and repackaging the response.
-func (a *Agent) proxyICMP(conn *websocket.Conn, origPacket []byte, origSrc, dstIP net.IP, ihl int) {
+func (a *Agent) proxyICMP(tc *tunnelConn, origPacket []byte, origSrc, dstIP net.IP, ihl int) {
 	icmpData := origPacket[ihl:]
 	if len(icmpData) < 8 {
 		return
@@ -1025,14 +1028,14 @@ func (a *Agent) proxyICMP(conn *websocket.Conn, origPacket []byte, origSrc, dstI
 	// Build response packet with original src/dst swapped
 	respPacket := buildIPPacket(dstIP, origSrc, 1, replyICMP)
 
-	// Send response back through WebSocket
-	if err := conn.WriteMessage(websocket.BinaryMessage, respPacket); err != nil {
+	// Send response back through WebSocket (synchronized)
+	if err := tc.WriteMessage(websocket.BinaryMessage, respPacket); err != nil {
 		log.Printf("WS tunnel proxy: failed to send response: %v", err)
 	}
 }
 
 // proxyTCP handles TCP packets by establishing real connections and proxying data.
-func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net.IP, ihl int) {
+func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl int) {
 	if len(packet) < ihl+20 {
 		return // TCP header is at least 20 bytes
 	}
@@ -1077,14 +1080,14 @@ func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 		if err != nil {
 			log.Printf("WS tunnel proxy: TCP connect to %s failed: %v", targetAddr, err)
 			// Send RST back
-			a.sendTCPResponse(wsConn, dstIP, srcIP, dstPort, srcPort, 0, seqNum+1, 0x14, nil) // RST+ACK
+			a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, 0, seqNum+1, 0x14, nil) // RST+ACK
 			return
 		}
 
 		// Create proxy connection
 		proxyConn := &tcpProxyConn{
 			conn:      tcpConn,
-			wsConn:    wsConn,
+			wsConn:    tc,
 			srcIP:     srcIP,
 			srcPort:   srcPort,
 			dstIP:     dstIP,
@@ -1095,7 +1098,7 @@ func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 		a.tunTCPConns.Store(flowKey, proxyConn)
 
 		// Send SYN-ACK
-		a.sendTCPResponse(wsConn, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x12, nil) // SYN+ACK
+		a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x12, nil) // SYN+ACK
 		proxyConn.localSeq++
 
 		// Start goroutine to read from TCP and send back via WebSocket
@@ -1108,7 +1111,7 @@ func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 	if !ok {
 		// Unknown connection, send RST
 		if !isRST {
-			a.sendTCPResponse(wsConn, dstIP, srcIP, dstPort, srcPort, 0, seqNum+1, 0x14, nil) // RST+ACK
+			a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, 0, seqNum+1, 0x14, nil) // RST+ACK
 		}
 		return
 	}
@@ -1122,7 +1125,7 @@ func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 		proxyConn.mu.Unlock()
 
 		// Send FIN-ACK and close
-		a.sendTCPResponse(wsConn, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x11, nil) // FIN+ACK
+		a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x11, nil) // FIN+ACK
 		proxyConn.conn.Close()
 		a.tunTCPConns.Delete(flowKey)
 		return
@@ -1152,7 +1155,7 @@ func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 			}
 
 			// Send ACK
-			a.sendTCPResponse(wsConn, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x10, nil) // ACK
+			a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x10, nil) // ACK
 		}
 	}
 }
@@ -1191,7 +1194,7 @@ func (a *Agent) tcpProxyReadLoop(flowKey string, proxyConn *tcpProxyConn) {
 }
 
 // sendTCPResponse constructs and sends a TCP packet back through WebSocket.
-func (a *Agent) sendTCPResponse(wsConn *websocket.Conn, srcIP, dstIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags byte, payload []byte) {
+func (a *Agent) sendTCPResponse(tc *tunnelConn, srcIP, dstIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags byte, payload []byte) {
 	// Build TCP header (20 bytes minimum)
 	tcpLen := 20 + len(payload)
 	tcp := make([]byte, tcpLen)
@@ -1234,8 +1237,8 @@ func (a *Agent) sendTCPResponse(wsConn *websocket.Conn, srcIP, dstIP net.IP, src
 	// Build full IP packet
 	packet := buildIPPacket(srcIP, dstIP, 6, tcp)
 
-	// Send via WebSocket
-	if err := wsConn.WriteMessage(websocket.BinaryMessage, packet); err != nil {
+	// Send via WebSocket (synchronized)
+	if err := tc.WriteMessage(websocket.BinaryMessage, packet); err != nil {
 		log.Printf("WS tunnel proxy: failed to send TCP response: %v", err)
 	}
 }
@@ -1269,7 +1272,7 @@ func tcpChecksum(srcIP, dstIP net.IP, tcpSegment []byte) (byte, byte) {
 }
 
 // proxyUDP handles UDP packets by proxying them directly.
-func (a *Agent) proxyUDP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net.IP, ihl int) {
+func (a *Agent) proxyUDP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl int) {
 	if len(packet) < ihl+8 {
 		return
 	}
@@ -1323,9 +1326,9 @@ func (a *Agent) proxyUDP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 	respUDP[7] = 0
 	copy(respUDP[8:], respBuf[:n])
 
-	// Build IP packet and send back
+	// Build IP packet and send back (synchronized)
 	respPacket := buildIPPacket(dstIP, srcIP, 17, respUDP)
-	if err := wsConn.WriteMessage(websocket.BinaryMessage, respPacket); err != nil {
+	if err := tc.WriteMessage(websocket.BinaryMessage, respPacket); err != nil {
 		log.Printf("WS tunnel proxy: failed to send UDP response: %v", err)
 	}
 }
@@ -2143,33 +2146,20 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 
 	// Build peer info maps for enrichment
 	peerIDToInfo := make(map[string]map[string]string)
+	peersByID := make(map[string]*Peer)
 	for _, p := range a.state.Peers {
 		peerIDToInfo[p.ID] = map[string]string{
 			"id":   p.ID,
 			"name": p.Name,
 			"ip":   p.IP,
 		}
+		peersByID[p.ID] = p
 	}
 	// Add local node to owner info map
 	peerIDToInfo[a.hwid] = map[string]string{
 		"id":   a.hwid,
 		"name": a.hostname,
 		"ip":   a.ip,
-	}
-
-	// Helper to get workload status
-	getStatus := func(wl *Workload) string {
-		if wl.Owner != a.hwid {
-			return "remote" // Can't check status of remote workloads
-		}
-		out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
-		if err != nil {
-			return "unknown"
-		}
-		if len(strings.TrimSpace(string(out))) > 0 {
-			return "running"
-		}
-		return "stopped"
 	}
 
 	// Build enriched workloads with owner info and status
@@ -2185,27 +2175,122 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 		Status       string            `json:"status"`
 	}
 
-	workloads := make([]EnrichedWorkload, 0, len(a.state.Workloads))
+	// Collect workload data - we'll fetch remote statuses after releasing the lock
+	type workloadData struct {
+		wl        *Workload
+		ownerInfo map[string]string
+		ownerPeer *Peer
+		isLocal   bool
+	}
+	workloadInfos := make([]workloadData, 0, len(a.state.Workloads))
 	for _, wl := range a.state.Workloads {
 		ownerInfo := peerIDToInfo[wl.Owner]
 		if ownerInfo == nil {
 			ownerInfo = map[string]string{"id": wl.Owner, "name": "unknown", "ip": "unknown"}
 		}
-		workloads = append(workloads, EnrichedWorkload{
-			Name:         wl.Name,
-			IP:           wl.IP,
-			Compose:      wl.Compose,
-			Revive:       wl.Revive,
-			Autostart:    wl.Autostart,
-			AllowedNodes: wl.AllowedNodes,
-			Owner:        ownerInfo,
-			Version:      wl.Version,
-			Status:       getStatus(wl),
+		isLocal := wl.Owner == a.hwid
+		var ownerPeer *Peer
+		if !isLocal {
+			ownerPeer = peersByID[wl.Owner]
+		}
+		workloadInfos = append(workloadInfos, workloadData{
+			wl:        wl,
+			ownerInfo: ownerInfo,
+			ownerPeer: ownerPeer,
+			isLocal:   isLocal,
 		})
 	}
 
 	hasTunnel := a.state.CFToken != ""
 	a.stateMu.RUnlock()
+
+	// Helper to get local workload status
+	getLocalStatus := func(name string) string {
+		out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+name).Output()
+		if err != nil {
+			return "unknown"
+		}
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return "running"
+		}
+		return "stopped"
+	}
+
+	// Fetch remote workload statuses in parallel with 2 second timeout
+	statusClient := &http.Client{Timeout: 2 * time.Second}
+	statuses := make(map[string]string)
+	var statusMu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, info := range workloadInfos {
+		if info.isLocal {
+			statuses[info.wl.Name] = getLocalStatus(info.wl.Name)
+		} else if info.ownerPeer != nil && info.ownerPeer.Healthy {
+			wg.Add(1)
+			go func(wl *Workload, peer *Peer) {
+				defer wg.Done()
+				status := "remote" // Default fallback
+
+				url := a.getPeerAPIURL(peer, "/api/workloads/"+wl.Name)
+				if url != "" {
+					req, err := a.peerRequest("GET", url, nil)
+					if err == nil {
+						resp, err := statusClient.Do(req)
+						if err == nil {
+							defer resp.Body.Close()
+							if resp.StatusCode == 200 {
+								var data map[string]interface{}
+								if json.NewDecoder(resp.Body).Decode(&data) == nil {
+									// Check containers array for running status
+									if containers, ok := data["containers"].([]interface{}); ok && len(containers) > 0 {
+										hasRunning := false
+										for _, c := range containers {
+											if cm, ok := c.(map[string]interface{}); ok {
+												if running, ok := cm["running"].(bool); ok && running {
+													hasRunning = true
+													break
+												}
+											}
+										}
+										if hasRunning {
+											status = "running"
+										} else {
+											status = "stopped"
+										}
+									} else {
+										status = "stopped"
+									}
+								}
+							}
+						}
+					}
+				}
+
+				statusMu.Lock()
+				statuses[wl.Name] = status
+				statusMu.Unlock()
+			}(info.wl, info.ownerPeer)
+		} else {
+			statuses[info.wl.Name] = "remote"
+		}
+	}
+	wg.Wait()
+
+	// Build final workloads list
+	workloads := make([]EnrichedWorkload, 0, len(workloadInfos))
+	for _, info := range workloadInfos {
+		workloads = append(workloads, EnrichedWorkload{
+			Name:         info.wl.Name,
+			IP:           info.wl.IP,
+			Compose:      info.wl.Compose,
+			Revive:       info.wl.Revive,
+			Autostart:    info.wl.Autostart,
+			AllowedNodes: info.wl.AllowedNodes,
+			Owner:        info.ownerInfo,
+			Version:      info.wl.Version,
+			Status:       statuses[info.wl.Name],
+		})
+	}
 
 	resp := map[string]interface{}{
 		"node": map[string]interface{}{
@@ -2246,6 +2331,7 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 	// Build peer info maps for enrichment and filtering
 	peerNameToID := make(map[string]string)
 	peerIDToInfo := make(map[string]map[string]string)
+	peersByID := make(map[string]*Peer)
 	for _, p := range a.state.Peers {
 		peerNameToID[p.Name] = p.ID
 		peerIDToInfo[p.ID] = map[string]string{
@@ -2253,6 +2339,7 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 			"name": p.Name,
 			"ip":   p.IP,
 		}
+		peersByID[p.ID] = p
 	}
 
 	// Add local node to owner info map
@@ -2274,22 +2361,14 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 		Status       string            `json:"status"`
 	}
 
-	// Helper to get workload status
-	getStatus := func(wl *Workload) string {
-		if wl.Owner != a.hwid {
-			return "remote" // Can't check status of remote workloads
-		}
-		out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
-		if err != nil {
-			return "unknown"
-		}
-		if len(strings.TrimSpace(string(out))) > 0 {
-			return "running"
-		}
-		return "stopped"
+	// Collect workload data - we'll fetch remote statuses after releasing the lock
+	type workloadData struct {
+		wl        *Workload
+		ownerInfo map[string]string
+		ownerPeer *Peer
+		isLocal   bool
 	}
-
-	var workloads []WorkloadResponse
+	var workloadInfos []workloadData
 
 	for _, wl := range a.state.Workloads {
 		// Apply node filter if specified
@@ -2325,19 +2404,107 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 			ownerInfo = map[string]string{"id": wl.Owner, "name": "unknown", "ip": "unknown"}
 		}
 
-		workloads = append(workloads, WorkloadResponse{
-			Name:         wl.Name,
-			IP:           wl.IP,
-			Compose:      wl.Compose,
-			Revive:       wl.Revive,
-			Autostart:    wl.Autostart,
-			AllowedNodes: wl.AllowedNodes,
-			Owner:        ownerInfo,
-			Version:      wl.Version,
-			Status:       getStatus(wl),
+		isLocal := wl.Owner == a.hwid
+		var ownerPeer *Peer
+		if !isLocal {
+			ownerPeer = peersByID[wl.Owner]
+		}
+		workloadInfos = append(workloadInfos, workloadData{
+			wl:        wl,
+			ownerInfo: ownerInfo,
+			ownerPeer: ownerPeer,
+			isLocal:   isLocal,
 		})
 	}
 	a.stateMu.RUnlock()
+
+	// Helper to get local workload status
+	getLocalStatus := func(name string) string {
+		out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+name).Output()
+		if err != nil {
+			return "unknown"
+		}
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return "running"
+		}
+		return "stopped"
+	}
+
+	// Fetch remote workload statuses in parallel with 2 second timeout
+	statusClient := &http.Client{Timeout: 2 * time.Second}
+	statuses := make(map[string]string)
+	var statusMu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, info := range workloadInfos {
+		if info.isLocal {
+			statuses[info.wl.Name] = getLocalStatus(info.wl.Name)
+		} else if info.ownerPeer != nil && info.ownerPeer.Healthy {
+			wg.Add(1)
+			go func(wl *Workload, peer *Peer) {
+				defer wg.Done()
+				status := "remote" // Default fallback
+
+				url := a.getPeerAPIURL(peer, "/api/workloads/"+wl.Name)
+				if url != "" {
+					req, err := a.peerRequest("GET", url, nil)
+					if err == nil {
+						resp, err := statusClient.Do(req)
+						if err == nil {
+							defer resp.Body.Close()
+							if resp.StatusCode == 200 {
+								var data map[string]interface{}
+								if json.NewDecoder(resp.Body).Decode(&data) == nil {
+									// Check containers array for running status
+									if containers, ok := data["containers"].([]interface{}); ok && len(containers) > 0 {
+										hasRunning := false
+										for _, c := range containers {
+											if cm, ok := c.(map[string]interface{}); ok {
+												if running, ok := cm["running"].(bool); ok && running {
+													hasRunning = true
+													break
+												}
+											}
+										}
+										if hasRunning {
+											status = "running"
+										} else {
+											status = "stopped"
+										}
+									} else {
+										status = "stopped"
+									}
+								}
+							}
+						}
+					}
+				}
+
+				statusMu.Lock()
+				statuses[wl.Name] = status
+				statusMu.Unlock()
+			}(info.wl, info.ownerPeer)
+		} else {
+			statuses[info.wl.Name] = "remote"
+		}
+	}
+	wg.Wait()
+
+	// Build final workloads list
+	workloads := make([]WorkloadResponse, 0, len(workloadInfos))
+	for _, info := range workloadInfos {
+		workloads = append(workloads, WorkloadResponse{
+			Name:         info.wl.Name,
+			IP:           info.wl.IP,
+			Compose:      info.wl.Compose,
+			Revive:       info.wl.Revive,
+			Autostart:    info.wl.Autostart,
+			AllowedNodes: info.wl.AllowedNodes,
+			Owner:        info.ownerInfo,
+			Version:      info.wl.Version,
+			Status:       statuses[info.wl.Name],
+		})
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(workloads)
