@@ -754,6 +754,7 @@ func (a *Agent) tunReadLoop() {
 			continue // Not IPv4
 		}
 		dstIP := net.IP(packet[16:20])
+		srcIP := net.IP(packet[12:16])
 
 		// Find peer that owns this workload IP
 		a.workloadRoutesMu.Lock()
@@ -761,12 +762,14 @@ func (a *Agent) tunReadLoop() {
 		a.workloadRoutesMu.Unlock()
 
 		if !ok {
+			log.Printf("IPIP send: no route for %s (src=%s)", dstIP, srcIP)
 			continue // No route for this destination
 		}
 
 		// Get peer's WARP IP for IPIP encapsulation
 		peerIPVal, ok := a.tunPeerIPs.Load(ownerID)
 		if !ok {
+			log.Printf("IPIP send: no peer IP for owner %s (dst=%s)", ownerID[:8], dstIP)
 			continue // Peer IP not known
 		}
 		peerIP := net.ParseIP(peerIPVal.(string))
@@ -774,10 +777,12 @@ func (a *Agent) tunReadLoop() {
 			continue
 		}
 
+		log.Printf("IPIP send: %s -> %s via %s (%d bytes)", srcIP, dstIP, peerIP, n)
+
 		// Send inner packet - kernel wraps with outer IP header (dst=peerIP, proto=4)
 		_, err = a.tunIPConn.WriteToIP(packet, &net.IPAddr{IP: peerIP})
 		if err != nil {
-			log.Printf("Failed to send IPIP packet to %s: %v", peerIP, err)
+			log.Printf("IPIP send: failed to send to %s: %v", peerIP, err)
 		}
 	}
 }
@@ -787,7 +792,7 @@ func (a *Agent) tunReadLoop() {
 func (a *Agent) tunRecvLoop() {
 	buf := make([]byte, 65535)
 	for {
-		n, _, err := a.tunIPConn.ReadFromIP(buf)
+		n, srcAddr, err := a.tunIPConn.ReadFromIP(buf)
 		if err != nil {
 			select {
 			case <-a.stopCh:
@@ -810,6 +815,9 @@ func (a *Agent) tunRecvLoop() {
 			continue // Not enough data for inner packet
 		}
 
+		// Extract outer src IP for logging
+		outerSrcIP := net.IP(buf[12:16])
+
 		// Extract inner packet (skip outer header)
 		innerPacket := buf[outerIHL:n]
 		if innerPacket[0]>>4 != 4 {
@@ -818,6 +826,9 @@ func (a *Agent) tunRecvLoop() {
 
 		// Get destination IP from inner packet
 		dstIP := net.IP(innerPacket[16:20])
+		srcIP := net.IP(innerPacket[12:16])
+
+		log.Printf("IPIP recv: outer src=%s, inner src=%s -> dst=%s (%d bytes)", outerSrcIP, srcIP, dstIP, n)
 
 		// Check if this is for a local workload
 		a.stateMu.RLock()
@@ -831,9 +842,14 @@ func (a *Agent) tunRecvLoop() {
 		a.stateMu.RUnlock()
 
 		if localWorkload != nil {
+			log.Printf("IPIP recv: injecting packet for local workload %s (%s)", localWorkload.Name, dstIP)
 			// Write inner packet to local network stack
 			// The iptables DNAT rules will forward to the container
-			a.tunDevice.Write(innerPacket)
+			if _, err := a.tunDevice.Write(innerPacket); err != nil {
+				log.Printf("IPIP recv: failed to write to TUN: %v", err)
+			}
+		} else {
+			log.Printf("IPIP recv: no local workload for %s (from %s)", dstIP, srcAddr)
 		}
 	}
 }
