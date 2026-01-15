@@ -2904,7 +2904,10 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	// Step 4: Build docker run command for new container
 	args := []string{"run", "-d", "--name", containerName + "-update"}
 
-	// Add mounts
+	// Copy all volumes from old container (preserves anonymous volumes like /var/lib/cloudflare-warp)
+	args = append(args, "--volumes-from", containerName)
+
+	// Add explicit bind mounts (these override --volumes-from if paths conflict)
 	for _, bind := range container.HostConfig.Binds {
 		args = append(args, "-v", bind)
 	}
