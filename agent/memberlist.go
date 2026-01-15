@@ -481,12 +481,20 @@ func (a *Agent) broadcastWorkloadUpdate(wl *Workload) {
 		return
 	}
 
-	payload, _ := json.Marshal(wl)
+	payload, err := json.Marshal(wl)
+	if err != nil {
+		log.Printf("Warning: failed to marshal workload for broadcast: %v", err)
+		return
+	}
 	msg := BroadcastMessage{
 		Type:    "workload_update",
 		Payload: payload,
 	}
-	data, _ := json.Marshal(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("Warning: failed to marshal broadcast message: %v", err)
+		return
+	}
 
 	a.mlDelegate.broadcasts.QueueBroadcast(&simpleBroadcast{msg: data})
 }
@@ -497,12 +505,20 @@ func (a *Agent) broadcastWorkloadDelete(dw *DeletedWorkload) {
 		return
 	}
 
-	payload, _ := json.Marshal(dw)
+	payload, err := json.Marshal(dw)
+	if err != nil {
+		log.Printf("Warning: failed to marshal deleted workload for broadcast: %v", err)
+		return
+	}
 	msg := BroadcastMessage{
 		Type:    "workload_delete",
 		Payload: payload,
 	}
-	data, _ := json.Marshal(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("Warning: failed to marshal broadcast message: %v", err)
+		return
+	}
 
 	a.mlDelegate.broadcasts.QueueBroadcast(&simpleBroadcast{msg: data})
 }
@@ -513,12 +529,20 @@ func (a *Agent) broadcastEnvUpdate(key, value string) {
 		return
 	}
 
-	payload, _ := json.Marshal(map[string]string{"key": key, "value": value})
+	payload, err := json.Marshal(map[string]string{"key": key, "value": value})
+	if err != nil {
+		log.Printf("Warning: failed to marshal env update for broadcast: %v", err)
+		return
+	}
 	msg := BroadcastMessage{
 		Type:    "env_update",
 		Payload: payload,
 	}
-	data, _ := json.Marshal(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("Warning: failed to marshal broadcast message: %v", err)
+		return
+	}
 
 	a.mlDelegate.broadcasts.QueueBroadcast(&simpleBroadcast{msg: data})
 }
@@ -529,12 +553,20 @@ func (a *Agent) broadcastEnvDelete(dek *DeletedEnvKey) {
 		return
 	}
 
-	payload, _ := json.Marshal(dek)
+	payload, err := json.Marshal(dek)
+	if err != nil {
+		log.Printf("Warning: failed to marshal deleted env key for broadcast: %v", err)
+		return
+	}
 	msg := BroadcastMessage{
 		Type:    "env_delete",
 		Payload: payload,
 	}
-	data, _ := json.Marshal(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("Warning: failed to marshal broadcast message: %v", err)
+		return
+	}
 
 	a.mlDelegate.broadcasts.QueueBroadcast(&simpleBroadcast{msg: data})
 }
