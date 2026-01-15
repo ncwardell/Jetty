@@ -53,8 +53,9 @@ func New() (*Agent, error) {
 		cfTunnelID:      getEnv("JETTY_CF_TUNNEL_ID", ""),  // WARP connector tunnel ID for route management
 		composeDir:      filepath.Join(dataDir, "compose"),
 		hostsFile:       "/etc/hosts",
-		workloadRoutes:  make(map[string]string),
-		ipipWarnedPeers: make(map[string]bool),
+		workloadRoutes:     make(map[string]string),
+		ipipWarnedPeers:    make(map[string]bool),
+		failoverInProgress: make(map[string]time.Time),
 		state: &State{
 			Peers:            make(map[string]*Peer),
 			Workloads:        make(map[string]*Workload),
@@ -84,7 +85,9 @@ func (a *Agent) cleanupOrphanedState() {
 		for _, name := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 			if name != "" && strings.HasSuffix(name, "-old") {
 				log.Printf("Removing old container from previous update: %s", name)
-				exec.Command("docker", "rm", "-f", name).Run()
+				if err := exec.Command("docker", "rm", "-f", name).Run(); err != nil {
+					log.Printf("Warning: failed to remove old container %s: %v", name, err)
+				}
 			}
 		}
 	}
@@ -92,7 +95,9 @@ func (a *Agent) cleanupOrphanedState() {
 	// Check if there's orphaned jetty0 interface from previous run
 	if err := exec.Command("ip", "link", "show", "jetty0").Run(); err == nil {
 		log.Printf("Found orphaned jetty0 interface from previous run, cleaning up...")
-		exec.Command("ip", "link", "del", "jetty0").Run()
+		if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
+			log.Printf("Warning: failed to delete orphaned jetty0 interface: %v", err)
+		}
 	}
 
 	// Clean up any orphaned IPIP tunnels (named tun_*)
@@ -102,8 +107,11 @@ func (a *Agent) cleanupOrphanedState() {
 			parts := strings.Fields(line)
 			if len(parts) > 0 {
 				tunName := strings.TrimSuffix(parts[0], ":")
-				exec.Command("ip", "tunnel", "del", tunName).Run()
-				log.Printf("Cleaned up orphaned tunnel: %s", tunName)
+				if err := exec.Command("ip", "tunnel", "del", tunName).Run(); err != nil {
+					log.Printf("Warning: failed to delete orphaned tunnel %s: %v", tunName, err)
+				} else {
+					log.Printf("Cleaned up orphaned tunnel: %s", tunName)
+				}
 			}
 		}
 	}
@@ -115,15 +123,19 @@ func (a *Agent) cleanupOrphanedState() {
 		if strings.HasPrefix(line, "10.") && strings.Contains(line, "/32") {
 			parts := strings.Fields(line)
 			if len(parts) > 0 {
-				exec.Command("ip", "route", "del", parts[0]).Run()
-				log.Printf("Cleaned up orphaned route: %s", parts[0])
+				if err := exec.Command("ip", "route", "del", parts[0]).Run(); err != nil {
+					log.Printf("Warning: failed to delete orphaned route %s: %v", parts[0], err)
+				} else {
+					log.Printf("Cleaned up orphaned route: %s", parts[0])
+				}
 			}
 		}
 	}
 
 	// Clean up any orphaned nftables rules from previous runs
 	// Delete our jetty table if it exists (will be recreated in initWarpRules)
-	exec.Command("nft", "delete", "table", "ip", "jetty").Run()
+	// Ignore error as table may not exist
+	_ = exec.Command("nft", "delete", "table", "ip", "jetty").Run()
 
 	// Also clean up any old-style masquerade rules left in the main nat table
 	// These were added before we moved to using our own table
@@ -146,8 +158,11 @@ func (a *Agent) cleanupLegacyNftRules() {
 			if len(parts) == 2 {
 				handle := strings.TrimSpace(parts[1])
 				if handle != "" {
-					exec.Command("nft", "delete", "rule", "ip", "nat", "POSTROUTING", "handle", handle).Run()
-					log.Printf("Cleaned up legacy nft rule handle %s", handle)
+					if err := exec.Command("nft", "delete", "rule", "ip", "nat", "POSTROUTING", "handle", handle).Run(); err != nil {
+						log.Printf("Warning: failed to delete legacy nft rule handle %s: %v", handle, err)
+					} else {
+						log.Printf("Cleaned up legacy nft rule handle %s", handle)
+					}
 				}
 			}
 		}
@@ -2423,7 +2438,7 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wl.Owner = a.hwid
-	wl.Version = time.Now().Unix()
+	wl.Version = time.Now().UnixNano()
 	a.state.Workloads[wl.IP] = &wl
 	a.stateMu.Unlock()
 
@@ -2728,7 +2743,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update version
-	found.Version = time.Now().Unix()
+	found.Version = time.Now().UnixNano()
 
 	// Store with (potentially new) mesh IP
 	a.state.Workloads[newMeshIP] = found
@@ -2946,7 +2961,7 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 	// This ensures the deletion propagates to peers even if they have older copies
 	a.state.DeletedWorkloads[foundIP] = &DeletedWorkload{
 		IP:      foundIP,
-		Version: time.Now().Unix(),
+		Version: time.Now().UnixNano(),
 	}
 	a.stateMu.Unlock()
 
@@ -2981,7 +2996,10 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		To string `json:"to"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), 400)
+		return
+	}
 
 	// Find workload and current owner
 	a.stateMu.RLock()
@@ -3067,7 +3085,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Deploy locally
-		newVersion = time.Now().Unix()
+		newVersion = time.Now().UnixNano()
 		localWl := *found // Copy workload
 		localWl.Owner = a.hwid
 		localWl.Version = newVersion
@@ -3138,7 +3156,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 			if newVersion > 0 {
 				wl.Version = newVersion
 			} else {
-				wl.Version = time.Now().Unix()
+				wl.Version = time.Now().UnixNano()
 			}
 		}
 		a.stateMu.Unlock()
@@ -3363,7 +3381,10 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		Version string `json:"version"`
 		Arch    string `json:"arch"` // CPU architecture (amd64, arm64, etc.)
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), 400)
+		return
+	}
 
 	// Validate cluster secret
 	if a.clusterSecret == "" {
@@ -4642,7 +4663,7 @@ func (a *Agent) apiDeleteEnv(w http.ResponseWriter, r *http.Request) {
 		// Create tombstone to propagate deletion across cluster
 		a.state.DeletedEnvKeys[key] = &DeletedEnvKey{
 			Key:     key,
-			Version: time.Now().Unix(),
+			Version: time.Now().UnixNano(),
 		}
 	}
 	a.stateMu.Unlock()
@@ -5180,7 +5201,7 @@ func (a *Agent) gossipLoop() {
 // This prevents unbounded growth of the tombstone map while ensuring
 // deletions have enough time to propagate across all nodes.
 func (a *Agent) gcTombstones() {
-	cutoff := time.Now().Unix() - 3600 // 1 hour ago
+	cutoff := time.Now().UnixNano() - int64(time.Hour) // 1 hour ago
 
 	a.stateMu.Lock()
 	removedWorkloads := 0
@@ -5400,6 +5421,16 @@ func (a *Agent) failoverLoop() {
 }
 
 func (a *Agent) checkFailover() {
+	// Clean up stale failover entries (older than 5 minutes - deployment timeout)
+	a.failoverInProgressMu.Lock()
+	for ip, startTime := range a.failoverInProgress {
+		if time.Since(startTime) > 5*time.Minute {
+			log.Printf("Failover for workload IP %s timed out, allowing retry", ip)
+			delete(a.failoverInProgress, ip)
+		}
+	}
+	a.failoverInProgressMu.Unlock()
+
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
 
@@ -5413,6 +5444,14 @@ func (a *Agent) checkFailover() {
 		if wl.Owner == a.hwid {
 			continue // We own it
 		}
+
+		// Check if failover is already in progress for this workload
+		a.failoverInProgressMu.Lock()
+		if _, inProgress := a.failoverInProgress[wl.IP]; inProgress {
+			a.failoverInProgressMu.Unlock()
+			continue // Already being claimed
+		}
+		a.failoverInProgressMu.Unlock()
 
 		// Use memberlist for health check if available (faster, more accurate)
 		ownerHealthy := false
@@ -5436,13 +5475,26 @@ func (a *Agent) checkFailover() {
 		// Owner is dead - should we claim?
 		if a.shouldClaim(wl) {
 			log.Printf("Claiming orphaned workload: %s", wl.Name)
+
+			// Mark failover in progress before releasing state lock
+			a.failoverInProgressMu.Lock()
+			a.failoverInProgress[wl.IP] = time.Now()
+			a.failoverInProgressMu.Unlock()
+
 			oldOwner := wl.Owner
 			oldVersion := wl.Version
 			wl.Owner = a.hwid
-			wl.Version = time.Now().Unix()
+			wl.Version = time.Now().UnixNano() // Use nanoseconds for better precision
 
 			// Deploy it - capture workload state for rollback on failure
 			go func(w *Workload, prevOwner string, prevVersion int64) {
+				// Ensure we clean up the in-progress marker when done
+				defer func() {
+					a.failoverInProgressMu.Lock()
+					delete(a.failoverInProgress, w.IP)
+					a.failoverInProgressMu.Unlock()
+				}()
+
 				if err := a.deployWorkload(w); err != nil {
 					log.Printf("Failover deploy failed for %s: %v - reverting ownership", w.Name, err)
 					// Rollback ownership on failure so another node can try

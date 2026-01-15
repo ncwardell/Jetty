@@ -196,6 +196,10 @@ type Agent struct {
 	memberlist *memberlist.Memberlist
 	mlDelegate *jettyDelegate
 
+	// Failover tracking (prevents duplicate claims during deployment)
+	failoverInProgress   map[string]time.Time // workload IP -> claim start time
+	failoverInProgressMu sync.Mutex
+
 	stopCh chan struct{}
 }
 
