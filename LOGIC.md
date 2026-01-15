@@ -46,6 +46,21 @@ Cloudflare WARP provides the mesh networking backbone.
 - Tailscale: Similar to WARP but with additional vendor lock-in
 - Plain TCP: No encryption, requires open ports, NAT issues
 
+**Important WARP limitation: No ICMP support**
+
+WARP does not forward ICMP traffic (ping), only TCP/UDP. This has significant design implications:
+
+1. **Health checks must use HTTP, not ping** - The gossip loop uses `GET /api/health` instead of ICMP echo requests. This is why peer health checking hits the API endpoint rather than using a simple ping.
+
+2. **ICMP proxy in userspace tunnel** - When the userspace tunnel receives ICMP packets destined for a remote workload, it can't just forward them over WARP. Instead, it must:
+   - Receive the ICMP echo request via WebSocket
+   - Send its own ICMP request locally to the workload container
+   - Package the response and send it back via WebSocket
+
+   This is why `proxyICMP()` exists in agent.go - it's working around WARP's ICMP limitation.
+
+3. **Workload-to-workload ping works** - Because IPIP/GRE tunnels encapsulate the entire IP packet (including ICMP) inside a TCP/UDP packet that WARP *can* forward. The outer packet is TCP/UDP, the inner packet can be anything.
+
 ---
 
 ## State Synchronization
