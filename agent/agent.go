@@ -150,12 +150,11 @@ type Agent struct {
 	ipipWarnedPeersMu sync.Mutex
 
 	// Userspace tunnel (fallback when kernel IPIP/GRE not available)
-	tunDevice    *water.Interface // TUN device for capturing workload traffic
-	tunPeerConns sync.Map         // peerID -> *websocket.Conn (outgoing connections to peers)
-	tunPeerIPs   sync.Map         // peerID -> string (peer WARP IP for tunnel)
-	tunConnMu    sync.Mutex       // Protects WebSocket connection establishment
-	tunLocalIP   string           // Our WARP IP (used as source for tunnel NAT)
-	tunNATTable  sync.Map         // natKey -> original src IP (for DNAT on responses)
+	tunDevice       *water.Interface // TUN device for capturing workload traffic
+	tunPeerConns    sync.Map         // peerID -> *websocket.Conn (outgoing connections to peers)
+	tunPeerIPs      sync.Map         // peerID -> string (peer WARP IP for tunnel)
+	tunConnMu       sync.Mutex       // Protects WebSocket connection establishment
+	tunReturnRoutes sync.Map         // srcIP -> peerID (for routing responses back through tunnel)
 
 	stopCh chan struct{}
 }
@@ -731,16 +730,7 @@ func (a *Agent) detectTunnelMode() string {
 // Traffic to remote workloads (10.100.x.x) is captured via TUN, sent over WebSocket
 // to the peer's API (port 6880), and injected into their local network.
 // We use WebSocket over the existing API port - no additional ports needed.
-// Packets are SNATed to use our WARP IP, so responses can be routed back correctly.
 func (a *Agent) initUserspaceTunnel() error {
-	// Get our WARP IP for NAT
-	a.tunLocalIP = a.getWarpIP()
-	if a.tunLocalIP == "" {
-		log.Printf("Warning: WARP IP not available, tunnel NAT may not work correctly")
-	} else {
-		log.Printf("Tunnel will use WARP IP %s for NAT", a.tunLocalIP)
-	}
-
 	// Create TUN device
 	config := water.Config{
 		DeviceType: water.TUN,
@@ -767,7 +757,6 @@ func (a *Agent) initUserspaceTunnel() error {
 }
 
 // tunReadLoop reads packets from TUN device and sends them via WebSocket to the appropriate peer.
-// Outgoing packets are SNATed to use our WARP IP so responses can be routed back.
 func (a *Agent) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -787,50 +776,36 @@ func (a *Agent) tunReadLoop() {
 			continue // Too small to be valid IP packet
 		}
 
-		// Make a copy of the packet since we'll modify it
-		packet := make([]byte, n)
-		copy(packet, buf[:n])
-
+		packet := buf[:n]
 		if packet[0]>>4 != 4 {
 			continue // Not IPv4
 		}
 		dstIP := net.IP(packet[16:20])
 		srcIP := net.IP(packet[12:16])
 
-		// Find peer to route this packet to via workload routes
+		// Check workload routes first (for outgoing traffic to remote workloads)
 		a.workloadRoutesMu.Lock()
 		ownerID := a.workloadRoutes[dstIP.String()]
 		a.workloadRoutesMu.Unlock()
 
+		// Also check return routes (for response traffic back to peers)
 		if ownerID == "" {
-			// No route - this is normal for local traffic, don't spam logs
-			continue
+			if peerIDVal, ok := a.tunReturnRoutes.Load(dstIP.String()); ok {
+				ownerID = peerIDVal.(string)
+			}
+		}
+
+		if ownerID == "" {
+			continue // No route for this destination
 		}
 
 		// Get peer's WARP IP for WebSocket tunnel
 		peerIPVal, ok := a.tunPeerIPs.Load(ownerID)
 		if !ok {
 			log.Printf("WS tunnel send: no peer IP for owner %s (dst=%s)", ownerID[:8], dstIP)
-			continue // Peer IP not known
+			continue
 		}
 		peerIP := peerIPVal.(string)
-
-		// SNAT: Replace source IP with our WARP IP so responses come back to us
-		origSrcIP := srcIP.String()
-		if a.tunLocalIP != "" && origSrcIP != a.tunLocalIP {
-			// Create NAT key based on protocol/ports/dst for tracking
-			natKey := a.createNATKey(packet, dstIP.String())
-			a.tunNATTable.Store(natKey, origSrcIP)
-
-			// Rewrite source IP to our WARP IP
-			newSrcIP := net.ParseIP(a.tunLocalIP).To4()
-			if newSrcIP != nil {
-				copy(packet[12:16], newSrcIP)
-				// Recalculate IP header checksum
-				a.updateIPChecksum(packet)
-				log.Printf("WS tunnel SNAT: %s -> %s (original src %s)", a.tunLocalIP, dstIP, origSrcIP)
-			}
-		}
 
 		// Get or establish WebSocket connection to peer
 		conn, err := a.getTunPeerConn(ownerID, peerIP)
@@ -839,12 +814,11 @@ func (a *Agent) tunReadLoop() {
 			continue
 		}
 
-		log.Printf("WS tunnel send: %s -> %s via %s (%d bytes)", a.tunLocalIP, dstIP, peerIP, n)
+		log.Printf("WS tunnel send: %s -> %s via %s (%d bytes)", srcIP, dstIP, peerIP, n)
 
 		// Send packet as binary WebSocket message
 		if err := conn.WriteMessage(websocket.BinaryMessage, packet); err != nil {
 			log.Printf("WS tunnel send: failed to send to %s: %v", peerIP, err)
-			// Close broken connection so it gets re-established
 			conn.Close()
 			a.tunPeerConns.Delete(ownerID)
 		}
@@ -893,7 +867,6 @@ func (a *Agent) getTunPeerConn(peerID, peerIP string) (*websocket.Conn, error) {
 }
 
 // tunWsRecvLoop receives packets from a peer's WebSocket connection and injects them locally.
-// For response packets (dst is our WARP IP), DNAT back to original destination.
 func (a *Agent) tunWsRecvLoop(peerID string, conn *websocket.Conn) {
 	defer func() {
 		conn.Close()
@@ -924,25 +897,7 @@ func (a *Agent) tunWsRecvLoop(peerID string, conn *websocket.Conn) {
 		dstIP := net.IP(packet[16:20])
 		srcIP := net.IP(packet[12:16])
 
-		// DNAT: If destination is our WARP IP, this is a response - restore original dst
-		if a.tunLocalIP != "" && dstIP.String() == a.tunLocalIP {
-			natKey := a.createReverseNATKey(packet, srcIP.String())
-			if origDstVal, ok := a.tunNATTable.Load(natKey); ok {
-				origDst := origDstVal.(string)
-				newDstIP := net.ParseIP(origDst).To4()
-				if newDstIP != nil {
-					copy(packet[16:20], newDstIP)
-					a.updateIPChecksum(packet)
-					log.Printf("WS tunnel DNAT: %s -> %s (restored from %s)", srcIP, origDst, a.tunLocalIP)
-					// Clean up NAT entry (for ICMP; TCP/UDP should use timeout)
-					a.tunNATTable.Delete(natKey)
-				}
-			} else {
-				log.Printf("WS tunnel recv: no NAT entry for response %s -> %s", srcIP, dstIP)
-			}
-		}
-
-		log.Printf("WS tunnel recv: from %s, packet %s -> %s (%d bytes)", peerID[:8], srcIP, net.IP(packet[16:20]), len(packet))
+		log.Printf("WS tunnel recv: from %s, packet %s -> %s (%d bytes)", peerID[:8], srcIP, dstIP, len(packet))
 
 		// Inject packet into TUN device for local delivery
 		if a.tunDevice != nil {
@@ -954,118 +909,11 @@ func (a *Agent) tunWsRecvLoop(peerID string, conn *websocket.Conn) {
 }
 
 // updateTunPeerAddr updates the WARP IP for a peer's WebSocket tunnel endpoint.
-// Also adds a route for the peer's WARP IP so responses to them go through our TUN.
 func (a *Agent) updateTunPeerAddr(peerID, peerIP string) {
 	if a.tunDevice == nil || peerIP == "" {
 		return
 	}
-
-	// Check if we already have this peer registered
-	oldIP, existed := a.tunPeerIPs.Load(peerID)
-
 	a.tunPeerIPs.Store(peerID, peerIP)
-
-	// Add route for peer's WARP IP so responses go through our TUN
-	// This allows us to capture and tunnel response traffic
-	if !existed || oldIP.(string) != peerIP {
-		// Remove old route if IP changed
-		if existed && oldIP.(string) != peerIP {
-			exec.Command("ip", "route", "del", oldIP.(string)+"/32", "dev", "jetty_tun").Run()
-		}
-		// Add new route
-		if err := exec.Command("ip", "route", "add", peerIP+"/32", "dev", "jetty_tun").Run(); err != nil {
-			log.Printf("WS tunnel: failed to add route for peer %s (%s): %v", peerID[:8], peerIP, err)
-		} else {
-			log.Printf("WS tunnel: added route for peer %s WARP IP %s via jetty_tun", peerID[:8], peerIP)
-		}
-	}
-}
-
-// createNATKey creates a key for tracking NAT mappings based on protocol/ports/dst.
-func (a *Agent) createNATKey(packet []byte, dstIP string) string {
-	if len(packet) < 20 {
-		return ""
-	}
-
-	protocol := packet[9]
-	ihl := int(packet[0]&0x0f) * 4
-
-	switch protocol {
-	case 1: // ICMP
-		if len(packet) >= ihl+8 {
-			// Use ICMP ID for tracking (bytes 4-5 of ICMP header)
-			icmpID := uint16(packet[ihl+4])<<8 | uint16(packet[ihl+5])
-			return fmt.Sprintf("icmp:%d:%s", icmpID, dstIP)
-		}
-	case 6, 17: // TCP, UDP
-		if len(packet) >= ihl+4 {
-			srcPort := uint16(packet[ihl])<<8 | uint16(packet[ihl+1])
-			dstPort := uint16(packet[ihl+2])<<8 | uint16(packet[ihl+3])
-			return fmt.Sprintf("%d:%d:%d:%s", protocol, srcPort, dstPort, dstIP)
-		}
-	}
-
-	// Fallback: just use protocol and dst
-	return fmt.Sprintf("%d:0:0:%s", protocol, dstIP)
-}
-
-// createReverseNATKey creates the reverse NAT key for response packets.
-func (a *Agent) createReverseNATKey(packet []byte, srcIP string) string {
-	if len(packet) < 20 {
-		return ""
-	}
-
-	protocol := packet[9]
-	ihl := int(packet[0]&0x0f) * 4
-
-	switch protocol {
-	case 1: // ICMP
-		if len(packet) >= ihl+8 {
-			// Use ICMP ID for tracking
-			icmpID := uint16(packet[ihl+4])<<8 | uint16(packet[ihl+5])
-			return fmt.Sprintf("icmp:%d:%s", icmpID, srcIP)
-		}
-	case 6, 17: // TCP, UDP
-		if len(packet) >= ihl+4 {
-			// For responses, src/dst ports are swapped
-			srcPort := uint16(packet[ihl])<<8 | uint16(packet[ihl+1])
-			dstPort := uint16(packet[ihl+2])<<8 | uint16(packet[ihl+3])
-			return fmt.Sprintf("%d:%d:%d:%s", protocol, dstPort, srcPort, srcIP)
-		}
-	}
-
-	return fmt.Sprintf("%d:0:0:%s", protocol, srcIP)
-}
-
-// updateIPChecksum recalculates the IP header checksum after modifying the packet.
-func (a *Agent) updateIPChecksum(packet []byte) {
-	if len(packet) < 20 {
-		return
-	}
-
-	ihl := int(packet[0]&0x0f) * 4
-	if len(packet) < ihl {
-		return
-	}
-
-	// Clear existing checksum
-	packet[10] = 0
-	packet[11] = 0
-
-	// Calculate new checksum
-	var sum uint32
-	for i := 0; i < ihl; i += 2 {
-		sum += uint32(packet[i])<<8 | uint32(packet[i+1])
-	}
-
-	// Fold 32-bit sum to 16 bits
-	for sum > 0xffff {
-		sum = (sum & 0xffff) + (sum >> 16)
-	}
-
-	checksum := ^uint16(sum)
-	packet[10] = byte(checksum >> 8)
-	packet[11] = byte(checksum)
 }
 
 // cleanupUserspaceTunnel closes all WebSocket connections and the TUN device.
@@ -1078,9 +926,9 @@ func (a *Agent) cleanupUserspaceTunnel() {
 		return true
 	})
 
-	// Remove all peer WARP IP routes
-	a.tunPeerIPs.Range(func(key, value interface{}) bool {
-		if ip, ok := value.(string); ok {
+	// Remove all return routes (routes for source IPs that sent us traffic)
+	a.tunReturnRoutes.Range(func(key, value interface{}) bool {
+		if ip, ok := key.(string); ok {
 			exec.Command("ip", "route", "del", ip+"/32", "dev", "jetty_tun").Run()
 		}
 		return true
@@ -1188,8 +1036,19 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// Note: sender SNATs packets to their WARP IP, so srcIP should be their WARP IP
-			// Responses will be routed back through the tunnel via the peer WARP IP route
+			// Add return route for the source IP so responses go back through the tunnel
+			if peerID != "" {
+				srcIPStr := srcIP.String()
+				if _, exists := a.tunReturnRoutes.Load(srcIPStr); !exists {
+					// Add host route so responses go through TUN device
+					if err := exec.Command("ip", "route", "add", srcIPStr+"/32", "dev", "jetty_tun").Run(); err != nil {
+						log.Printf("WS tunnel: failed to add return route for %s: %v", srcIPStr, err)
+					} else {
+						log.Printf("WS tunnel: added return route for %s via jetty_tun", srcIPStr)
+					}
+				}
+				a.tunReturnRoutes.Store(srcIPStr, peerID)
+			}
 
 			peerIDShort := peerID
 			if len(peerIDShort) > 8 {
