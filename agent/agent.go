@@ -536,18 +536,14 @@ func (a *Agent) cleanupNetwork() {
 		log.Printf("Removed jetty0 interface")
 	}
 
-	// Unregister WARP device from Cloudflare to prevent orphaned devices
-	log.Printf("Unregistering WARP device from Cloudflare...")
+	// Disconnect WARP (don't delete registration - state is persisted in /data/warp and reused on restart)
+	log.Printf("Disconnecting WARP...")
 	if output, err := exec.Command("warp-cli", "--accept-tos", "disconnect").CombinedOutput(); err != nil {
 		log.Printf("WARP disconnect: %v (%s)", err, strings.TrimSpace(string(output)))
 	} else {
 		log.Printf("WARP disconnected")
 	}
-	if output, err := exec.Command("warp-cli", "--accept-tos", "registration", "delete").CombinedOutput(); err != nil {
-		log.Printf("WARP registration delete: %v (%s)", err, strings.TrimSpace(string(output)))
-	} else {
-		log.Printf("WARP registration deleted - device should be removed from Cloudflare dashboard")
-	}
+	// Registration is preserved in /data/warp for reuse across restarts/updates
 
 	// Clean up WARP network modifications (important for --net host mode)
 	// These persist on the host after container stops, breaking SSH/git
@@ -2904,10 +2900,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	// Step 4: Build docker run command for new container
 	args := []string{"run", "-d", "--name", containerName + "-update"}
 
-	// Copy all volumes from old container (preserves anonymous volumes like /var/lib/cloudflare-warp)
-	args = append(args, "--volumes-from", containerName)
-
-	// Add explicit bind mounts (these override --volumes-from if paths conflict)
+	// Add bind mounts (WARP state is persisted in /data/warp via symlink)
 	for _, bind := range container.HostConfig.Binds {
 		args = append(args, "-v", bind)
 	}
