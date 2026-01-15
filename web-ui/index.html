@@ -1545,8 +1545,21 @@
             }
         }
 
-        // Start auto-refresh timer display update
-        setInterval(updateLastRefreshedDisplay, 1000);
+        // Update all relative timestamps on the page
+        function updateAllTimestamps() {
+            document.querySelectorAll('[data-timestamp]').forEach(el => {
+                const timestamp = el.getAttribute('data-timestamp');
+                if (timestamp) {
+                    el.textContent = formatRelativeTime(timestamp);
+                }
+            });
+        }
+
+        // Start timer to update refresh display and all timestamps
+        setInterval(() => {
+            updateLastRefreshedDisplay();
+            updateAllTimestamps();
+        }, 1000);
 
         // Helper function to get CSS class for workload status
         function getStatusClass(status) {
@@ -1604,13 +1617,13 @@
             return parseFloat(str.replace('%', '')) || 0;
         }
 
-        // Helper function to parse byte strings like "15.2 GB" to bytes
+        // Helper function to parse byte strings like "15.2 GB" or "4.9 GiB" to bytes
         function parseBytes(str) {
             if (!str) return 0;
-            const match = str.match(/^([\d.]+)\s*(B|KB|MB|GB|TB|PB)?$/i);
+            const match = str.match(/^([\d.]+)\s*(B|Ki?B|Mi?B|Gi?B|Ti?B|Pi?B)?$/i);
             if (!match) return 0;
             const value = parseFloat(match[1]);
-            const unit = (match[2] || 'B').toUpperCase();
+            const unit = (match[2] || 'B').toUpperCase().replace('I', ''); // Normalize GiB -> GB
             const multipliers = { 'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4, 'PB': 1024**5 };
             return value * (multipliers[unit] || 1);
         }
@@ -1618,7 +1631,7 @@
         // Helper function to format bytes to human readable
         function formatBytes(bytes) {
             if (bytes === 0) return '0 B';
-            const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+            const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
             const i = Math.floor(Math.log(bytes) / Math.log(1024));
             const value = bytes / Math.pow(1024, i);
             return value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2) + ' ' + units[i];
@@ -1918,22 +1931,16 @@
                             <tbody>
                                 ${nodes.map(node => {
                                     const cpu = node.system?.cpu_percent || 'N/A';
-                                    const memPct = node.system?.memory_percent || 'N/A';
-                                    const memUsed = node.system?.memory_used || '';
-                                    const memTotal = node.system?.memory_total || '';
-                                    const memDisplay = memUsed && memTotal ? `${memPct} (${memUsed}/${memTotal})` : memPct;
-                                    const diskPct = node.system?.disk_percent || 'N/A';
-                                    const diskUsed = node.system?.disk_used || '';
-                                    const diskTotal = node.system?.disk_total || '';
-                                    const diskDisplay = diskUsed && diskTotal ? `${diskPct} (${diskUsed}/${diskTotal})` : diskPct;
+                                    const mem = node.system?.memory_percent || 'N/A';
+                                    const disk = node.system?.disk_percent || 'N/A';
                                     const statusClass = node.status === 'healthy' ? 'running' : (node.status === 'medium' ? 'stopped' : 'error');
                                     const statusText = node.status || 'Unknown';
                                     return `
                                         <tr onclick="showNodeDetail('${node.id}')" style="cursor: pointer;">
                                             <td>${node.name || node.id.substring(0, 8)}</td>
                                             <td>${cpu}</td>
-                                            <td>${memDisplay}</td>
-                                            <td>${diskDisplay}</td>
+                                            <td>${mem}</td>
+                                            <td>${disk}</td>
                                             <td><span class="status-badge ${statusClass}">${statusText}</span></td>
                                         </tr>
                                     `;
@@ -1975,7 +1982,6 @@
                                 const isCurrentNode = node.id === state.node?.id || node.is_self;
                                 const healthClass = node.healthy !== false ? 'running' : 'error';
                                 const healthText = node.healthy !== false ? 'Healthy' : 'Unhealthy';
-                                const lastSeen = formatRelativeTime(node.last_seen);
                                 const nodeWorkloads = state.workloads.filter(w => w.owner?.id === node.id);
                                 return `
                                     <tr onclick="showNodeDetail('${node.id}')" style="cursor: pointer;">
@@ -1985,7 +1991,7 @@
                                         </td>
                                         <td><span class="status-badge ${healthClass}">${healthText}</span></td>
                                         <td><code>${node.ip || 'N/A'}</code></td>
-                                        <td>${lastSeen}</td>
+                                        <td><span data-timestamp="${node.last_seen || ''}">${formatRelativeTime(node.last_seen)}</span></td>
                                         <td>${nodeWorkloads.length}</td>
                                     </tr>
                                 `;
@@ -2029,7 +2035,6 @@
                 const isCurrentNode = node.id === state.node?.id || node.is_self;
                 const nodeWorkloads = state.workloads.filter(w => w.owner?.id === node.id);
                 const healthClass = node.healthy !== false ? 'healthy' : 'unhealthy';
-                const lastSeen = formatRelativeTime(node.last_seen);
 
                 return `
                     <div class="node-card" onclick="showNodeDetail('${node.id}')" style="cursor: pointer;">
@@ -2055,7 +2060,7 @@
                         </div>
                         <div class="node-details">
                             <p><strong>Mesh IP:</strong> ${node.ip || 'N/A'}</p>
-                            <p><strong>Last Seen:</strong> ${lastSeen}</p>
+                            <p><strong>Last Seen:</strong> <span data-timestamp="${node.last_seen || ''}">${formatRelativeTime(node.last_seen)}</span></p>
                             ${node.warp_ip || node.warpIP ? `<p><strong>WARP IP:</strong> ${node.warp_ip || node.warpIP}</p>` : ''}
                             ${node.tunnel_host || node.tunnelHost ? `<p><strong>Tunnel:</strong> ${node.tunnel_host || node.tunnelHost}</p>` : ''}
                         </div>
