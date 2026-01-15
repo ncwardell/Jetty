@@ -176,6 +176,18 @@ func New() (*Agent, error) {
 // cleanupOrphanedState cleans up any leftover state from previous unclean shutdowns.
 // This prevents accumulation of orphaned WARP devices in Cloudflare dashboard.
 func (a *Agent) cleanupOrphanedState() {
+	// Clean up old Jetty container from previous update
+	// The update process renames the old container to {name}-old before stopping it
+	output, err := exec.Command("docker", "ps", "-a", "--filter", "name=-old$", "--format", "{{.Names}}").CombinedOutput()
+	if err == nil {
+		for _, name := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+			if name != "" && strings.HasSuffix(name, "-old") {
+				log.Printf("Removing old container from previous update: %s", name)
+				exec.Command("docker", "rm", "-f", name).Run()
+			}
+		}
+	}
+
 	// Check if there's orphaned jetty0 interface from previous run
 	if err := exec.Command("ip", "link", "show", "jetty0").Run(); err == nil {
 		log.Printf("Found orphaned jetty0 interface from previous run, cleaning up...")
@@ -261,6 +273,9 @@ func (a *Agent) Start() error {
 	if !needsJoin {
 		a.syncStateOnStartup()
 	}
+
+	// Announce our current IP to peers (handles IP changes during restart/update)
+	go a.announceOurIP()
 
 	// Auto-start owned workloads (only those we still own after sync)
 	a.autostartWorkloads()
@@ -521,18 +536,14 @@ func (a *Agent) cleanupNetwork() {
 		log.Printf("Removed jetty0 interface")
 	}
 
-	// Unregister WARP device from Cloudflare to prevent orphaned devices
-	log.Printf("Unregistering WARP device from Cloudflare...")
+	// Disconnect WARP (don't delete registration - state is persisted in /data/warp and reused on restart)
+	log.Printf("Disconnecting WARP...")
 	if output, err := exec.Command("warp-cli", "--accept-tos", "disconnect").CombinedOutput(); err != nil {
 		log.Printf("WARP disconnect: %v (%s)", err, strings.TrimSpace(string(output)))
 	} else {
 		log.Printf("WARP disconnected")
 	}
-	if output, err := exec.Command("warp-cli", "--accept-tos", "registration", "delete").CombinedOutput(); err != nil {
-		log.Printf("WARP registration delete: %v (%s)", err, strings.TrimSpace(string(output)))
-	} else {
-		log.Printf("WARP registration deleted - device should be removed from Cloudflare dashboard")
-	}
+	// Registration is preserved in /data/warp for reuse across restarts/updates
 
 	// Clean up WARP network modifications (important for --net host mode)
 	// These persist on the host after container stops, breaking SSH/git
@@ -2889,7 +2900,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	// Step 4: Build docker run command for new container
 	args := []string{"run", "-d", "--name", containerName + "-update"}
 
-	// Add mounts
+	// Add bind mounts (WARP state is persisted in /data/warp via symlink)
 	for _, bind := range container.HostConfig.Binds {
 		args = append(args, "-v", bind)
 	}
