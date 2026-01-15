@@ -1,12 +1,8 @@
 package agent
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha256"
 	_ "embed"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -33,155 +29,13 @@ import (
 )
 
 // Embedded dashboard UI - automatically synced from web-ui/index.html during build
+//
 //go:generate cp ../web-ui/index.html dashboard.html
 //go:embed dashboard.html
 var dashboardHTML []byte
 
-// Shared HTTP client with timeout to prevent blocking on hung peers
-var httpClient = &http.Client{
-	Timeout: 30 * time.Second,
-}
-
-// Shorter timeout clients for peer health checks
-var peerClient = &http.Client{
-	Timeout: 5 * time.Second, // Normal peer query timeout
-}
-var unhealthyPeerClient = &http.Client{
-	Timeout: 1 * time.Second, // Very short timeout for known-unhealthy peers
-}
-
-// Valid workload name pattern (alphanumeric, dash, underscore only)
-var validNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-
 // Version is the current Jetty agent version (set at build time via -ldflags or defaults to "dev")
 var Version = "2.0.0"
-
-// =============================================================================
-// Types
-// =============================================================================
-
-type Peer struct {
-	ID       string    `json:"id"`        // HWID
-	Name     string    `json:"name"`      // Hostname
-	IP       string    `json:"ip"`        // WARP IP (100.96.x.x) - primary address for node communication
-	Healthy  bool      `json:"healthy"`
-	LastSeen time.Time `json:"last_seen"`
-	Version  string    `json:"version"`   // Agent version
-	Arch     string    `json:"arch"`      // CPU architecture (amd64, arm64, etc.)
-}
-
-type Workload struct {
-	Name         string   `json:"name"`                    // DNS hostname
-	IP           string   `json:"ip"`                      // Service IP (routed via WARP)
-	Compose      string   `json:"compose"`                 // Default compose (used if no arch-specific)
-	ComposeAmd64 string   `json:"compose_amd64,omitempty"` // Optional: amd64-specific compose
-	ComposeArm64 string   `json:"compose_arm64,omitempty"` // Optional: arm64-specific compose
-	Revive       bool     `json:"revive"`                  // Auto-failover to another node if owner dies
-	Autostart    bool     `json:"autostart"`               // Auto-start when Jetty starts up
-	AllowedNodes []string `json:"allowed_nodes,omitempty"` // Node whitelist: empty/["*"] = all, otherwise node names/IDs
-	Owner        string   `json:"owner"`                   // Node HWID
-	Version      int64    `json:"version"`                 // Unix timestamp
-}
-
-// DeletedWorkload represents a tombstone for a deleted workload to propagate deletions
-type DeletedWorkload struct {
-	IP      string `json:"ip"`      // The IP of the deleted workload
-	Version int64  `json:"version"` // Timestamp when deleted (must be > workload version to take effect)
-}
-
-// DeletedEnvKey represents a tombstone for a deleted environment variable to propagate deletions
-type DeletedEnvKey struct {
-	Key     string `json:"key"`     // The name of the deleted env key
-	Version int64  `json:"version"` // Timestamp when deleted
-}
-
-type State struct {
-	Peers            map[string]*Peer            `json:"peers"`                       // ID -> Peer
-	Workloads        map[string]*Workload        `json:"workloads"`                   // IP -> Workload
-	DeletedWorkloads map[string]*DeletedWorkload `json:"deleted_workloads,omitempty"` // IP -> tombstone (for sync propagation)
-	CFToken          string                      `json:"cf_token,omitempty"`          // Cloudflare tunnel token (shared cluster-wide)
-	WarpToken        string                      `json:"warp_token,omitempty"`        // Cloudflare WARP connector token (shared cluster-wide)
-	EnvData          map[string]string           `json:"env_data,omitempty"`          // Encrypted environment variables (key -> encrypted value)
-	DeletedEnvKeys   map[string]*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`  // Key -> tombstone (for sync propagation)
-}
-
-// =============================================================================
-// TCP Proxy for Tunnel
-// =============================================================================
-
-// tcpProxyConn represents an active TCP proxy connection through the tunnel.
-type tcpProxyConn struct {
-	conn      net.Conn          // TCP connection to the workload
-	wsConn    *websocket.Conn   // WebSocket connection back to the tunnel peer
-	srcIP     net.IP            // Original source IP
-	srcPort   uint16            // Original source port
-	dstIP     net.IP            // Destination IP (workload)
-	dstPort   uint16            // Destination port
-	localSeq  uint32            // Our sequence number for responses
-	remoteSeq uint32            // Remote sequence number (from client)
-	mu        sync.Mutex        // Protects sequence numbers
-}
-
-// =============================================================================
-// Agent
-// =============================================================================
-
-type Agent struct {
-	// Identity
-	hwid     string
-	hostname string
-	ip       string // WARP IP (100.96.x.x) - primary node address
-
-	// Cloudflare
-	cfTunnelID string // WARP connector tunnel ID (for workload route management)
-
-	// Config
-	dataDir       string
-	apiPort       int
-	serviceCIDR   string // CIDR for workload service IPs (routed via WARP)
-	joinURL       string
-	clusterSecret string // Shared secret for cluster authentication
-	tunnelDomain  string // Cloudflare tunnel domain for API access
-	tunnelHost    string // This node's specific tunnel hostname (e.g., "node1.cluster.example.com")
-
-	// State
-	state   *State
-	stateMu sync.RWMutex
-
-	// Paths
-	composeDir string
-	hostsFile  string
-
-	// Cloudflare tunnel
-	cfCmd    *exec.Cmd
-	cfMu     sync.Mutex
-	cfStopCh chan struct{}
-
-	// Runtime
-	startTime            time.Time // When Jetty started (for uptime tracking)
-	lastHeartbeatErrLog  time.Time // Last time we logged a heartbeat error (to reduce spam)
-	publicIP             string    // Cached public IP (set at startup to avoid slow lookups)
-	cachedCPUPercent     float64   // Cached CPU usage (updated by background goroutine)
-	cachedCPUMu          sync.RWMutex
-
-	// Route management
-	workloadRoutes   map[string]string // workload IP -> owner WARP IP (for remote workloads)
-	workloadRoutesMu sync.Mutex
-
-	// Tunnel support for cross-node routing
-	tunnelMode        string            // "ipip", "gre", or "" (none available)
-	ipipWarnedPeers   map[string]bool   // Peers we've already warned about tunnel failure
-	ipipWarnedPeersMu sync.Mutex
-
-	// Userspace tunnel (fallback when kernel IPIP/GRE not available)
-	tunDevice    *water.Interface // TUN device for capturing workload traffic
-	tunPeerConns sync.Map         // peerID -> *websocket.Conn (outgoing connections to peers)
-	tunPeerIPs   sync.Map         // peerID -> string (peer WARP IP for tunnel)
-	tunConnMu    sync.Mutex       // Protects WebSocket connection establishment
-	tunTCPConns  sync.Map         // flowKey -> *tcpProxyConn (active TCP proxy connections)
-
-	stopCh chan struct{}
-}
 
 func New() (*Agent, error) {
 	dataDir := getEnv("JETTY_DATA_DIR", "/data")
@@ -194,9 +48,9 @@ func New() (*Agent, error) {
 		serviceCIDR:     getEnv("JETTY_SERVICE_CIDR", "10.100.0.0/16"), // CIDR for workload IPs
 		joinURL:         getEnv("JETTY_JOIN", ""),
 		clusterSecret:   getEnv("JETTY_SECRET", ""),
-		tunnelDomain:    getEnv("JETTY_TUNNEL_DOMAIN", ""),            // e.g., "cluster.example.com" - Cloudflare tunnel for API access
-		tunnelHost:      getEnv("JETTY_TUNNEL_HOST", ""),              // e.g., "node1.cluster.example.com" - this node's specific subdomain
-		cfTunnelID:      getEnv("JETTY_CF_TUNNEL_ID", ""),             // WARP connector tunnel ID for route management
+		tunnelDomain:    getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - Cloudflare tunnel for API access
+		tunnelHost:      getEnv("JETTY_TUNNEL_HOST", ""),   // e.g., "node1.cluster.example.com" - this node's specific subdomain
+		cfTunnelID:      getEnv("JETTY_CF_TUNNEL_ID", ""),  // WARP connector tunnel ID for route management
 		composeDir:      filepath.Join(dataDir, "compose"),
 		hostsFile:       "/etc/hosts",
 		workloadRoutes:  make(map[string]string),
@@ -204,10 +58,10 @@ func New() (*Agent, error) {
 		state: &State{
 			Peers:            make(map[string]*Peer),
 			Workloads:        make(map[string]*Workload),
-			DeletedWorkloads: make(map[string]*DeletedWorkload), // Tombstones for deleted workloads
-			CFToken:          getEnv("JETTY_CF_TOKEN", ""),      // Bootstrap tunnel token
+			DeletedWorkloads: make(map[string]*DeletedWorkload),        // Tombstones for deleted workloads
+			CFToken:          getEnv("JETTY_CF_TOKEN", ""),             // Bootstrap tunnel token
 			WarpToken:        getEnv("JETTY_WARP_CONNECTOR_TOKEN", ""), // Bootstrap WARP connector token
-			EnvData:          make(map[string]string),           // Encrypted environment variables
+			EnvData:          make(map[string]string),                  // Encrypted environment variables
 		},
 		stopCh: make(chan struct{}),
 	}
@@ -2348,17 +2202,17 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 	for _, p := range a.state.Peers {
 		peerNameToID[p.Name] = p.ID
 		peerIDToInfo[p.ID] = map[string]string{
-			"id":      p.ID,
-			"name":    p.Name,
-			"ip": p.IP,
+			"id":   p.ID,
+			"name": p.Name,
+			"ip":   p.IP,
 		}
 	}
 
 	// Add local node to owner info map
 	peerIDToInfo[a.hwid] = map[string]string{
-		"id":      a.hwid,
-		"name":    a.hostname,
-		"ip": a.ip,
+		"id":   a.hwid,
+		"name": a.hostname,
+		"ip":   a.ip,
 	}
 
 	type WorkloadResponse struct {
@@ -2576,15 +2430,15 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	// Build response with enriched owner info
 	response := map[string]interface{}{
 		"name":          wl.Name,
-		"ip":       wl.IP,
+		"ip":            wl.IP,
 		"compose":       wl.Compose,
 		"revive":        wl.Revive,
 		"autostart":     wl.Autostart,
 		"allowed_nodes": wl.AllowedNodes,
 		"owner": map[string]string{
-			"id":      a.hwid,
-			"name":    a.hostname,
-			"ip": a.ip,
+			"id":   a.hwid,
+			"name": a.hostname,
+			"ip":   a.ip,
 		},
 		"version": wl.Version,
 	}
@@ -2628,9 +2482,9 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 	// Helper to build owner info object
 	buildOwnerInfo := func(id, peerName, meshIP string) map[string]string {
 		return map[string]string{
-			"id":      id,
-			"name":    peerName,
-			"ip": meshIP,
+			"id":   id,
+			"name": peerName,
+			"ip":   meshIP,
 		}
 	}
 
@@ -2645,7 +2499,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"name":          found.Name,
-				"ip":       found.IP,
+				"ip":            found.IP,
 				"compose":       found.Compose,
 				"revive":        found.Revive,
 				"autostart":     found.Autostart,
@@ -2667,7 +2521,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"name":          found.Name,
-				"ip":       found.IP,
+				"ip":            found.IP,
 				"compose":       found.Compose,
 				"revive":        found.Revive,
 				"autostart":     found.Autostart,
@@ -2700,7 +2554,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 	ownerInfo := buildOwnerInfo(a.hwid, a.hostname, a.ip)
 	response := map[string]interface{}{
 		"name":          found.Name,
-		"ip":       found.IP,
+		"ip":            found.IP,
 		"compose":       found.Compose,
 		"revive":        found.Revive,
 		"autostart":     found.Autostart,
@@ -2893,15 +2747,15 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	// Build response
 	response := map[string]interface{}{
 		"name":          found.Name,
-		"ip":       found.IP,
+		"ip":            found.IP,
 		"compose":       found.Compose,
 		"revive":        found.Revive,
 		"autostart":     found.Autostart,
 		"allowed_nodes": found.AllowedNodes,
 		"owner": map[string]string{
-			"id":      a.hwid,
-			"name":    a.hostname,
-			"ip": a.ip,
+			"id":   a.hwid,
+			"name": a.hostname,
+			"ip":   a.ip,
 		},
 		"version":    found.Version,
 		"redeployed": needsRedeploy,
@@ -5447,415 +5301,6 @@ func (a *Agent) tunnelModeHealthCheck() {
 	a.stateMu.Unlock()
 }
 
-// syncStateOnStartup syncs state from known peers before autostarting workloads.
-// This handles the case where we restarted and workloads were revived by other nodes.
-func (a *Agent) syncStateOnStartup() {
-	a.stateMu.RLock()
-	peerCount := len(a.state.Peers)
-	peers := make([]*Peer, 0, peerCount)
-	for _, p := range a.state.Peers {
-		peers = append(peers, p)
-	}
-	a.stateMu.RUnlock()
-
-	if peerCount == 0 {
-		log.Printf("No known peers - skipping startup sync")
-		return
-	}
-
-	log.Printf("Syncing state from %d known peer(s) before autostart...", peerCount)
-	synced := false
-
-	// Try tunnel domain first if configured
-	if a.tunnelDomain != "" {
-		url := fmt.Sprintf("https://%s/api/sync", a.tunnelDomain)
-		resp, err := httpClient.Get(url)
-		if err == nil {
-			var syncResp struct {
-				Workloads        []*Workload        `json:"workloads"`
-				DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
-				EnvData          map[string]string  `json:"env_data,omitempty"`
-				DeletedEnvKeys   []*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`
-			}
-			json.NewDecoder(resp.Body).Decode(&syncResp)
-			resp.Body.Close()
-
-			a.stateMu.Lock()
-			// Process deleted workloads (tombstones) first
-			for _, dw := range syncResp.DeletedWorkloads {
-				existingTombstone := a.state.DeletedWorkloads[dw.IP]
-				if existingTombstone == nil || dw.Version > existingTombstone.Version {
-					a.state.DeletedWorkloads[dw.IP] = dw
-				}
-				existing := a.state.Workloads[dw.IP]
-				if existing != nil && dw.Version > existing.Version {
-					log.Printf("Startup sync: workload %s was deleted while we were down", existing.Name)
-					delete(a.state.Workloads, dw.IP)
-				}
-			}
-			// Process workloads
-			for _, w := range syncResp.Workloads {
-				tombstone := a.state.DeletedWorkloads[w.IP]
-				if tombstone != nil && tombstone.Version > w.Version {
-					continue
-				}
-				existing := a.state.Workloads[w.IP]
-				if existing == nil || w.Version > existing.Version {
-					if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
-						log.Printf("Workload %s was revived by %s while we were down", w.Name, w.Owner[:12])
-					}
-					a.state.Workloads[w.IP] = w
-					if tombstone != nil {
-						delete(a.state.DeletedWorkloads, w.IP)
-					}
-				}
-			}
-			// Process deleted env keys (tombstones) first
-			for _, dek := range syncResp.DeletedEnvKeys {
-				existingTombstone := a.state.DeletedEnvKeys[dek.Key]
-				if existingTombstone == nil || dek.Version > existingTombstone.Version {
-					a.state.DeletedEnvKeys[dek.Key] = dek
-				}
-				if _, exists := a.state.EnvData[dek.Key]; exists {
-					log.Printf("Startup sync: env key %s was deleted while we were down", dek.Key)
-					delete(a.state.EnvData, dek.Key)
-				}
-			}
-			// Merge env data from peer (only if not tombstoned)
-			for k, v := range syncResp.EnvData {
-				tombstone := a.state.DeletedEnvKeys[k]
-				if tombstone != nil {
-					continue
-				}
-				a.state.EnvData[k] = v
-			}
-			a.stateMu.Unlock()
-			synced = true
-		}
-	}
-
-	// Try direct peer connections
-	for _, peer := range peers {
-		url := fmt.Sprintf("http://%s:%d/api/sync", peer.IP, a.apiPort)
-		resp, err := httpClient.Get(url)
-		if err != nil {
-			continue
-		}
-
-		var syncResp struct {
-			Workloads        []*Workload        `json:"workloads"`
-			DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
-			EnvData          map[string]string  `json:"env_data,omitempty"`
-			DeletedEnvKeys   []*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`
-		}
-		json.NewDecoder(resp.Body).Decode(&syncResp)
-		resp.Body.Close()
-
-		a.stateMu.Lock()
-		// Process deleted workloads (tombstones) first
-		for _, dw := range syncResp.DeletedWorkloads {
-			existingTombstone := a.state.DeletedWorkloads[dw.IP]
-			if existingTombstone == nil || dw.Version > existingTombstone.Version {
-				a.state.DeletedWorkloads[dw.IP] = dw
-			}
-			existing := a.state.Workloads[dw.IP]
-			if existing != nil && dw.Version > existing.Version {
-				log.Printf("Startup sync: workload %s was deleted while we were down", existing.Name)
-				delete(a.state.Workloads, dw.IP)
-			}
-		}
-		// Process workloads
-		for _, w := range syncResp.Workloads {
-			tombstone := a.state.DeletedWorkloads[w.IP]
-			if tombstone != nil && tombstone.Version > w.Version {
-				continue
-			}
-			existing := a.state.Workloads[w.IP]
-			if existing == nil || w.Version > existing.Version {
-				if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
-					log.Printf("Workload %s was revived by %s while we were down", w.Name, w.Owner[:12])
-				}
-				a.state.Workloads[w.IP] = w
-				if tombstone != nil {
-					delete(a.state.DeletedWorkloads, w.IP)
-				}
-			}
-		}
-		// Process deleted env keys (tombstones) first
-		for _, dek := range syncResp.DeletedEnvKeys {
-			existingTombstone := a.state.DeletedEnvKeys[dek.Key]
-			if existingTombstone == nil || dek.Version > existingTombstone.Version {
-				a.state.DeletedEnvKeys[dek.Key] = dek
-			}
-			if _, exists := a.state.EnvData[dek.Key]; exists {
-				log.Printf("Startup sync: env key %s was deleted while we were down", dek.Key)
-				delete(a.state.EnvData, dek.Key)
-			}
-		}
-		// Merge env data from peer (only if not tombstoned)
-		for k, v := range syncResp.EnvData {
-			tombstone := a.state.DeletedEnvKeys[k]
-			if tombstone != nil {
-				continue
-			}
-			a.state.EnvData[k] = v
-		}
-		a.stateMu.Unlock()
-		synced = true
-	}
-
-	if synced {
-		log.Printf("Startup sync complete")
-		a.saveState()
-	} else {
-		log.Printf("Warning: could not reach any peers for startup sync")
-	}
-}
-
-func (a *Agent) syncWorkloads() {
-	// In tunnel-only mode, sync through tunnel domain
-	if a.tunnelDomain != "" {
-		a.tunnelModeSyncWorkloads()
-		return
-	}
-
-	// Direct mode: sync with each peer via mesh IP
-	a.stateMu.RLock()
-	peers := make([]*Peer, 0)
-	for _, p := range a.state.Peers {
-		if p.Healthy {
-			peers = append(peers, p)
-		}
-	}
-	a.stateMu.RUnlock()
-
-	var lostOwnership []*Workload
-	var envUpdated bool
-
-	for _, peer := range peers {
-		url := fmt.Sprintf("http://%s:%d/api/sync", peer.IP, a.apiPort)
-		resp, err := httpClient.Get(url)
-		if err != nil {
-			continue
-		}
-
-		var syncResp struct {
-			Workloads        []*Workload        `json:"workloads"`
-			DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
-			EnvData          map[string]string  `json:"env_data,omitempty"`
-			DeletedEnvKeys   []*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`
-		}
-		json.NewDecoder(resp.Body).Decode(&syncResp)
-		resp.Body.Close()
-
-		a.stateMu.Lock()
-		// Process deleted workloads (tombstones) first
-		for _, dw := range syncResp.DeletedWorkloads {
-			// Merge tombstone if we don't have it or peer's is newer
-			existingTombstone := a.state.DeletedWorkloads[dw.IP]
-			if existingTombstone == nil || dw.Version > existingTombstone.Version {
-				a.state.DeletedWorkloads[dw.IP] = dw
-			}
-			// Check if we have a local workload that should be deleted
-			existing := a.state.Workloads[dw.IP]
-			if existing != nil && dw.Version > existing.Version {
-				log.Printf("Sync: removing workload %s (IP %s) - deleted by peer (tombstone version %d > workload version %d)",
-					existing.Name, dw.IP, dw.Version, existing.Version)
-				if existing.Owner == a.hwid {
-					lostOwnership = append(lostOwnership, existing)
-				}
-				delete(a.state.Workloads, dw.IP)
-			}
-		}
-		// Process workloads - only add/update if not tombstoned with a newer version
-		for _, w := range syncResp.Workloads {
-			// Check if there's a tombstone that supersedes this workload
-			tombstone := a.state.DeletedWorkloads[w.IP]
-			if tombstone != nil && tombstone.Version > w.Version {
-				// Tombstone is newer, ignore this workload
-				continue
-			}
-			existing := a.state.Workloads[w.IP]
-			if existing == nil || w.Version > existing.Version {
-				// Check if we lost ownership (IP collision resolution)
-				if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
-					log.Printf("Lost ownership of %s (IP %s) to %s - newer version wins", existing.Name, w.IP, w.Owner[:12])
-					lostOwnership = append(lostOwnership, existing)
-				}
-				a.state.Workloads[w.IP] = w
-				// Clear any older tombstone since we're accepting a newer workload
-				if tombstone != nil {
-					delete(a.state.DeletedWorkloads, w.IP)
-				}
-			}
-		}
-		// Process deleted env keys (tombstones) first
-		for _, dek := range syncResp.DeletedEnvKeys {
-			existingTombstone := a.state.DeletedEnvKeys[dek.Key]
-			if existingTombstone == nil || dek.Version > existingTombstone.Version {
-				a.state.DeletedEnvKeys[dek.Key] = dek
-			}
-			if _, exists := a.state.EnvData[dek.Key]; exists {
-				log.Printf("Sync: removing env key %s - deleted by peer", dek.Key)
-				delete(a.state.EnvData, dek.Key)
-				envUpdated = true
-			}
-		}
-		// Merge env data from peer (only if not tombstoned)
-		for k, v := range syncResp.EnvData {
-			tombstone := a.state.DeletedEnvKeys[k]
-			if tombstone != nil {
-				continue
-			}
-			if a.state.EnvData[k] != v {
-				a.state.EnvData[k] = v
-				envUpdated = true
-			}
-		}
-		a.stateMu.Unlock()
-	}
-
-	// Stop workloads we lost ownership of (outside lock)
-	for _, wl := range lostOwnership {
-		log.Printf("Stopping local workload %s - ownership transferred", wl.Name)
-		a.removeWorkload(wl)
-	}
-
-	if envUpdated {
-		a.saveState()
-	}
-
-	a.updateHosts()
-}
-
-// tunnelModeSyncWorkloads syncs workloads through the tunnel.
-// In tunnel-only mode, we hit the tunnel and get workloads from whichever node responds.
-// Since all nodes gossip, they eventually converge on the same state.
-func (a *Agent) tunnelModeSyncWorkloads() {
-	url := a.getTunnelAPIURL("/api/sync")
-	resp, err := httpClient.Get(url)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	var syncResp struct {
-		Workloads        []*Workload        `json:"workloads"`
-		DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
-		EnvData          map[string]string  `json:"env_data,omitempty"`
-		DeletedEnvKeys   []*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
-		return
-	}
-
-	var lostOwnership []*Workload
-	var envUpdated bool
-
-	a.stateMu.Lock()
-	// Process deleted workloads (tombstones) first
-	for _, dw := range syncResp.DeletedWorkloads {
-		// Merge tombstone if we don't have it or peer's is newer
-		existingTombstone := a.state.DeletedWorkloads[dw.IP]
-		if existingTombstone == nil || dw.Version > existingTombstone.Version {
-			a.state.DeletedWorkloads[dw.IP] = dw
-		}
-		// Check if we have a local workload that should be deleted
-		existing := a.state.Workloads[dw.IP]
-		if existing != nil && dw.Version > existing.Version {
-			log.Printf("Sync: removing workload %s (IP %s) - deleted by peer (tombstone version %d > workload version %d)",
-				existing.Name, dw.IP, dw.Version, existing.Version)
-			if existing.Owner == a.hwid {
-				lostOwnership = append(lostOwnership, existing)
-			}
-			delete(a.state.Workloads, dw.IP)
-		}
-	}
-	// Process workloads - only add/update if not tombstoned with a newer version
-	for _, w := range syncResp.Workloads {
-		// Check if there's a tombstone that supersedes this workload
-		tombstone := a.state.DeletedWorkloads[w.IP]
-		if tombstone != nil && tombstone.Version > w.Version {
-			// Tombstone is newer, ignore this workload
-			continue
-		}
-		existing := a.state.Workloads[w.IP]
-		if existing == nil || w.Version > existing.Version {
-			// Check if we lost ownership (IP collision resolution)
-			if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
-				log.Printf("Lost ownership of %s (IP %s) to %s - newer version wins", existing.Name, w.IP, w.Owner[:12])
-				lostOwnership = append(lostOwnership, existing)
-			}
-			a.state.Workloads[w.IP] = w
-			// Clear any older tombstone since we're accepting a newer workload
-			if tombstone != nil {
-				delete(a.state.DeletedWorkloads, w.IP)
-			}
-		}
-	}
-	// Process deleted env keys (tombstones) first
-	for _, dek := range syncResp.DeletedEnvKeys {
-		existingTombstone := a.state.DeletedEnvKeys[dek.Key]
-		if existingTombstone == nil || dek.Version > existingTombstone.Version {
-			a.state.DeletedEnvKeys[dek.Key] = dek
-		}
-		if _, exists := a.state.EnvData[dek.Key]; exists {
-			log.Printf("Sync: removing env key %s - deleted by peer", dek.Key)
-			delete(a.state.EnvData, dek.Key)
-			envUpdated = true
-		}
-	}
-	// Merge env data from peer (only if not tombstoned)
-	for k, v := range syncResp.EnvData {
-		tombstone := a.state.DeletedEnvKeys[k]
-		if tombstone != nil {
-			continue
-		}
-		if a.state.EnvData[k] != v {
-			a.state.EnvData[k] = v
-			envUpdated = true
-		}
-	}
-	a.stateMu.Unlock()
-
-	// Stop workloads we lost ownership of (outside lock)
-	for _, wl := range lostOwnership {
-		log.Printf("Stopping local workload %s - ownership transferred", wl.Name)
-		a.removeWorkload(wl)
-	}
-
-	if envUpdated {
-		a.saveState()
-	}
-
-	a.updateHosts()
-}
-
-func (a *Agent) broadcastState() {
-	// In tunnel-only mode, just trigger a sync through the tunnel
-	if a.tunnelDomain != "" {
-		url := a.getTunnelAPIURL("/api/sync")
-		resp, err := httpClient.Get(url)
-		if err == nil {
-			resp.Body.Close()
-		}
-		return
-	}
-
-	// Direct mode: sync with each peer
-	a.stateMu.RLock()
-	peers := make([]*Peer, 0)
-	for _, p := range a.state.Peers {
-		peers = append(peers, p)
-	}
-	a.stateMu.RUnlock()
-
-	for _, peer := range peers {
-		url := fmt.Sprintf("http://%s:%d/api/sync", peer.IP, a.apiPort)
-		httpClient.Get(url) // Trigger sync
-	}
-}
-
 func (a *Agent) announcePeer(newPeer *Peer) {
 	// Include secret in announcement
 	announcement := struct {
@@ -6016,508 +5461,4 @@ func (a *Agent) shouldClaim(wl *Workload) bool {
 
 	sort.Strings(candidates)
 	return len(candidates) > 0 && candidates[0] == a.hwid
-}
-
-// =============================================================================
-// Encryption
-// =============================================================================
-
-// deriveKey derives a 32-byte AES key from the cluster secret using SHA-256.
-func (a *Agent) deriveKey() []byte {
-	hash := sha256.Sum256([]byte(a.clusterSecret))
-	return hash[:]
-}
-
-// encryptValue encrypts a plaintext value using AES-GCM with the cluster secret.
-// Returns base64-encoded ciphertext.
-func (a *Agent) encryptValue(plaintext string) (string, error) {
-	if a.clusterSecret == "" {
-		return "", fmt.Errorf("cluster secret not configured")
-	}
-
-	key := a.deriveKey()
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", fmt.Errorf("create cipher: %w", err)
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", fmt.Errorf("create GCM: %w", err)
-	}
-
-	// Generate random nonce
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", fmt.Errorf("generate nonce: %w", err)
-	}
-
-	// Encrypt and prepend nonce to ciphertext
-	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
-}
-
-// decryptValue decrypts a base64-encoded ciphertext using AES-GCM with the cluster secret.
-// Returns the plaintext value.
-func (a *Agent) decryptValue(encrypted string) (string, error) {
-	if a.clusterSecret == "" {
-		return "", fmt.Errorf("cluster secret not configured")
-	}
-
-	ciphertext, err := base64.StdEncoding.DecodeString(encrypted)
-	if err != nil {
-		return "", fmt.Errorf("decode base64: %w", err)
-	}
-
-	key := a.deriveKey()
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", fmt.Errorf("create cipher: %w", err)
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", fmt.Errorf("create GCM: %w", err)
-	}
-
-	if len(ciphertext) < gcm.NonceSize() {
-		return "", fmt.Errorf("ciphertext too short")
-	}
-
-	// Extract nonce and decrypt
-	nonce := ciphertext[:gcm.NonceSize()]
-	ciphertext = ciphertext[gcm.NonceSize():]
-
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return "", fmt.Errorf("decrypt: %w", err)
-	}
-
-	return string(plaintext), nil
-}
-
-// getDecryptedEnv returns all environment variables decrypted.
-// Returns a map of key -> decrypted value.
-func (a *Agent) getDecryptedEnv() (map[string]string, error) {
-	a.stateMu.RLock()
-	defer a.stateMu.RUnlock()
-
-	result := make(map[string]string)
-	for key, encrypted := range a.state.EnvData {
-		value, err := a.decryptValue(encrypted)
-		if err != nil {
-			return nil, fmt.Errorf("decrypt %s: %w", key, err)
-		}
-		result[key] = value
-	}
-	return result, nil
-}
-
-// =============================================================================
-// State Persistence
-// =============================================================================
-
-func (a *Agent) saveState() {
-	a.stateMu.RLock()
-	data, _ := json.MarshalIndent(a.state, "", "  ")
-	a.stateMu.RUnlock()
-
-	// Atomic write: write to temp file then rename
-	statePath := filepath.Join(a.dataDir, "state.json")
-	tempPath := statePath + ".tmp"
-
-	if err := os.WriteFile(tempPath, data, 0644); err != nil {
-		log.Printf("Failed to write state: %v", err)
-		return
-	}
-
-	if err := os.Rename(tempPath, statePath); err != nil {
-		log.Printf("Failed to rename state file: %v", err)
-		os.Remove(tempPath) // Clean up temp file
-	}
-}
-
-func (a *Agent) loadState() {
-	data, err := os.ReadFile(filepath.Join(a.dataDir, "state.json"))
-	if err != nil {
-		return
-	}
-
-	a.stateMu.Lock()
-	// Preserve env var CF token if set
-	envCFToken := a.state.CFToken
-
-	json.Unmarshal(data, a.state)
-
-	// Env var takes precedence over saved state
-	if envCFToken != "" && a.state.CFToken == "" {
-		a.state.CFToken = envCFToken
-	}
-
-	// Initialize maps if nil (for backwards compatibility or corrupted state)
-	if a.state.Peers == nil {
-		a.state.Peers = make(map[string]*Peer)
-	}
-	if a.state.Workloads == nil {
-		a.state.Workloads = make(map[string]*Workload)
-	}
-	if a.state.EnvData == nil {
-		a.state.EnvData = make(map[string]string)
-	}
-	if a.state.DeletedWorkloads == nil {
-		a.state.DeletedWorkloads = make(map[string]*DeletedWorkload)
-	}
-	if a.state.DeletedEnvKeys == nil {
-		a.state.DeletedEnvKeys = make(map[string]*DeletedEnvKey)
-	}
-	a.stateMu.Unlock()
-
-	log.Printf("Loaded: %d peers, %d workloads, %d env vars", len(a.state.Peers), len(a.state.Workloads), len(a.state.EnvData))
-}
-
-// =============================================================================
-// Cloudflare Tunnel
-// =============================================================================
-
-// cloudflaredLogFilter filters cloudflared output to only log important messages.
-// This prevents verbose debug output from flooding the logs while still capturing
-// errors, connection status, and other important information.
-type cloudflaredLogFilter struct {
-	prefix string
-}
-
-func (f *cloudflaredLogFilter) Write(p []byte) (n int, err error) {
-	line := strings.TrimSpace(string(p))
-	if line == "" {
-		return len(p), nil
-	}
-
-	// Only log important messages: errors, warnings, connection status
-	// Filter out verbose debug output (INFO level routine messages)
-	if strings.Contains(line, "ERR") ||
-		strings.Contains(line, "WRN") ||
-		strings.Contains(line, "error") ||
-		strings.Contains(line, "failed") ||
-		strings.Contains(line, "Registered") ||
-		strings.Contains(line, "Unregistered") ||
-		strings.Contains(line, "connected") ||
-		strings.Contains(line, "Starting tunnel") {
-		log.Printf("[%s] %s", f.prefix, line)
-	}
-
-	return len(p), nil
-}
-
-// startCloudflared starts the cloudflared tunnel process with the configured token.
-// It runs the tunnel pointing to the local API, providing external access to the cluster.
-// The process is monitored and automatically restarted on failure.
-func (a *Agent) startCloudflared() error {
-	a.cfMu.Lock()
-	defer a.cfMu.Unlock()
-
-	// Check if already running
-	if a.cfCmd != nil && a.cfCmd.Process != nil {
-		return nil
-	}
-
-	a.stateMu.RLock()
-	token := a.state.CFToken
-	a.stateMu.RUnlock()
-
-	if token == "" {
-		return nil // No token configured
-	}
-
-	a.cfStopCh = make(chan struct{})
-
-	// Start cloudflared tunnel with --no-autoupdate to prevent background updates
-	// Note: --no-autoupdate is a global flag and must come before 'tunnel'
-	// Pass token via --token flag (more reliable than TUNNEL_TOKEN env var)
-	a.cfCmd = exec.Command("cloudflared", "--no-autoupdate", "tunnel", "run", "--token", token)
-
-	// Use filtered log writer to capture important messages while suppressing verbose output
-	logFilter := &cloudflaredLogFilter{prefix: "cloudflared"}
-	a.cfCmd.Stdout = logFilter
-	a.cfCmd.Stderr = logFilter
-
-	if err := a.cfCmd.Start(); err != nil {
-		return fmt.Errorf("cloudflared start: %w", err)
-	}
-
-	log.Printf("Cloudflare tunnel started (pid: %d)", a.cfCmd.Process.Pid)
-
-	// Monitor process and restart on failure
-	go a.monitorCloudflared()
-
-	return nil
-}
-
-// stopCloudflared gracefully stops the cloudflared tunnel process.
-func (a *Agent) stopCloudflared() {
-	a.cfMu.Lock()
-	defer a.cfMu.Unlock()
-
-	if a.cfStopCh != nil {
-		close(a.cfStopCh)
-		a.cfStopCh = nil
-	}
-
-	if a.cfCmd != nil && a.cfCmd.Process != nil {
-		a.cfCmd.Process.Signal(os.Interrupt)
-		// Give it 5 seconds to shutdown gracefully
-		done := make(chan struct{})
-		go func() {
-			a.cfCmd.Wait()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			a.cfCmd.Process.Kill()
-		}
-		log.Printf("Cloudflare tunnel stopped")
-	}
-	a.cfCmd = nil
-}
-
-// monitorCloudflared watches the cloudflared process and restarts it if it dies.
-// Uses exponential backoff with a maximum of 10 consecutive failures before giving up.
-func (a *Agent) monitorCloudflared() {
-	const (
-		initialBackoff  = 5 * time.Second
-		maxBackoff      = 2 * time.Minute
-		maxFailures     = 10
-		successReset    = 30 * time.Second // Reset failure count if running for this long
-	)
-
-	backoff := initialBackoff
-	failures := 0
-
-	for {
-		a.cfMu.Lock()
-		cmd := a.cfCmd
-		stopCh := a.cfStopCh
-		a.cfMu.Unlock()
-
-		if cmd == nil {
-			return
-		}
-
-		startTime := time.Now()
-
-		// Wait for process to exit
-		err := cmd.Wait()
-
-		// Check if we were asked to stop
-		select {
-		case <-stopCh:
-			return
-		default:
-		}
-
-		// If process ran for a while, reset the failure counter and backoff
-		if time.Since(startTime) >= successReset {
-			failures = 0
-			backoff = initialBackoff
-		} else {
-			failures++
-		}
-
-		// Check if we've exceeded max failures
-		if failures >= maxFailures {
-			log.Printf("Cloudflare tunnel failed %d times consecutively, giving up. Check your JETTY_CF_TOKEN.", failures)
-			return
-		}
-
-		if err != nil {
-			log.Printf("Cloudflare tunnel exited: %v (attempt %d/%d), restarting in %v...", err, failures, maxFailures, backoff)
-		} else {
-			log.Printf("Cloudflare tunnel exited (attempt %d/%d), restarting in %v...", failures, maxFailures, backoff)
-		}
-
-		time.Sleep(backoff)
-
-		// Exponential backoff: double the wait time for next failure, up to max
-		backoff = backoff * 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
-
-		// Check again if we should stop
-		select {
-		case <-stopCh:
-			return
-		default:
-		}
-
-		// Restart
-		a.cfMu.Lock()
-		a.stateMu.RLock()
-		token := a.state.CFToken
-		a.stateMu.RUnlock()
-
-		if token == "" {
-			a.cfMu.Unlock()
-			return
-		}
-
-		// Note: --no-autoupdate is a global flag and must come before 'tunnel'
-		// Pass token via --token flag (more reliable than TUNNEL_TOKEN env var)
-		a.cfCmd = exec.Command("cloudflared", "--no-autoupdate", "tunnel", "run", "--token", token)
-
-		// Use filtered log writer to capture important messages while suppressing verbose output
-		logFilter := &cloudflaredLogFilter{prefix: "cloudflared"}
-		a.cfCmd.Stdout = logFilter
-		a.cfCmd.Stderr = logFilter
-
-		if err := a.cfCmd.Start(); err != nil {
-			log.Printf("Cloudflare tunnel restart failed: %v", err)
-			a.cfMu.Unlock()
-			return
-		}
-		log.Printf("Cloudflare tunnel restarted (pid: %d)", a.cfCmd.Process.Pid)
-		a.cfMu.Unlock()
-	}
-}
-
-// restartCloudflared stops and starts the tunnel (used when token changes).
-func (a *Agent) restartCloudflared() error {
-	a.stopCloudflared()
-	return a.startCloudflared()
-}
-
-// isTunnelRunning returns true if cloudflared is currently running.
-func (a *Agent) isTunnelRunning() bool {
-	a.cfMu.Lock()
-	defer a.cfMu.Unlock()
-	return a.cfCmd != nil && a.cfCmd.Process != nil
-}
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-// getPeerAPIURL returns the URL to reach a peer's API via WARP.
-func (a *Agent) getPeerAPIURL(peer *Peer, path string) string {
-	// Use WARP IP for direct node-to-node communication
-	if peer.IP != "" {
-		return fmt.Sprintf("http://%s:%d%s", peer.IP, a.apiPort, path)
-	}
-	// Fall back to tunnel domain if peer IP unknown (WARP not yet connected)
-	if a.tunnelDomain != "" {
-		return fmt.Sprintf("https://%s%s", a.tunnelDomain, path)
-	}
-	return ""
-}
-
-// peerRequest creates an HTTP request to a peer with auth headers set.
-func (a *Agent) peerRequest(method, url string, body io.Reader) (*http.Request, error) {
-	req, err := http.NewRequest(method, url, body)
-	if err != nil {
-		return nil, err
-	}
-	if a.clusterSecret != "" {
-		req.Header.Set("X-API-Key", a.clusterSecret)
-	}
-	if method == "POST" || method == "PUT" || method == "PATCH" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	return req, nil
-}
-
-// getTunnelAPIURL returns the Cloudflare tunnel URL for API calls.
-// Returns empty string if not in tunnel-only mode.
-func (a *Agent) getTunnelAPIURL(path string) string {
-	if a.tunnelDomain == "" {
-		return ""
-	}
-	return fmt.Sprintf("https://%s%s", a.tunnelDomain, path)
-}
-
-func getEnv(k, d string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return d
-}
-
-func getEnvInt(k string, d int) int {
-	if v := os.Getenv(k); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			log.Printf("Warning: invalid integer value for %s: %q, using default %d", k, v, d)
-			return d
-		}
-		return n
-	}
-	return d
-}
-
-func getHostname() string {
-	h, _ := os.Hostname()
-	if h == "" {
-		return "node"
-	}
-	return h
-}
-
-func getPublicIP() string {
-	// Allow override via environment variable (useful in containers)
-	if ip := os.Getenv("JETTY_PUBLIC_IP"); ip != "" {
-		return ip
-	}
-
-	// Try external services to get actual public IP (with short timeout)
-	client := &http.Client{Timeout: 3 * time.Second}
-	services := []string{
-		"https://api.ipify.org",
-		"https://ifconfig.me/ip",
-		"https://icanhazip.com",
-	}
-
-	for _, svc := range services {
-		resp, err := client.Get(svc)
-		if err != nil {
-			continue
-		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-		ip := strings.TrimSpace(string(body))
-		// Validate it looks like an IP
-		if parsed := net.ParseIP(ip); parsed != nil {
-			return ip
-		}
-	}
-
-	// Fallback: get outbound IP (local IP used to reach internet)
-	dialer := net.Dialer{Timeout: 2 * time.Second}
-	c, err := dialer.Dial("udp", "8.8.8.8:80")
-	if err == nil {
-		defer c.Close()
-		if addr, ok := c.LocalAddr().(*net.UDPAddr); ok && !addr.IP.IsLoopback() {
-			return addr.IP.String()
-		}
-	}
-
-	// Last resort: find first non-loopback interface IP
-	addrs, err := net.InterfaceAddrs()
-	if err == nil {
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
-				return ipnet.IP.String()
-			}
-		}
-	}
-
-	return "127.0.0.1"
-}
-
-func genID() string {
-	b := make([]byte, 8)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }
