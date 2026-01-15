@@ -69,7 +69,7 @@ ENV JETTY_DATA_DIR=/data
 EXPOSE 8080
 EXPOSE 51820/udp
 
-VOLUME ["/data", "/var/lib/cloudflare-warp"]
+VOLUME ["/data"]
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["jetty"]

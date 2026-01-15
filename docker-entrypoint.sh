@@ -138,6 +138,17 @@ get_warp_token_from_state() {
 
 # Main entrypoint logic
 main() {
+    local data_dir="${JETTY_DATA_DIR:-/data}"
+
+    # Symlink WARP state directory to /data so it persists across container restarts/updates
+    # This prevents duplicate device registrations in Cloudflare Zero Trust dashboard
+    if [ ! -L /var/lib/cloudflare-warp ]; then
+        log "Setting up WARP state directory in $data_dir/warp..."
+        mkdir -p "$data_dir/warp"
+        rm -rf /var/lib/cloudflare-warp
+        ln -s "$data_dir/warp" /var/lib/cloudflare-warp
+    fi
+
     local warp_token=""
 
     # Determine WARP token source:
@@ -209,12 +220,11 @@ cleanup() {
         kill $TUNNEL_PID 2>/dev/null || true
     fi
 
-    # Disconnect, unregister, and stop WARP
+    # Disconnect and stop WARP (don't delete registration - state is persisted in /data/warp)
     if [ -n "$WARP_SVC_PID" ]; then
         log "Disconnecting WARP..."
         warp-cli --accept-tos disconnect 2>/dev/null || true
-        log "Unregistering WARP device from Cloudflare..."
-        warp-cli --accept-tos registration delete 2>/dev/null || true
+        # Registration is preserved in /data/warp and reused on restart
         sleep 1
         kill $WARP_SVC_PID 2>/dev/null || true
     fi
