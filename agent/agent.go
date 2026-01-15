@@ -262,6 +262,9 @@ func (a *Agent) Start() error {
 		a.syncStateOnStartup()
 	}
 
+	// Announce our current IP to peers (handles IP changes during restart/update)
+	go a.announceOurIP()
+
 	// Auto-start owned workloads (only those we still own after sync)
 	a.autostartWorkloads()
 
