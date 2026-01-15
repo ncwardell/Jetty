@@ -243,6 +243,38 @@ func (a *Agent) cleanupOrphanedState() {
 			}
 		}
 	}
+
+	// Clean up any orphaned nftables rules from previous runs
+	// Delete our jetty table if it exists (will be recreated in initWarpRules)
+	exec.Command("nft", "delete", "table", "ip", "jetty").Run()
+
+	// Also clean up any old-style masquerade rules left in the main nat table
+	// These were added before we moved to using our own table
+	a.cleanupLegacyNftRules()
+}
+
+// cleanupLegacyNftRules removes old masquerade rules that were added directly to nat POSTROUTING
+func (a *Agent) cleanupLegacyNftRules() {
+	// Get all rules in nat POSTROUTING chain and remove CloudflareWARP masquerade rules
+	output, err := exec.Command("nft", "-a", "list", "chain", "ip", "nat", "POSTROUTING").CombinedOutput()
+	if err != nil {
+		return // Chain might not exist
+	}
+
+	// Parse output and find handles of CloudflareWARP masquerade rules
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.Contains(line, "CloudflareWARP") && strings.Contains(line, "masquerade") {
+			// Extract handle number from line like: "oifname "CloudflareWARP" masquerade # handle 123"
+			parts := strings.Split(line, "handle")
+			if len(parts) == 2 {
+				handle := strings.TrimSpace(parts[1])
+				if handle != "" {
+					exec.Command("nft", "delete", "rule", "ip", "nat", "POSTROUTING", "handle", handle).Run()
+					log.Printf("Cleaned up legacy nft rule handle %s", handle)
+				}
+			}
+		}
+	}
 }
 
 func (a *Agent) Start() error {
@@ -558,6 +590,9 @@ func (a *Agent) cleanupNetwork() {
 
 	// Clean up userspace tunnel if active
 	a.cleanupUserspaceTunnel()
+
+	// Clean up nftables rules
+	a.cleanupWarpRules()
 
 	// Remove jetty0 interface (this also removes all IPs bound to it)
 	if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
@@ -1179,9 +1214,17 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 // 2. Route for WARP client IP range (100.96.0.0/12)
 // 3. Rules to allow cloudflared QUIC traffic through WARP firewall
 func (a *Agent) initWarpRules() error {
+	// First, clean up any existing Jetty nft rules to avoid duplicates
+	a.cleanupWarpRules()
+
+	// Create Jetty's own nft table for our rules (easier to clean up)
+	exec.Command("nft", "add", "table", "ip", "jetty").Run()
+	exec.Command("nft", "add", "chain", "ip", "jetty", "postrouting",
+		"{ type nat hook postrouting priority srcnat; }").Run()
+
 	// Add masquerade rule for traffic going out through CloudflareWARP
 	// This ensures responses from our mesh IPs route back through WARP
-	if err := exec.Command("nft", "add", "rule", "ip", "nat", "POSTROUTING",
+	if err := exec.Command("nft", "add", "rule", "ip", "jetty", "postrouting",
 		"oifname", "CloudflareWARP", "masquerade").Run(); err != nil {
 		log.Printf("Warning: failed to add WARP masquerade rule: %v", err)
 	}
@@ -1202,8 +1245,14 @@ func (a *Agent) initWarpRules() error {
 		}
 	}
 
-	log.Printf("WARP nft rules initialized")
+	log.Printf("WARP nft rules initialized (table: ip jetty)")
 	return nil
+}
+
+// cleanupWarpRules removes all Jetty nftables rules
+func (a *Agent) cleanupWarpRules() {
+	// Delete our entire table - this removes all our rules cleanly
+	exec.Command("nft", "delete", "table", "ip", "jetty").Run()
 }
 
 // =============================================================================
