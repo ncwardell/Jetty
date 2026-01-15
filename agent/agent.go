@@ -899,16 +899,27 @@ var wsUpgrader = websocket.Upgrader{
 
 // apiTunnelWs handles incoming WebSocket connections for packet tunneling.
 // Peers connect here to send/receive encapsulated IP packets.
+// SECURITY: This endpoint is protected by apiKeyMiddleware (requires JETTY_SECRET).
+// Only authenticated cluster peers can establish tunnel connections.
 func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
+	// Defense-in-depth: verify auth even though middleware should have checked
+	if a.clusterSecret != "" {
+		apiKey := r.Header.Get("X-API-Key")
+		if apiKey != a.clusterSecret {
+			log.Printf("WS tunnel: rejected unauthenticated connection from %s", r.RemoteAddr)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WS tunnel: upgrade failed: %v", err)
 		return
 	}
 
-	// Get peer identity from request (could be from header or we can use remote addr)
 	remoteAddr := r.RemoteAddr
-	log.Printf("WS tunnel: incoming connection from %s", remoteAddr)
+	log.Printf("WS tunnel: authenticated connection from %s", remoteAddr)
 
 	// Handle incoming packets from this peer
 	go func() {
@@ -938,7 +949,24 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 			dstIP := net.IP(packet[16:20])
 			srcIP := net.IP(packet[12:16])
 
-			log.Printf("WS tunnel recv (server): from %s, packet %s -> %s (%d bytes)", remoteAddr, srcIP, dstIP, len(packet))
+			// Security: only accept packets destined for our local workloads
+			// This prevents using the tunnel as an arbitrary packet injection point
+			a.stateMu.RLock()
+			var isLocalWorkload bool
+			for _, wl := range a.state.Workloads {
+				if wl.Owner == a.hwid && wl.IP == dstIP.String() {
+					isLocalWorkload = true
+					break
+				}
+			}
+			a.stateMu.RUnlock()
+
+			if !isLocalWorkload {
+				log.Printf("WS tunnel: rejected packet to non-local IP %s from %s", dstIP, remoteAddr)
+				continue
+			}
+
+			log.Printf("WS tunnel recv: from %s, packet %s -> %s (%d bytes)", remoteAddr, srcIP, dstIP, len(packet))
 
 			// Inject packet into TUN device for local delivery
 			if a.tunDevice != nil {
