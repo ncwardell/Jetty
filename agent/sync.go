@@ -171,14 +171,16 @@ func (a *Agent) syncStateOnStartup() {
 		url := a.getTunnelAPIURL("/api/sync")
 		resp, err := httpClient.Get(url)
 		if err == nil {
-			var syncResp SyncResponse
-			if err := json.NewDecoder(resp.Body).Decode(&syncResp); err == nil {
-				a.stateMu.Lock()
-				a.mergeStartupSyncData(&syncResp)
-				a.stateMu.Unlock()
-				synced = true
-			}
-			resp.Body.Close()
+			func() {
+				defer resp.Body.Close()
+				var syncResp SyncResponse
+				if err := json.NewDecoder(resp.Body).Decode(&syncResp); err == nil {
+					a.stateMu.Lock()
+					a.mergeStartupSyncData(&syncResp)
+					a.stateMu.Unlock()
+					synced = true
+				}
+			}()
 		}
 	}
 
@@ -190,14 +192,16 @@ func (a *Agent) syncStateOnStartup() {
 			continue
 		}
 
-		var syncResp SyncResponse
-		if err := json.NewDecoder(resp.Body).Decode(&syncResp); err == nil {
-			a.stateMu.Lock()
-			a.mergeStartupSyncData(&syncResp)
-			a.stateMu.Unlock()
-			synced = true
-		}
-		resp.Body.Close()
+		func() {
+			defer resp.Body.Close()
+			var syncResp SyncResponse
+			if err := json.NewDecoder(resp.Body).Decode(&syncResp); err == nil {
+				a.stateMu.Lock()
+				a.mergeStartupSyncData(&syncResp)
+				a.stateMu.Unlock()
+				synced = true
+			}
+		}()
 	}
 
 	if synced {
@@ -236,21 +240,22 @@ func (a *Agent) syncWorkloads() {
 			continue
 		}
 
-		var syncResp SyncResponse
-		if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
-			resp.Body.Close()
-			continue
-		}
-		resp.Body.Close()
+		func() {
+			defer resp.Body.Close()
+			var syncResp SyncResponse
+			if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
+				return
+			}
 
-		a.stateMu.Lock()
-		result := a.mergeWorkloadState(&syncResp)
-		a.stateMu.Unlock()
+			a.stateMu.Lock()
+			result := a.mergeWorkloadState(&syncResp)
+			a.stateMu.Unlock()
 
-		allLostOwnership = append(allLostOwnership, result.LostOwnership...)
-		if result.EnvUpdated {
-			anyEnvUpdated = true
-		}
+			allLostOwnership = append(allLostOwnership, result.LostOwnership...)
+			if result.EnvUpdated {
+				anyEnvUpdated = true
+			}
+		}()
 	}
 
 	// Stop workloads we lost ownership of (outside lock)
