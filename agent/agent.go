@@ -942,7 +942,10 @@ func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 		case 1: // ICMP - proxy at application level
 			go a.proxyICMP(tc, packet, srcIP, dstIP, ihl)
 		case 6: // TCP - proxy connections
-			a.proxyTCP(tc, packet, srcIP, dstIP, ihl)
+			// Copy packet data since goroutine may outlive this iteration
+			tcpPacket := make([]byte, len(packet))
+			copy(tcpPacket, packet)
+			go a.proxyTCP(tc, tcpPacket, srcIP, dstIP, ihl)
 		case 17: // UDP - proxy datagrams
 			go a.proxyUDP(tc, packet, srcIP, dstIP, ihl)
 		default:
