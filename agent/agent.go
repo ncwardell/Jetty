@@ -227,8 +227,19 @@ func (a *Agent) Start() error {
 		log.Printf("Warning: failed to start cloudflared: %v", err)
 	}
 
-	// Start gossip
-	go a.gossipLoop()
+	// Initialize memberlist for cluster membership and failure detection
+	ml, err := a.initMemberlist()
+	if err != nil {
+		log.Printf("Warning: memberlist init failed: %v - falling back to HTTP gossip", err)
+		// Fall back to HTTP-based gossip if memberlist fails
+		go a.gossipLoop()
+	} else {
+		a.memberlist = ml
+		// Join known peers
+		a.joinMemberlistPeers()
+		// Start sync loop (for periodic full state sync, tombstone GC)
+		go a.memberlistSyncLoop()
+	}
 
 	// Start failover monitor
 	go a.failoverLoop()
@@ -323,7 +334,10 @@ func (a *Agent) ipMonitorLoop() {
 			a.ip = newIP
 			log.Printf("WARP IP changed: %s -> %s", oldIP, newIP)
 
-			// Re-announce our new IP to all peers
+			// Notify memberlist of IP change (if using memberlist)
+			a.updateMemberlistIP(newIP)
+
+			// Re-announce our new IP to all peers (for HTTP-based gossip fallback)
 			go a.announceOurIP()
 
 			// Update IPIP tunnels (they use our local IP)
@@ -5396,15 +5410,27 @@ func (a *Agent) checkFailover() {
 		}
 
 		// Check if owner is dead
-		owner := a.state.Peers[wl.Owner]
 		if wl.Owner == a.hwid {
 			continue // We own it
 		}
-		if owner != nil && owner.Healthy {
-			continue // Owner is alive
+
+		// Use memberlist for health check if available (faster, more accurate)
+		ownerHealthy := false
+		if a.memberlist != nil {
+			ownerHealthy = a.isPeerHealthyInMemberlist(wl.Owner)
+		} else {
+			// Fallback to stored peer state
+			owner := a.state.Peers[wl.Owner]
+			if owner != nil && owner.Healthy {
+				ownerHealthy = true
+			}
+			if owner != nil && time.Since(owner.LastSeen) < 45*time.Second {
+				ownerHealthy = true // Recently seen (3 missed heartbeats + buffer)
+			}
 		}
-		if owner != nil && time.Since(owner.LastSeen) < 45*time.Second {
-			continue // Recently seen (3 missed heartbeats + buffer)
+
+		if ownerHealthy {
+			continue // Owner is alive
 		}
 
 		// Owner is dead - should we claim?
@@ -5430,7 +5456,12 @@ func (a *Agent) checkFailover() {
 				}
 				a.updateHosts()
 				a.saveState()
-				a.broadcastState()
+				// Broadcast via memberlist if available, otherwise use HTTP
+				if a.memberlist != nil {
+					a.broadcastWorkloadUpdate(w)
+				} else {
+					a.broadcastState()
+				}
 			}(wl, oldOwner, oldVersion)
 		}
 	}
@@ -5453,9 +5484,23 @@ func (a *Agent) shouldClaim(wl *Workload) bool {
 	candidates = append(candidates, a.hwid)
 
 	// Add healthy peers that are allowed (and have compatible architecture)
-	for _, p := range a.state.Peers {
-		if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name, p.Arch) {
-			candidates = append(candidates, p.ID)
+	// Use memberlist for health checks if available (faster, more accurate)
+	if a.memberlist != nil {
+		for _, node := range a.memberlist.Members() {
+			if node.Name == a.hwid {
+				continue // Skip self (already added)
+			}
+			meta := parseNodeMeta(node.Meta)
+			if meta != nil && a.isNodeAllowed(wl, meta.ID, meta.Name, meta.Arch) {
+				candidates = append(candidates, meta.ID)
+			}
+		}
+	} else {
+		// Fallback to stored peer state
+		for _, p := range a.state.Peers {
+			if p.Healthy && a.isNodeAllowed(wl, p.ID, p.Name, p.Arch) {
+				candidates = append(candidates, p.ID)
+			}
 		}
 	}
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/hashicorp/memberlist"
 	"github.com/songgao/water"
 )
 
@@ -190,6 +191,10 @@ type Agent struct {
 	tunPeerIPs   sync.Map         // peerID -> string (peer WARP IP for tunnel)
 	tunConnMu    sync.Mutex       // Protects WebSocket connection establishment
 	tunTCPConns  sync.Map         // flowKey -> *tcpProxyConn (active TCP proxy connections)
+
+	// Memberlist (cluster membership and failure detection)
+	memberlist *memberlist.Memberlist
+	mlDelegate *jettyDelegate
 
 	stopCh chan struct{}
 }
