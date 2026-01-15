@@ -65,25 +65,35 @@ WARP does not forward ICMP traffic (ping), only TCP/UDP. This has significant de
 
 ## State Synchronization
 
-### The Gossip Protocol
+### Memberlist (SWIM Protocol)
 
-Located in: `agent/agent.go:5140` (`gossipLoop`)
+Located in: `agent/memberlist.go`
 
-Every 10 seconds, each node:
-1. Sends health checks to all known peers
-2. Pulls state from healthy peers via `/api/sync`
-3. Merges incoming state with local state
+Jetty uses [HashiCorp's memberlist](https://github.com/hashicorp/memberlist) library which implements the SWIM protocol for cluster membership and failure detection.
 
-**Why gossip instead of consensus (Raft/Paxos)?**
+**Key benefits over custom HTTP-based gossip:**
 
-- **Simplicity**: No leader election, no log replication
-- **Availability over consistency**: System stays available during partitions
-- **Scale**: O(n) messages per round vs O(n²) for consensus
-- **Failure tolerance**: Continues working with any single node alive
+| Aspect | Custom Gossip (old) | Memberlist (current) |
+|--------|---------------------|----------------------|
+| Failure detection | 45 seconds (3 missed heartbeats) | ~2-3 seconds (SWIM protocol) |
+| Message complexity | O(n) per node | O(log n) per node |
+| Protocol | Pull-based HTTP | Push/pull with protocol-optimized timing |
+| Battle-tested | No | Yes (Consul, Nomad, Serf) |
 
-**Trade-off accepted:**
-- Updates may take multiple gossip rounds to propagate
-- Conflicting updates resolved by "highest version wins"
+**How it works:**
+
+1. **Node discovery**: When a node starts, it joins known peers via memberlist
+2. **Failure detection**: SWIM protocol uses indirect probes - if node A can't reach B, it asks C to try
+3. **State propagation**: Workload updates are broadcast via memberlist's gossip layer
+4. **Full sync**: Periodic full state sync catches any missed broadcasts
+
+**Fallback behavior:**
+
+If memberlist initialization fails (e.g., port already in use), Jetty falls back to the original HTTP-based gossip protocol for backwards compatibility.
+
+**Port usage:**
+- Memberlist uses port 6881 (UDP and TCP) for gossip protocol
+- API port 6880 still used for full state sync and workload proxying
 
 ### The Merge Algorithm
 
