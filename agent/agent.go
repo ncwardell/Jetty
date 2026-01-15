@@ -89,6 +89,12 @@ type DeletedWorkload struct {
 	Version int64  `json:"version"` // Timestamp when deleted (must be > workload version to take effect)
 }
 
+// DeletedEnvKey represents a tombstone for a deleted environment variable to propagate deletions
+type DeletedEnvKey struct {
+	Key     string `json:"key"`     // The name of the deleted env key
+	Version int64  `json:"version"` // Timestamp when deleted
+}
+
 type State struct {
 	Peers            map[string]*Peer            `json:"peers"`                       // ID -> Peer
 	Workloads        map[string]*Workload        `json:"workloads"`                   // IP -> Workload
@@ -96,6 +102,7 @@ type State struct {
 	CFToken          string                      `json:"cf_token,omitempty"`          // Cloudflare tunnel token (shared cluster-wide)
 	WarpToken        string                      `json:"warp_token,omitempty"`        // Cloudflare WARP connector token (shared cluster-wide)
 	EnvData          map[string]string           `json:"env_data,omitempty"`          // Encrypted environment variables (key -> encrypted value)
+	DeletedEnvKeys   map[string]*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`  // Key -> tombstone (for sync propagation)
 }
 
 // =============================================================================
@@ -4510,6 +4517,10 @@ func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 	for k, v := range a.state.EnvData {
 		envData[k] = v
 	}
+	deletedEnvKeys := make([]*DeletedEnvKey, 0, len(a.state.DeletedEnvKeys))
+	for _, dek := range a.state.DeletedEnvKeys {
+		deletedEnvKeys = append(deletedEnvKeys, dek)
+	}
 	a.stateMu.RUnlock()
 
 	// Return sync response with workloads, tombstones, and env data
@@ -4521,6 +4532,9 @@ func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(envData) > 0 {
 		resp["env_data"] = envData
+	}
+	if len(deletedEnvKeys) > 0 {
+		resp["deleted_env_keys"] = deletedEnvKeys
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -4757,6 +4771,11 @@ func (a *Agent) apiDeleteEnv(w http.ResponseWriter, r *http.Request) {
 	_, exists := a.state.EnvData[key]
 	if exists {
 		delete(a.state.EnvData, key)
+		// Create tombstone to propagate deletion across cluster
+		a.state.DeletedEnvKeys[key] = &DeletedEnvKey{
+			Key:     key,
+			Version: time.Now().Unix(),
+		}
 	}
 	a.stateMu.Unlock()
 
@@ -4768,7 +4787,7 @@ func (a *Agent) apiDeleteEnv(w http.ResponseWriter, r *http.Request) {
 	a.saveState()
 
 	w.WriteHeader(204)
-	log.Printf("Env deleted: %s", key)
+	log.Printf("Env deleted: %s, created tombstone for sync propagation", key)
 }
 
 func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
@@ -5296,17 +5315,24 @@ func (a *Agent) gcTombstones() {
 	cutoff := time.Now().Unix() - 3600 // 1 hour ago
 
 	a.stateMu.Lock()
-	removed := 0
+	removedWorkloads := 0
 	for ip, dw := range a.state.DeletedWorkloads {
 		if dw.Version < cutoff {
 			delete(a.state.DeletedWorkloads, ip)
-			removed++
+			removedWorkloads++
+		}
+	}
+	removedEnvKeys := 0
+	for key, dek := range a.state.DeletedEnvKeys {
+		if dek.Version < cutoff {
+			delete(a.state.DeletedEnvKeys, key)
+			removedEnvKeys++
 		}
 	}
 	a.stateMu.Unlock()
 
-	if removed > 0 {
-		log.Printf("GC: removed %d old tombstones", removed)
+	if removedWorkloads > 0 || removedEnvKeys > 0 {
+		log.Printf("GC: removed %d workload tombstones, %d env key tombstones", removedWorkloads, removedEnvKeys)
 		a.saveState()
 	}
 }
@@ -5449,6 +5475,7 @@ func (a *Agent) syncStateOnStartup() {
 				Workloads        []*Workload        `json:"workloads"`
 				DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
 				EnvData          map[string]string  `json:"env_data,omitempty"`
+				DeletedEnvKeys   []*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`
 			}
 			json.NewDecoder(resp.Body).Decode(&syncResp)
 			resp.Body.Close()
@@ -5483,8 +5510,23 @@ func (a *Agent) syncStateOnStartup() {
 					}
 				}
 			}
-			// Merge env data from peer
+			// Process deleted env keys (tombstones) first
+			for _, dek := range syncResp.DeletedEnvKeys {
+				existingTombstone := a.state.DeletedEnvKeys[dek.Key]
+				if existingTombstone == nil || dek.Version > existingTombstone.Version {
+					a.state.DeletedEnvKeys[dek.Key] = dek
+				}
+				if _, exists := a.state.EnvData[dek.Key]; exists {
+					log.Printf("Startup sync: env key %s was deleted while we were down", dek.Key)
+					delete(a.state.EnvData, dek.Key)
+				}
+			}
+			// Merge env data from peer (only if not tombstoned)
 			for k, v := range syncResp.EnvData {
+				tombstone := a.state.DeletedEnvKeys[k]
+				if tombstone != nil {
+					continue
+				}
 				a.state.EnvData[k] = v
 			}
 			a.stateMu.Unlock()
@@ -5504,6 +5546,7 @@ func (a *Agent) syncStateOnStartup() {
 			Workloads        []*Workload        `json:"workloads"`
 			DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
 			EnvData          map[string]string  `json:"env_data,omitempty"`
+			DeletedEnvKeys   []*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`
 		}
 		json.NewDecoder(resp.Body).Decode(&syncResp)
 		resp.Body.Close()
@@ -5538,8 +5581,23 @@ func (a *Agent) syncStateOnStartup() {
 				}
 			}
 		}
-		// Merge env data from peer
+		// Process deleted env keys (tombstones) first
+		for _, dek := range syncResp.DeletedEnvKeys {
+			existingTombstone := a.state.DeletedEnvKeys[dek.Key]
+			if existingTombstone == nil || dek.Version > existingTombstone.Version {
+				a.state.DeletedEnvKeys[dek.Key] = dek
+			}
+			if _, exists := a.state.EnvData[dek.Key]; exists {
+				log.Printf("Startup sync: env key %s was deleted while we were down", dek.Key)
+				delete(a.state.EnvData, dek.Key)
+			}
+		}
+		// Merge env data from peer (only if not tombstoned)
 		for k, v := range syncResp.EnvData {
+			tombstone := a.state.DeletedEnvKeys[k]
+			if tombstone != nil {
+				continue
+			}
 			a.state.EnvData[k] = v
 		}
 		a.stateMu.Unlock()
@@ -5585,6 +5643,7 @@ func (a *Agent) syncWorkloads() {
 			Workloads        []*Workload        `json:"workloads"`
 			DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
 			EnvData          map[string]string  `json:"env_data,omitempty"`
+			DeletedEnvKeys   []*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`
 		}
 		json.NewDecoder(resp.Body).Decode(&syncResp)
 		resp.Body.Close()
@@ -5630,8 +5689,24 @@ func (a *Agent) syncWorkloads() {
 				}
 			}
 		}
-		// Merge env data from peer (env data is eventually consistent - accept all keys)
+		// Process deleted env keys (tombstones) first
+		for _, dek := range syncResp.DeletedEnvKeys {
+			existingTombstone := a.state.DeletedEnvKeys[dek.Key]
+			if existingTombstone == nil || dek.Version > existingTombstone.Version {
+				a.state.DeletedEnvKeys[dek.Key] = dek
+			}
+			if _, exists := a.state.EnvData[dek.Key]; exists {
+				log.Printf("Sync: removing env key %s - deleted by peer", dek.Key)
+				delete(a.state.EnvData, dek.Key)
+				envUpdated = true
+			}
+		}
+		// Merge env data from peer (only if not tombstoned)
 		for k, v := range syncResp.EnvData {
+			tombstone := a.state.DeletedEnvKeys[k]
+			if tombstone != nil {
+				continue
+			}
 			if a.state.EnvData[k] != v {
 				a.state.EnvData[k] = v
 				envUpdated = true
@@ -5668,6 +5743,7 @@ func (a *Agent) tunnelModeSyncWorkloads() {
 		Workloads        []*Workload        `json:"workloads"`
 		DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
 		EnvData          map[string]string  `json:"env_data,omitempty"`
+		DeletedEnvKeys   []*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
 		return
@@ -5717,8 +5793,24 @@ func (a *Agent) tunnelModeSyncWorkloads() {
 			}
 		}
 	}
-	// Merge env data from peer (env data is eventually consistent - accept all keys)
+	// Process deleted env keys (tombstones) first
+	for _, dek := range syncResp.DeletedEnvKeys {
+		existingTombstone := a.state.DeletedEnvKeys[dek.Key]
+		if existingTombstone == nil || dek.Version > existingTombstone.Version {
+			a.state.DeletedEnvKeys[dek.Key] = dek
+		}
+		if _, exists := a.state.EnvData[dek.Key]; exists {
+			log.Printf("Sync: removing env key %s - deleted by peer", dek.Key)
+			delete(a.state.EnvData, dek.Key)
+			envUpdated = true
+		}
+	}
+	// Merge env data from peer (only if not tombstoned)
 	for k, v := range syncResp.EnvData {
+		tombstone := a.state.DeletedEnvKeys[k]
+		if tombstone != nil {
+			continue
+		}
 		if a.state.EnvData[k] != v {
 			a.state.EnvData[k] = v
 			envUpdated = true
@@ -6074,6 +6166,9 @@ func (a *Agent) loadState() {
 	}
 	if a.state.DeletedWorkloads == nil {
 		a.state.DeletedWorkloads = make(map[string]*DeletedWorkload)
+	}
+	if a.state.DeletedEnvKeys == nil {
+		a.state.DeletedEnvKeys = make(map[string]*DeletedEnvKey)
 	}
 	a.stateMu.Unlock()
 
