@@ -150,10 +150,11 @@ type Agent struct {
 	ipipWarnedPeersMu sync.Mutex
 
 	// Userspace tunnel (fallback when kernel IPIP/GRE not available)
-	tunDevice    *water.Interface // TUN device for capturing workload traffic
-	tunPeerConns sync.Map         // peerID -> *websocket.Conn (outgoing connections to peers)
-	tunPeerIPs   sync.Map         // peerID -> string (peer WARP IP for tunnel)
-	tunConnMu    sync.Mutex       // Protects WebSocket connection establishment
+	tunDevice       *water.Interface // TUN device for capturing workload traffic
+	tunPeerConns    sync.Map         // peerID -> *websocket.Conn (outgoing connections to peers)
+	tunPeerIPs      sync.Map         // peerID -> string (peer WARP IP for tunnel)
+	tunConnMu       sync.Mutex       // Protects WebSocket connection establishment
+	tunProxyRoutes  sync.Map         // srcIP -> *websocket.Conn (for TCP/UDP response routing)
 
 	stopCh chan struct{}
 }
@@ -756,6 +757,7 @@ func (a *Agent) initUserspaceTunnel() error {
 }
 
 // tunReadLoop reads packets from TUN device and sends them via WebSocket to the appropriate peer.
+// This handles both outgoing traffic (to remote workloads) and response traffic (back to tunnel sources).
 func (a *Agent) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -775,16 +777,29 @@ func (a *Agent) tunReadLoop() {
 			continue // Too small to be valid IP packet
 		}
 
-		packet := buf[:n]
+		packet := make([]byte, n)
+		copy(packet, buf[:n])
+
 		if packet[0]>>4 != 4 {
 			continue // Not IPv4
 		}
 		dstIP := net.IP(packet[16:20])
 		srcIP := net.IP(packet[12:16])
 
-		// Check workload routes for outgoing traffic to remote workloads
+		// First check: is this a response to a tunneled request? (TCP/UDP responses)
+		dstIPStr := dstIP.String()
+		if connVal, ok := a.tunProxyRoutes.Load(dstIPStr); ok {
+			conn := connVal.(*websocket.Conn)
+			log.Printf("WS tunnel response: %s -> %s (%d bytes)", srcIP, dstIP, n)
+			if err := conn.WriteMessage(websocket.BinaryMessage, packet); err != nil {
+				log.Printf("WS tunnel response: send failed: %v", err)
+			}
+			continue
+		}
+
+		// Second check: is this outgoing traffic to a remote workload?
 		a.workloadRoutesMu.Lock()
-		ownerID := a.workloadRoutes[dstIP.String()]
+		ownerID := a.workloadRoutes[dstIPStr]
 		a.workloadRoutesMu.Unlock()
 
 		if ownerID == "" {
@@ -918,6 +933,14 @@ func (a *Agent) cleanupUserspaceTunnel() {
 		return true
 	})
 
+	// Remove all proxy routes (source IPs we added routes for)
+	a.tunProxyRoutes.Range(func(key, value interface{}) bool {
+		if ip, ok := key.(string); ok {
+			exec.Command("ip", "route", "del", ip+"/32", "dev", "jetty_tun").Run()
+		}
+		return true
+	})
+
 	if a.tunDevice != nil {
 		a.tunDevice.Close()
 		exec.Command("ip", "link", "del", "jetty_tun").Run()
@@ -1014,10 +1037,13 @@ func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 		}
 		protocol := packet[9]
 
-		// Handle ICMP (protocol 1)
-		if protocol == 1 {
+		// Handle by protocol
+		switch protocol {
+		case 1: // ICMP - proxy at application level
 			go a.proxyICMP(conn, packet, srcIP, dstIP, ihl)
-		} else {
+		case 6, 17: // TCP (6) and UDP (17) - inject into TUN with response routing
+			go a.proxyTCPUDP(conn, packet, srcIP, dstIP, protocol)
+		default:
 			log.Printf("WS tunnel proxy: unsupported protocol %d", protocol)
 		}
 	}
@@ -1100,6 +1126,36 @@ func (a *Agent) proxyICMP(conn *websocket.Conn, origPacket []byte, origSrc, dstI
 	// Send response back through WebSocket
 	if err := conn.WriteMessage(websocket.BinaryMessage, respPacket); err != nil {
 		log.Printf("WS tunnel proxy: failed to send response: %v", err)
+	}
+}
+
+// proxyTCPUDP handles TCP and UDP packets by injecting into TUN and routing responses back.
+func (a *Agent) proxyTCPUDP(conn *websocket.Conn, packet []byte, srcIP, dstIP net.IP, protocol byte) {
+	protoName := "TCP"
+	if protocol == 17 {
+		protoName = "UDP"
+	}
+
+	srcIPStr := srcIP.String()
+
+	// Add route for source IP so responses come back through TUN
+	if _, exists := a.tunProxyRoutes.Load(srcIPStr); !exists {
+		if err := exec.Command("ip", "route", "add", srcIPStr+"/32", "dev", "jetty_tun").Run(); err != nil {
+			// Route may already exist, that's fine
+			log.Printf("WS tunnel proxy: route add for %s: %v", srcIPStr, err)
+		} else {
+			log.Printf("WS tunnel proxy: added response route for %s", srcIPStr)
+		}
+	}
+	a.tunProxyRoutes.Store(srcIPStr, conn)
+
+	log.Printf("WS tunnel proxy %s: %s -> %s", protoName, srcIP, dstIP)
+
+	// Inject packet into TUN for local delivery to workload
+	if a.tunDevice != nil {
+		if _, err := a.tunDevice.Write(packet); err != nil {
+			log.Printf("WS tunnel proxy: TUN write failed: %v", err)
+		}
 	}
 }
 
