@@ -625,7 +625,7 @@ func (a *Agent) initNetwork() error {
 	// Try IPIP first (most efficient), then GRE as fallback
 	a.tunnelMode = a.detectTunnelMode()
 	if a.tunnelMode == "" {
-		log.Printf("Warning: IPIP tunnels not available (kernel module not loaded) - cross-node workload routing disabled")
+		log.Printf("Warning: IPIP/GRE tunnels not available (kernel module not loaded) - using direct WARP routing fallback")
 	}
 
 	log.Printf("Network ready: %s (WARP), workload interface: jetty0", a.ip)
@@ -1027,6 +1027,7 @@ func (a *Agent) updateHosts() {
 
 // updateWorkloadRoutes adds/removes routes for remote workloads.
 // Routes go through IPIP/GRE tunnels to the owner node, which then DNATs to the container.
+// If tunnels aren't available, falls back to direct WARP routing (requires WARP to route 10.100.x.x).
 // This must be called with stateMu held (at least RLock).
 func (a *Agent) updateWorkloadRoutes() {
 	// Skip if WARP is not connected
@@ -1034,34 +1035,34 @@ func (a *Agent) updateWorkloadRoutes() {
 		return
 	}
 
-	// Skip if no tunnel mode available (no routes possible)
-	if a.tunnelMode == "" {
-		return
-	}
-
-	// IMPORTANT: Ensure tunnels exist to ALL healthy peers, not just workload owners.
+	// If tunnel mode is available, ensure tunnels exist to ALL healthy peers
 	// IPIP/GRE requires bidirectional tunnels - if peer A routes to peer B, peer B needs a
 	// tunnel back to A for decapsulation. By creating tunnels to all peers, any node
 	// can receive encapsulated traffic from any other node.
-	for _, peer := range a.state.Peers {
-		if peer.IP != "" && peer.Healthy {
-			if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
-				log.Printf("Warning: failed to create tunnel to %s: %v", peer.Name, err)
+	if a.tunnelMode != "" {
+		for _, peer := range a.state.Peers {
+			if peer.IP != "" && peer.Healthy {
+				if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
+					log.Printf("Warning: failed to create tunnel to %s: %v", peer.Name, err)
+				}
 			}
 		}
 	}
 
-	// Build map of desired routes: workload IP -> owner ID
-	desiredRoutes := make(map[string]string) // wlIP -> ownerID
+	// Build map of desired routes: workload IP -> owner peer
+	type routeInfo struct {
+		ownerID string
+		ownerIP string
+	}
+	desiredRoutes := make(map[string]routeInfo) // wlIP -> routeInfo
 	for _, wl := range a.state.Workloads {
 		if wl.Owner == a.hwid {
 			// Local workload - no route needed (handled by local iptables)
 			continue
 		}
 		// Find owner peer - only route through healthy peers with IPs
-		// (tunnels already ensured above for all healthy peers)
 		if peer, ok := a.state.Peers[wl.Owner]; ok && peer.IP != "" && peer.Healthy {
-			desiredRoutes[wl.IP] = peer.ID
+			desiredRoutes[wl.IP] = routeInfo{ownerID: peer.ID, ownerIP: peer.IP}
 		}
 	}
 
@@ -1070,27 +1071,41 @@ func (a *Agent) updateWorkloadRoutes() {
 
 	// Remove stale routes (routes that are no longer needed)
 	for wlIP, ownerID := range a.workloadRoutes {
-		if desiredOwnerID, ok := desiredRoutes[wlIP]; !ok || desiredOwnerID != ownerID {
+		if desired, ok := desiredRoutes[wlIP]; !ok || desired.ownerID != ownerID {
 			// Route no longer needed or owner changed - remove it
 			exec.Command("ip", "route", "del", wlIP+"/32").Run()
 			delete(a.workloadRoutes, wlIP)
-			log.Printf("Removed route for %s (was via tunnel to %s)", wlIP, ownerID[:8])
+			log.Printf("Removed route for %s (was via %s)", wlIP, ownerID[:8])
 		}
 	}
 
-	// Add new routes through IPIP tunnels
-	for wlIP, ownerID := range desiredRoutes {
-		if existingOwner, ok := a.workloadRoutes[wlIP]; ok && existingOwner == ownerID {
+	// Add new routes
+	for wlIP, info := range desiredRoutes {
+		if existingOwner, ok := a.workloadRoutes[wlIP]; ok && existingOwner == info.ownerID {
 			// Route already exists with correct owner
 			continue
 		}
-		// Route workload IP through the tunnel to owner
-		tunName := a.getTunnelName(ownerID)
-		if err := exec.Command("ip", "route", "add", wlIP+"/32", "dev", tunName).Run(); err == nil {
-			a.workloadRoutes[wlIP] = ownerID
-			log.Printf("Added route for %s via tunnel %s", wlIP, tunName)
+
+		var err error
+		var routeDesc string
+
+		if a.tunnelMode != "" {
+			// Route through IPIP/GRE tunnel
+			tunName := a.getTunnelName(info.ownerID)
+			err = exec.Command("ip", "route", "add", wlIP+"/32", "dev", tunName).Run()
+			routeDesc = "tunnel " + tunName
 		} else {
-			log.Printf("Warning: failed to add route for %s via %s: %v", wlIP, tunName, err)
+			// Fallback: route directly through WARP interface
+			// This works if WARP is configured to route 10.100.x.x traffic
+			err = exec.Command("ip", "route", "add", wlIP+"/32", "via", info.ownerIP, "dev", "CloudflareWARP").Run()
+			routeDesc = "WARP via " + info.ownerIP
+		}
+
+		if err == nil {
+			a.workloadRoutes[wlIP] = info.ownerID
+			log.Printf("Added route for %s via %s", wlIP, routeDesc)
+		} else {
+			log.Printf("Warning: failed to add route for %s via %s: %v", wlIP, routeDesc, err)
 		}
 	}
 }
