@@ -634,9 +634,15 @@ func (a *Agent) initNetwork() error {
 	// Try IPIP first (most efficient), then GRE as fallback
 	a.tunnelMode = a.detectTunnelMode()
 	if a.tunnelMode == "" {
-		log.Printf("Warning: IPIP/GRE tunnels not available (kernel module not loaded) - trying userspace tunnel")
-		if err := a.initUserspaceTunnel(); err != nil {
-			log.Printf("Warning: userspace tunnel also failed: %v - cross-node workload routing disabled", err)
+		log.Printf("IPIP/GRE tunnels not available - will use userspace tunnel for sending")
+	}
+
+	// ALWAYS start userspace tunnel listener - even if we have IPIP for sending,
+	// we need to receive packets from peers that don't have IPIP (e.g., ChromeOS)
+	if err := a.initUserspaceTunnel(); err != nil {
+		log.Printf("Warning: userspace tunnel failed: %v", err)
+		if a.tunnelMode == "" {
+			log.Printf("Warning: no tunnel mode available - cross-node workload routing disabled")
 		}
 	}
 
