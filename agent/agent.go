@@ -123,6 +123,8 @@ type Agent struct {
 	startTime            time.Time // When Jetty started (for uptime tracking)
 	lastHeartbeatErrLog  time.Time // Last time we logged a heartbeat error (to reduce spam)
 	publicIP             string    // Cached public IP (set at startup to avoid slow lookups)
+	cachedCPUPercent     float64   // Cached CPU usage (updated by background goroutine)
+	cachedCPUMu          sync.RWMutex
 
 	// Route management
 	workloadRoutes   map[string]string // workload IP -> owner WARP IP (for remote workloads)
@@ -282,6 +284,9 @@ func (a *Agent) Start() error {
 
 	// Start IP monitor (detects WARP IP changes and re-announces)
 	go a.ipMonitorLoop()
+
+	// Start CPU sampling (background updates for accurate metrics)
+	go a.cpuSampleLoop()
 
 	mode := "warp (" + a.ip + ")"
 	if a.tunnelDomain != "" {
@@ -3229,6 +3234,58 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// cpuSampleLoop runs in the background and continuously samples CPU usage.
+// This provides accurate CPU metrics without blocking API requests.
+func (a *Agent) cpuSampleLoop() {
+	getCPUTimes := func() (idle, total uint64) {
+		if data, err := os.ReadFile("/proc/stat"); err == nil {
+			lines := strings.Split(string(data), "\n")
+			if len(lines) > 0 && strings.HasPrefix(lines[0], "cpu ") {
+				fields := strings.Fields(lines[0])
+				if len(fields) >= 5 {
+					var sum uint64
+					for i := 1; i < len(fields); i++ {
+						val, _ := strconv.ParseUint(fields[i], 10, 64)
+						sum += val
+						// idle (field 4) and iowait (field 5) = CPU not working
+						if i == 4 || i == 5 {
+							idle += val
+						}
+					}
+					total = sum
+				}
+			}
+		}
+		return
+	}
+
+	// Sample every 2 seconds for smooth, accurate readings
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	var lastIdle, lastTotal uint64
+	lastIdle, lastTotal = getCPUTimes()
+
+	for {
+		select {
+		case <-ticker.C:
+			idle, total := getCPUTimes()
+			if total > lastTotal {
+				idleDelta := float64(idle - lastIdle)
+				totalDelta := float64(total - lastTotal)
+				cpuPercent := (1.0 - idleDelta/totalDelta) * 100
+
+				a.cachedCPUMu.Lock()
+				a.cachedCPUPercent = cpuPercent
+				a.cachedCPUMu.Unlock()
+			}
+			lastIdle, lastTotal = idle, total
+		case <-a.stopCh:
+			return
+		}
+	}
+}
+
 // getSystemStats returns CPU, memory, and disk statistics for the node
 func (a *Agent) getSystemStats() map[string]interface{} {
 	stats := make(map[string]interface{})
@@ -3269,38 +3326,11 @@ func (a *Agent) getSystemStats() map[string]interface{} {
 		}
 	}
 
-	// Get CPU usage from /proc/stat (calculate over a brief interval)
-	getCPUTimes := func() (idle, total uint64) {
-		if data, err := os.ReadFile("/proc/stat"); err == nil {
-			lines := strings.Split(string(data), "\n")
-			if len(lines) > 0 && strings.HasPrefix(lines[0], "cpu ") {
-				fields := strings.Fields(lines[0])
-				if len(fields) >= 5 {
-					var sum uint64
-					for i := 1; i < len(fields); i++ {
-						val, _ := strconv.ParseUint(fields[i], 10, 64)
-						sum += val
-						if i == 4 { // idle is 4th field (index 4)
-							idle = val
-						}
-					}
-					total = sum
-				}
-			}
-		}
-		return
-	}
-
-	idle1, total1 := getCPUTimes()
-	time.Sleep(100 * time.Millisecond) // Brief sample period
-	idle2, total2 := getCPUTimes()
-
-	if total2 > total1 {
-		idleDelta := float64(idle2 - idle1)
-		totalDelta := float64(total2 - total1)
-		cpuPercent := (1.0 - idleDelta/totalDelta) * 100
-		stats["cpu_percent"] = fmt.Sprintf("%.1f%%", cpuPercent)
-	}
+	// Get cached CPU usage (updated by background cpuSampleLoop)
+	a.cachedCPUMu.RLock()
+	cpuPercent := a.cachedCPUPercent
+	a.cachedCPUMu.RUnlock()
+	stats["cpu_percent"] = fmt.Sprintf("%.1f%%", cpuPercent)
 
 	// Get load average
 	if loadAvg, err := os.ReadFile("/proc/loadavg"); err == nil {
@@ -4820,7 +4850,32 @@ func getPublicIP() string {
 		return ip
 	}
 
-	// Try to determine IP by dialing out (with timeout to prevent hangs)
+	// Try external services to get actual public IP (with short timeout)
+	client := &http.Client{Timeout: 3 * time.Second}
+	services := []string{
+		"https://api.ipify.org",
+		"https://ifconfig.me/ip",
+		"https://icanhazip.com",
+	}
+
+	for _, svc := range services {
+		resp, err := client.Get(svc)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		ip := strings.TrimSpace(string(body))
+		// Validate it looks like an IP
+		if parsed := net.ParseIP(ip); parsed != nil {
+			return ip
+		}
+	}
+
+	// Fallback: get outbound IP (local IP used to reach internet)
 	dialer := net.Dialer{Timeout: 2 * time.Second}
 	c, err := dialer.Dial("udp", "8.8.8.8:80")
 	if err == nil {
@@ -4830,7 +4885,7 @@ func getPublicIP() string {
 		}
 	}
 
-	// Fallback: find first non-loopback interface IP
+	// Last resort: find first non-loopback interface IP
 	addrs, err := net.InterfaceAddrs()
 	if err == nil {
 		for _, addr := range addrs {
