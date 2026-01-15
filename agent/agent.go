@@ -3066,6 +3066,10 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 			// Try to restart old container as fallback
 			log.Printf("Attempting to restart old container as fallback...")
 			exec.Command("docker", "start", containerID).Run()
+		} else {
+			// New container started successfully - remove the old one
+			log.Printf("Removing old container %s", containerID)
+			exec.Command("docker", "rm", containerID).Run()
 		}
 
 		// If we get here and old container didn't stop us, force exit
