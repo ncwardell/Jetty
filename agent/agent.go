@@ -150,10 +150,11 @@ type Agent struct {
 	ipipWarnedPeersMu sync.Mutex
 
 	// Userspace tunnel (fallback when kernel IPIP/GRE not available)
-	tunDevice    *water.Interface          // TUN device for capturing workload traffic
-	tunPeerConns sync.Map                  // peerID -> *websocket.Conn (outgoing connections to peers)
-	tunPeerIPs   sync.Map                  // peerID -> string (peer WARP IP for tunnel)
-	tunConnMu    sync.Mutex                // Protects WebSocket connection establishment
+	tunDevice      *water.Interface // TUN device for capturing workload traffic
+	tunPeerConns   sync.Map         // peerID -> *websocket.Conn (outgoing connections to peers)
+	tunPeerIPs     sync.Map         // peerID -> string (peer WARP IP for tunnel)
+	tunConnMu      sync.Mutex       // Protects WebSocket connection establishment
+	tunReturnRoute sync.Map         // srcIP -> peerID (tracks where packets came from for return routing)
 
 	stopCh chan struct{}
 }
@@ -748,14 +749,27 @@ func (a *Agent) tunReadLoop() {
 		dstIP := net.IP(packet[16:20])
 		srcIP := net.IP(packet[12:16])
 
-		// Find peer that owns this workload IP
+		// Find peer to route this packet to:
+		// 1. Check workload routes (destination is a remote workload IP)
+		// 2. Check return routes (destination is a remote host that sent us traffic)
+		var ownerID string
+
+		// First check workload routes
 		a.workloadRoutesMu.Lock()
-		ownerID, ok := a.workloadRoutes[dstIP.String()]
+		ownerID = a.workloadRoutes[dstIP.String()]
 		a.workloadRoutesMu.Unlock()
 
-		if !ok {
-			log.Printf("WS tunnel send: no route for %s (src=%s)", dstIP, srcIP)
-			continue // No route for this destination
+		// If not a workload route, check return routes (for response traffic)
+		if ownerID == "" {
+			if peerIDVal, ok := a.tunReturnRoute.Load(dstIP.String()); ok {
+				ownerID = peerIDVal.(string)
+				log.Printf("WS tunnel: using return route for %s -> peer %s", dstIP, ownerID[:8])
+			}
+		}
+
+		if ownerID == "" {
+			// No route - this is normal for local traffic, don't spam logs
+			continue
 		}
 
 		// Get peer's WARP IP for WebSocket tunnel
@@ -886,6 +900,14 @@ func (a *Agent) cleanupUserspaceTunnel() {
 		return true
 	})
 
+	// Remove all return routes
+	a.tunReturnRoute.Range(func(key, value interface{}) bool {
+		if ip, ok := key.(string); ok {
+			exec.Command("ip", "route", "del", ip+"/32", "dev", "jetty_tun").Run()
+		}
+		return true
+	})
+
 	if a.tunDevice != nil {
 		a.tunDevice.Close()
 		exec.Command("ip", "link", "del", "jetty_tun").Run()
@@ -920,6 +942,28 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 
 	remoteAddr := r.RemoteAddr
 	log.Printf("WS tunnel: authenticated connection from %s", remoteAddr)
+
+	// Extract peer's WARP IP from remote address (format: "ip:port")
+	peerWarpIP := remoteAddr
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		peerWarpIP = host
+	}
+
+	// Find peer ID from WARP IP
+	var peerID string
+	a.stateMu.RLock()
+	for _, p := range a.state.Peers {
+		if p.IP == peerWarpIP {
+			peerID = p.ID
+			break
+		}
+	}
+	a.stateMu.RUnlock()
+
+	if peerID == "" {
+		log.Printf("WS tunnel: unknown peer from %s (not in peer list)", peerWarpIP)
+		// Still allow connection but we won't be able to send return traffic
+	}
 
 	// Handle incoming packets from this peer
 	go func() {
@@ -966,7 +1010,28 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			log.Printf("WS tunnel recv: from %s, packet %s -> %s (%d bytes)", remoteAddr, srcIP, dstIP, len(packet))
+			// Record return route: srcIP came from this peer
+			// This allows responses to be routed back through the tunnel
+			if peerID != "" {
+				srcIPStr := srcIP.String()
+				// Only add route if we haven't seen this source before
+				if _, exists := a.tunReturnRoute.Load(srcIPStr); !exists {
+					// Add host route so responses go through TUN device
+					if err := exec.Command("ip", "route", "add", srcIPStr+"/32", "dev", "jetty_tun").Run(); err != nil {
+						log.Printf("WS tunnel: failed to add return route for %s: %v", srcIPStr, err)
+					} else {
+						log.Printf("WS tunnel: added return route for %s via jetty_tun", srcIPStr)
+					}
+				}
+				a.tunReturnRoute.Store(srcIPStr, peerID)
+			}
+
+			peerIDShort := peerID
+			if len(peerIDShort) > 8 {
+				peerIDShort = peerIDShort[:8]
+			}
+			log.Printf("WS tunnel recv: from %s (peer %s), packet %s -> %s (%d bytes)",
+				remoteAddr, peerIDShort, srcIP, dstIP, len(packet))
 
 			// Inject packet into TUN device for local delivery
 			if a.tunDevice != nil {
