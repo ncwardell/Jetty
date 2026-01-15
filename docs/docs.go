@@ -23,6 +23,135 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
+        "/env": {
+            "get": {
+                "description": "Returns all stored environment variable keys (values are encrypted)",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "env"
+                ],
+                "summary": "List environment variables",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.EnvListResponse"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Stores encrypted environment variables (existing keys are overwritten)",
+                "consumes": [
+                    "application/json"
+                ],
+                "tags": [
+                    "env"
+                ],
+                "summary": "Set environment variables",
+                "parameters": [
+                    {
+                        "description": "Environment variables to set",
+                        "name": "env",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/agent.EnvSetRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.EnvSetResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid request",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Encryption error",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/env/{key}": {
+            "get": {
+                "description": "Returns the decrypted value of a specific environment variable",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "env"
+                ],
+                "summary": "Get environment variable",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Environment variable key",
+                        "name": "key",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.EnvGetResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Key not found",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Decryption error",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Removes an environment variable from storage",
+                "tags": [
+                    "env"
+                ],
+                "summary": "Delete environment variable",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Environment variable key",
+                        "name": "key",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "Variable deleted"
+                    },
+                    "404": {
+                        "description": "Key not found",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/health": {
             "get": {
                 "description": "Returns health status of this node or the entire cluster. Use node=local for just this node.",
@@ -673,6 +802,78 @@ const docTemplate = `{
         }
     },
     "definitions": {
+        "agent.EnvGetResponse": {
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "example": "DB_PASSWORD"
+                },
+                "value": {
+                    "type": "string",
+                    "example": "secret123"
+                }
+            }
+        },
+        "agent.EnvListResponse": {
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "integer",
+                    "example": 3
+                },
+                "keys": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "DB_HOST",
+                        "DB_PASSWORD",
+                        "API_KEY"
+                    ]
+                }
+            }
+        },
+        "agent.EnvSetRequest": {
+            "type": "object",
+            "properties": {
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    },
+                    "example": {
+                        "DB_HOST": "localhost",
+                        "DB_PASSWORD": "secret123"
+                    }
+                }
+            }
+        },
+        "agent.EnvSetResponse": {
+            "type": "object",
+            "properties": {
+                "added": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "DB_HOST",
+                        "DB_PASSWORD"
+                    ]
+                },
+                "updated": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "API_KEY"
+                    ]
+                }
+            }
+        },
         "agent.ErrorResponse": {
             "type": "object",
             "properties": {
@@ -755,6 +956,10 @@ const docTemplate = `{
         "agent.JoinRequest": {
             "type": "object",
             "properties": {
+                "arch": {
+                    "type": "string",
+                    "example": "amd64"
+                },
                 "id": {
                     "type": "string"
                 },
@@ -858,6 +1063,10 @@ const docTemplate = `{
         "agent.NodeInfo": {
             "type": "object",
             "properties": {
+                "arch": {
+                    "type": "string",
+                    "example": "amd64"
+                },
                 "id": {
                     "type": "string",
                     "example": "abc123def456"
@@ -901,6 +1110,10 @@ const docTemplate = `{
         "agent.Peer": {
             "type": "object",
             "properties": {
+                "arch": {
+                    "description": "CPU architecture (amd64, arm64, etc.)",
+                    "type": "string"
+                },
                 "healthy": {
                     "type": "boolean"
                 },
@@ -989,6 +1202,15 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "compose": {
+                    "description": "Default compose (used if no arch-specific)",
+                    "type": "string"
+                },
+                "compose_amd64": {
+                    "description": "Optional: amd64-specific compose",
+                    "type": "string"
+                },
+                "compose_arm64": {
+                    "description": "Optional: arm64-specific compose",
                     "type": "string"
                 },
                 "ip": {
@@ -1033,6 +1255,14 @@ const docTemplate = `{
                 "compose": {
                     "type": "string",
                     "example": "services:\n  web:\n    image: nginx"
+                },
+                "compose_amd64": {
+                    "type": "string",
+                    "example": "services:\n  web:\n    image: nginx:amd64"
+                },
+                "compose_arm64": {
+                    "type": "string",
+                    "example": "services:\n  web:\n    image: nginx:arm64"
                 },
                 "ip": {
                     "type": "string",

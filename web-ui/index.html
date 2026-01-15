@@ -1108,6 +1108,13 @@
                     </svg>
                     Orchestrate
                 </div>
+                <div class="sidebar-item" data-page="secrets" onclick="showPage('secrets')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                    </svg>
+                    Secrets
+                </div>
             </div>
         </aside>
 
@@ -1143,6 +1150,10 @@
                     <div class="stat-card">
                         <div class="stat-label">Running Workloads</div>
                         <div class="stat-value green" id="stat-running">-</div>
+                    </div>
+                    <div class="stat-card" onclick="showPage('secrets')" style="cursor: pointer;">
+                        <div class="stat-label">Secrets</div>
+                        <div class="stat-value" style="color: var(--accent-purple);" id="stat-secrets">-</div>
                     </div>
                 </div>
 
@@ -1294,6 +1305,69 @@
                     </div>
                 </div>
             </div>
+
+            <!-- Secrets Page -->
+            <div class="page" id="page-secrets">
+                <div class="page-header">
+                    <h1 class="page-title">Secrets</h1>
+                    <div style="display: flex; gap: 12px;">
+                        <button class="btn" onclick="refreshSecrets()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="23 4 23 10 17 10"/>
+                                <polyline points="1 20 1 14 7 14"/>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                            </svg>
+                            Refresh
+                        </button>
+                        <button class="btn btn-primary" onclick="openAddSecretModal()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="12" y1="5" x2="12" y2="19"/>
+                                <line x1="5" y1="12" x2="19" y2="12"/>
+                            </svg>
+                            Add Secret
+                        </button>
+                    </div>
+                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 24px;">
+                    Encrypted environment variables stored cluster-wide. Use <code>${"${VAR_NAME}"}</code> in your Docker Compose files to inject secrets at deploy time.
+                </p>
+
+                <div class="card">
+                    <div class="table-container">
+                        <table class="data-table" id="secretsTable">
+                            <thead>
+                                <tr>
+                                    <th>Key</th>
+                                    <th>Value</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="secretsTableBody">
+                                <tr>
+                                    <td colspan="3" class="empty-state" style="padding: 40px;">
+                                        <p>No secrets. Connect to a cluster and add your first secret.</p>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card" style="margin-top: 16px;">
+                    <div class="card-header">
+                        <h3 class="card-title">Usage Example</h3>
+                    </div>
+                    <div class="card-body">
+                        <p style="color: var(--text-secondary); margin-bottom: 12px;">Reference secrets in your Docker Compose files:</p>
+                        <pre style="background: var(--bg-primary); padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; color: var(--text-primary);">services:
+  app:
+    image: myapp:latest
+    environment:
+      - DATABASE_URL=${"${DATABASE_URL}"}
+      - API_KEY=${"${API_KEY}"}</pre>
+                    </div>
+                </div>
+            </div>
         </main>
     </div>
 
@@ -1412,6 +1486,43 @@
             <div class="modal-footer">
                 <button class="btn" onclick="closeMoveModal()">Cancel</button>
                 <button class="btn btn-primary" onclick="confirmMoveWorkload()">Move</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add/Edit Secret Modal -->
+    <div class="modal-overlay hidden" id="secretModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title" id="secretModalTitle">Add Secret</h2>
+                <button class="modal-close" onclick="closeSecretModal()">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">Key</label>
+                    <input type="text" class="form-input" id="secretKey" placeholder="DATABASE_URL">
+                    <div class="form-hint">Must start with a letter or underscore, followed by letters, numbers, or underscores</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Value</label>
+                    <input type="password" class="form-input" id="secretValue" placeholder="Your secret value">
+                    <div class="form-hint">This value will be encrypted with AES-256-GCM</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-checkbox">
+                        <input type="checkbox" id="showSecretValue" onchange="toggleSecretVisibility()">
+                        <span>Show value</span>
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeSecretModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveSecret()">Save</button>
             </div>
         </div>
     </div>
@@ -1691,6 +1802,8 @@
                 state.connected = true;
                 // Fetch cluster health data for resource display
                 await refreshClusterHealth();
+                // Fetch secrets data
+                await refreshSecrets();
                 // Set initial refresh timestamp
                 refreshState.lastRefresh = Date.now();
                 updateLastRefreshedDisplay();
@@ -2011,6 +2124,7 @@
             document.getElementById('stat-healthy').textContent = healthyNodes.length;
             document.getElementById('stat-workloads').textContent = state.workloads.length;
             document.getElementById('stat-running').textContent = runningWorkloads.length;
+            document.getElementById('stat-secrets').textContent = secretsData.count || 0;
         }
 
         function updateNodesGrid() {
@@ -2286,6 +2400,11 @@
 
             document.getElementById(`page-${pageName}`).classList.add('active');
             document.querySelector(`[data-page="${pageName}"]`).classList.add('active');
+
+            // Refresh page-specific data
+            if (pageName === 'secrets' && state.connected) {
+                refreshSecrets();
+            }
         }
 
         // Workload Actions
@@ -2781,6 +2900,198 @@
                 `;
             } catch (error) {
                 body.innerHTML = `<div class="empty-state"><p>Failed to load logs: ${error.message}</p></div>`;
+            }
+        }
+
+        // Secrets Management
+        let secretsData = { keys: [], count: 0 };
+        let editingSecretKey = null;
+
+        async function refreshSecrets() {
+            if (!state.connected) return;
+            try {
+                const data = await apiCall('/env');
+                secretsData = data;
+                updateSecretsTable();
+            } catch (error) {
+                console.error('Failed to fetch secrets:', error);
+                showToast(`Failed to load secrets: ${error.message}`, 'error');
+            }
+        }
+
+        function updateSecretsTable() {
+            const tbody = document.getElementById('secretsTableBody');
+
+            if (!secretsData.keys || secretsData.keys.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="3" style="text-align: center; padding: 40px; color: var(--text-secondary);">
+                            No secrets configured. Add your first secret to get started.
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+
+            tbody.innerHTML = secretsData.keys.map(key => `
+                <tr>
+                    <td><code>${escapeHtml(key)}</code></td>
+                    <td>
+                        <span class="secret-value-hidden" id="secret-value-${key}" style="color: var(--text-muted);">
+                            ••••••••
+                        </span>
+                        <button class="btn btn-sm" onclick="revealSecret('${escapeHtml(key)}')" title="Reveal" id="reveal-btn-${key}">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                                <circle cx="12" cy="12" r="3"/>
+                            </svg>
+                        </button>
+                    </td>
+                    <td class="actions-cell">
+                        <button class="btn btn-sm" onclick="editSecret('${escapeHtml(key)}')" title="Edit">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                            </svg>
+                        </button>
+                        <button class="btn btn-sm btn-danger" onclick="deleteSecret('${escapeHtml(key)}')" title="Delete">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="3 6 5 6 21 6"/>
+                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                            </svg>
+                        </button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        async function revealSecret(key) {
+            try {
+                const data = await apiCall(`/env/${encodeURIComponent(key)}`);
+                const valueEl = document.getElementById(`secret-value-${key}`);
+                const btnEl = document.getElementById(`reveal-btn-${key}`);
+
+                if (valueEl.dataset.revealed === 'true') {
+                    // Hide the value
+                    valueEl.textContent = '••••••••';
+                    valueEl.style.color = 'var(--text-muted)';
+                    valueEl.dataset.revealed = 'false';
+                    btnEl.innerHTML = `
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                            <circle cx="12" cy="12" r="3"/>
+                        </svg>
+                    `;
+                } else {
+                    // Show the value
+                    valueEl.textContent = data.value;
+                    valueEl.style.color = 'var(--text-primary)';
+                    valueEl.style.fontFamily = 'Monaco, Menlo, Ubuntu Mono, monospace';
+                    valueEl.style.fontSize = '12px';
+                    valueEl.dataset.revealed = 'true';
+                    btnEl.innerHTML = `
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+                            <line x1="1" y1="1" x2="23" y2="23"/>
+                        </svg>
+                    `;
+                }
+            } catch (error) {
+                showToast(`Failed to reveal secret: ${error.message}`, 'error');
+            }
+        }
+
+        function openAddSecretModal() {
+            if (!state.connected) {
+                showToast('Please connect to a cluster first', 'error');
+                return;
+            }
+            editingSecretKey = null;
+            document.getElementById('secretModalTitle').textContent = 'Add Secret';
+            document.getElementById('secretKey').value = '';
+            document.getElementById('secretKey').disabled = false;
+            document.getElementById('secretValue').value = '';
+            document.getElementById('showSecretValue').checked = false;
+            document.getElementById('secretValue').type = 'password';
+            document.getElementById('secretModal').classList.remove('hidden');
+        }
+
+        async function editSecret(key) {
+            if (!state.connected) {
+                showToast('Please connect to a cluster first', 'error');
+                return;
+            }
+            editingSecretKey = key;
+            document.getElementById('secretModalTitle').textContent = 'Edit Secret';
+            document.getElementById('secretKey').value = key;
+            document.getElementById('secretKey').disabled = true;
+
+            try {
+                const data = await apiCall(`/env/${encodeURIComponent(key)}`);
+                document.getElementById('secretValue').value = data.value;
+            } catch (error) {
+                document.getElementById('secretValue').value = '';
+            }
+
+            document.getElementById('showSecretValue').checked = false;
+            document.getElementById('secretValue').type = 'password';
+            document.getElementById('secretModal').classList.remove('hidden');
+        }
+
+        function closeSecretModal() {
+            document.getElementById('secretModal').classList.add('hidden');
+            editingSecretKey = null;
+        }
+
+        function toggleSecretVisibility() {
+            const input = document.getElementById('secretValue');
+            const checkbox = document.getElementById('showSecretValue');
+            input.type = checkbox.checked ? 'text' : 'password';
+        }
+
+        async function saveSecret() {
+            const key = document.getElementById('secretKey').value.trim();
+            const value = document.getElementById('secretValue').value;
+
+            if (!key) {
+                showToast('Please enter a key', 'error');
+                return;
+            }
+
+            // Validate key format
+            if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)) {
+                showToast('Invalid key format. Must start with a letter or underscore.', 'error');
+                return;
+            }
+
+            if (!value) {
+                showToast('Please enter a value', 'error');
+                return;
+            }
+
+            try {
+                const payload = { env: {} };
+                payload.env[key] = value;
+                await apiCall('/env', 'POST', payload);
+                showToast(`Secret "${key}" saved successfully`, 'success');
+                closeSecretModal();
+                await refreshSecrets();
+            } catch (error) {
+                showToast(`Failed to save secret: ${error.message}`, 'error');
+            }
+        }
+
+        async function deleteSecret(key) {
+            if (!confirm(`Are you sure you want to delete the secret "${key}"?`)) {
+                return;
+            }
+
+            try {
+                await apiCall(`/env/${encodeURIComponent(key)}`, 'DELETE');
+                showToast(`Secret "${key}" deleted`, 'success');
+                await refreshSecrets();
+            } catch (error) {
+                showToast(`Failed to delete secret: ${error.message}`, 'error');
             }
         }
 
