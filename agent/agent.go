@@ -201,7 +201,7 @@ func (a *Agent) cleanupOrphanedState() {
 	}
 
 	// Clean up any orphaned IPIP tunnels (named tun_*)
-	output, _ := exec.Command("ip", "tunnel", "show").CombinedOutput()
+	output, _ = exec.Command("ip", "tunnel", "show").CombinedOutput()
 	for _, line := range strings.Split(string(output), "\n") {
 		if strings.HasPrefix(line, "tun_") {
 			parts := strings.Fields(line)
