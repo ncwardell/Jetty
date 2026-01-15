@@ -885,6 +885,9 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 	defer conn.Close()
 
+	// Wrap the websocket connection with a write mutex to prevent concurrent write panics
+	tc := &tunnelConn{conn: conn}
+
 	for {
 		msgType, packet, err := conn.ReadMessage()
 		if err != nil {
@@ -937,11 +940,11 @@ func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 		// Handle by protocol
 		switch protocol {
 		case 1: // ICMP - proxy at application level
-			go a.proxyICMP(conn, packet, srcIP, dstIP, ihl)
+			go a.proxyICMP(tc, packet, srcIP, dstIP, ihl)
 		case 6: // TCP - proxy connections
-			a.proxyTCP(conn, packet, srcIP, dstIP, ihl)
+			a.proxyTCP(tc, packet, srcIP, dstIP, ihl)
 		case 17: // UDP - proxy datagrams
-			go a.proxyUDP(conn, packet, srcIP, dstIP, ihl)
+			go a.proxyUDP(tc, packet, srcIP, dstIP, ihl)
 		default:
 			log.Printf("WS tunnel proxy: unsupported protocol %d", protocol)
 		}
@@ -949,7 +952,7 @@ func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 }
 
 // proxyICMP proxies an ICMP packet by sending our own request and repackaging the response.
-func (a *Agent) proxyICMP(conn *websocket.Conn, origPacket []byte, origSrc, dstIP net.IP, ihl int) {
+func (a *Agent) proxyICMP(tc *tunnelConn, origPacket []byte, origSrc, dstIP net.IP, ihl int) {
 	icmpData := origPacket[ihl:]
 	if len(icmpData) < 8 {
 		return
@@ -1022,14 +1025,14 @@ func (a *Agent) proxyICMP(conn *websocket.Conn, origPacket []byte, origSrc, dstI
 	// Build response packet with original src/dst swapped
 	respPacket := buildIPPacket(dstIP, origSrc, 1, replyICMP)
 
-	// Send response back through WebSocket
-	if err := conn.WriteMessage(websocket.BinaryMessage, respPacket); err != nil {
+	// Send response back through WebSocket (synchronized)
+	if err := tc.WriteMessage(websocket.BinaryMessage, respPacket); err != nil {
 		log.Printf("WS tunnel proxy: failed to send response: %v", err)
 	}
 }
 
 // proxyTCP handles TCP packets by establishing real connections and proxying data.
-func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net.IP, ihl int) {
+func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl int) {
 	if len(packet) < ihl+20 {
 		return // TCP header is at least 20 bytes
 	}
@@ -1074,14 +1077,14 @@ func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 		if err != nil {
 			log.Printf("WS tunnel proxy: TCP connect to %s failed: %v", targetAddr, err)
 			// Send RST back
-			a.sendTCPResponse(wsConn, dstIP, srcIP, dstPort, srcPort, 0, seqNum+1, 0x14, nil) // RST+ACK
+			a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, 0, seqNum+1, 0x14, nil) // RST+ACK
 			return
 		}
 
 		// Create proxy connection
 		proxyConn := &tcpProxyConn{
 			conn:      tcpConn,
-			wsConn:    wsConn,
+			wsConn:    tc,
 			srcIP:     srcIP,
 			srcPort:   srcPort,
 			dstIP:     dstIP,
@@ -1092,7 +1095,7 @@ func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 		a.tunTCPConns.Store(flowKey, proxyConn)
 
 		// Send SYN-ACK
-		a.sendTCPResponse(wsConn, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x12, nil) // SYN+ACK
+		a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x12, nil) // SYN+ACK
 		proxyConn.localSeq++
 
 		// Start goroutine to read from TCP and send back via WebSocket
@@ -1105,7 +1108,7 @@ func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 	if !ok {
 		// Unknown connection, send RST
 		if !isRST {
-			a.sendTCPResponse(wsConn, dstIP, srcIP, dstPort, srcPort, 0, seqNum+1, 0x14, nil) // RST+ACK
+			a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, 0, seqNum+1, 0x14, nil) // RST+ACK
 		}
 		return
 	}
@@ -1119,7 +1122,7 @@ func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 		proxyConn.mu.Unlock()
 
 		// Send FIN-ACK and close
-		a.sendTCPResponse(wsConn, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x11, nil) // FIN+ACK
+		a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x11, nil) // FIN+ACK
 		proxyConn.conn.Close()
 		a.tunTCPConns.Delete(flowKey)
 		return
@@ -1149,7 +1152,7 @@ func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 			}
 
 			// Send ACK
-			a.sendTCPResponse(wsConn, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x10, nil) // ACK
+			a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x10, nil) // ACK
 		}
 	}
 }
@@ -1188,7 +1191,7 @@ func (a *Agent) tcpProxyReadLoop(flowKey string, proxyConn *tcpProxyConn) {
 }
 
 // sendTCPResponse constructs and sends a TCP packet back through WebSocket.
-func (a *Agent) sendTCPResponse(wsConn *websocket.Conn, srcIP, dstIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags byte, payload []byte) {
+func (a *Agent) sendTCPResponse(tc *tunnelConn, srcIP, dstIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags byte, payload []byte) {
 	// Build TCP header (20 bytes minimum)
 	tcpLen := 20 + len(payload)
 	tcp := make([]byte, tcpLen)
@@ -1231,8 +1234,8 @@ func (a *Agent) sendTCPResponse(wsConn *websocket.Conn, srcIP, dstIP net.IP, src
 	// Build full IP packet
 	packet := buildIPPacket(srcIP, dstIP, 6, tcp)
 
-	// Send via WebSocket
-	if err := wsConn.WriteMessage(websocket.BinaryMessage, packet); err != nil {
+	// Send via WebSocket (synchronized)
+	if err := tc.WriteMessage(websocket.BinaryMessage, packet); err != nil {
 		log.Printf("WS tunnel proxy: failed to send TCP response: %v", err)
 	}
 }
@@ -1266,7 +1269,7 @@ func tcpChecksum(srcIP, dstIP net.IP, tcpSegment []byte) (byte, byte) {
 }
 
 // proxyUDP handles UDP packets by proxying them directly.
-func (a *Agent) proxyUDP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net.IP, ihl int) {
+func (a *Agent) proxyUDP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl int) {
 	if len(packet) < ihl+8 {
 		return
 	}
@@ -1320,9 +1323,9 @@ func (a *Agent) proxyUDP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 	respUDP[7] = 0
 	copy(respUDP[8:], respBuf[:n])
 
-	// Build IP packet and send back
+	// Build IP packet and send back (synchronized)
 	respPacket := buildIPPacket(dstIP, srcIP, 17, respUDP)
-	if err := wsConn.WriteMessage(websocket.BinaryMessage, respPacket); err != nil {
+	if err := tc.WriteMessage(websocket.BinaryMessage, respPacket); err != nil {
 		log.Printf("WS tunnel proxy: failed to send UDP response: %v", err)
 	}
 }
