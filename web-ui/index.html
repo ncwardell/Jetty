@@ -1604,6 +1604,26 @@
             return parseFloat(str.replace('%', '')) || 0;
         }
 
+        // Helper function to parse byte strings like "15.2 GB" to bytes
+        function parseBytes(str) {
+            if (!str) return 0;
+            const match = str.match(/^([\d.]+)\s*(B|KB|MB|GB|TB|PB)?$/i);
+            if (!match) return 0;
+            const value = parseFloat(match[1]);
+            const unit = (match[2] || 'B').toUpperCase();
+            const multipliers = { 'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4, 'PB': 1024**5 };
+            return value * (multipliers[unit] || 1);
+        }
+
+        // Helper function to format bytes to human readable
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(1024));
+            const value = bytes / Math.pow(1024, i);
+            return value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2) + ' ' + units[i];
+        }
+
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
             loadSavedConnection();
@@ -1802,9 +1822,13 @@
 
             const nodes = state.clusterHealth.nodes;
 
-            // Calculate aggregate stats
-            let totalCpu = 0, totalMem = 0, totalDisk = 0;
+            // Calculate aggregate stats (percentages)
+            let totalCpu = 0, totalMemPct = 0, totalDiskPct = 0;
             let cpuCount = 0, memCount = 0, diskCount = 0;
+
+            // Calculate aggregate stats (absolute values)
+            let clusterMemTotal = 0, clusterMemUsed = 0;
+            let clusterDiskTotal = 0, clusterDiskUsed = 0;
 
             nodes.forEach(node => {
                 if (node.system) {
@@ -1813,19 +1837,37 @@
                         cpuCount++;
                     }
                     if (node.system.memory_percent) {
-                        totalMem += parsePercent(node.system.memory_percent);
+                        totalMemPct += parsePercent(node.system.memory_percent);
                         memCount++;
                     }
                     if (node.system.disk_percent) {
-                        totalDisk += parsePercent(node.system.disk_percent);
+                        totalDiskPct += parsePercent(node.system.disk_percent);
                         diskCount++;
+                    }
+                    // Sum absolute memory values
+                    if (node.system.memory_total) {
+                        clusterMemTotal += parseBytes(node.system.memory_total);
+                    }
+                    if (node.system.memory_used) {
+                        clusterMemUsed += parseBytes(node.system.memory_used);
+                    }
+                    // Sum absolute disk values
+                    if (node.system.disk_total) {
+                        clusterDiskTotal += parseBytes(node.system.disk_total);
+                    }
+                    if (node.system.disk_used) {
+                        clusterDiskUsed += parseBytes(node.system.disk_used);
                     }
                 }
             });
 
             const avgCpu = cpuCount > 0 ? (totalCpu / cpuCount).toFixed(1) : 0;
-            const avgMem = memCount > 0 ? (totalMem / memCount).toFixed(1) : 0;
-            const avgDisk = diskCount > 0 ? (totalDisk / diskCount).toFixed(1) : 0;
+            const avgMem = memCount > 0 ? (totalMemPct / memCount).toFixed(1) : 0;
+            const avgDisk = diskCount > 0 ? (totalDiskPct / diskCount).toFixed(1) : 0;
+
+            // Calculate cluster-wide percentages from absolute values
+            const clusterMemPct = clusterMemTotal > 0 ? (clusterMemUsed / clusterMemTotal * 100).toFixed(1) : avgMem;
+            const clusterDiskPct = clusterDiskTotal > 0 ? (clusterDiskUsed / clusterDiskTotal * 100).toFixed(1) : avgDisk;
 
             container.innerHTML = `
                 <div class="resource-grid">
@@ -1841,23 +1883,23 @@
                     </div>
                     <div class="resource-item">
                         <div class="resource-header">
-                            <span class="resource-label">Average Memory</span>
-                            <span class="resource-value">${avgMem}%</span>
+                            <span class="resource-label">Cluster Memory</span>
+                            <span class="resource-value">${clusterMemPct}%</span>
                         </div>
                         <div class="resource-bar">
-                            <div class="resource-bar-fill ${getResourceBarClass(avgMem)}" style="width: ${Math.min(avgMem, 100)}%"></div>
+                            <div class="resource-bar-fill ${getResourceBarClass(clusterMemPct)}" style="width: ${Math.min(clusterMemPct, 100)}%"></div>
                         </div>
-                        <div class="resource-detail">Across ${memCount} node(s)</div>
+                        <div class="resource-detail">${formatBytes(clusterMemUsed)} / ${formatBytes(clusterMemTotal)}</div>
                     </div>
                     <div class="resource-item">
                         <div class="resource-header">
-                            <span class="resource-label">Average Disk</span>
-                            <span class="resource-value">${avgDisk}%</span>
+                            <span class="resource-label">Cluster Disk</span>
+                            <span class="resource-value">${clusterDiskPct}%</span>
                         </div>
                         <div class="resource-bar">
-                            <div class="resource-bar-fill ${getResourceBarClass(avgDisk)}" style="width: ${Math.min(avgDisk, 100)}%"></div>
+                            <div class="resource-bar-fill ${getResourceBarClass(clusterDiskPct)}" style="width: ${Math.min(clusterDiskPct, 100)}%"></div>
                         </div>
-                        <div class="resource-detail">Across ${diskCount} node(s)</div>
+                        <div class="resource-detail">${formatBytes(clusterDiskUsed)} / ${formatBytes(clusterDiskTotal)}</div>
                     </div>
                 </div>
                 <div style="margin-top: 16px;">
@@ -1876,16 +1918,22 @@
                             <tbody>
                                 ${nodes.map(node => {
                                     const cpu = node.system?.cpu_percent || 'N/A';
-                                    const mem = node.system?.memory_percent || 'N/A';
-                                    const disk = node.system?.disk_percent || 'N/A';
+                                    const memPct = node.system?.memory_percent || 'N/A';
+                                    const memUsed = node.system?.memory_used || '';
+                                    const memTotal = node.system?.memory_total || '';
+                                    const memDisplay = memUsed && memTotal ? `${memPct} (${memUsed}/${memTotal})` : memPct;
+                                    const diskPct = node.system?.disk_percent || 'N/A';
+                                    const diskUsed = node.system?.disk_used || '';
+                                    const diskTotal = node.system?.disk_total || '';
+                                    const diskDisplay = diskUsed && diskTotal ? `${diskPct} (${diskUsed}/${diskTotal})` : diskPct;
                                     const statusClass = node.status === 'healthy' ? 'running' : (node.status === 'medium' ? 'stopped' : 'error');
                                     const statusText = node.status || 'Unknown';
                                     return `
                                         <tr onclick="showNodeDetail('${node.id}')" style="cursor: pointer;">
                                             <td>${node.name || node.id.substring(0, 8)}</td>
                                             <td>${cpu}</td>
-                                            <td>${mem}</td>
-                                            <td>${disk}</td>
+                                            <td>${memDisplay}</td>
+                                            <td>${diskDisplay}</td>
                                             <td><span class="status-badge ${statusClass}">${statusText}</span></td>
                                         </tr>
                                     `;
