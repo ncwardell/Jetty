@@ -940,14 +940,26 @@ func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 		// Handle by protocol
 		switch protocol {
 		case 1: // ICMP - proxy at application level
-			go a.proxyICMP(tc, packet, srcIP, dstIP, ihl)
+			// Copy packet data since goroutine may outlive this iteration
+			icmpPacket := make([]byte, len(packet))
+			copy(icmpPacket, packet)
+			icmpSrcIP := net.IP(icmpPacket[12:16])
+			icmpDstIP := net.IP(icmpPacket[16:20])
+			go a.proxyICMP(tc, icmpPacket, icmpSrcIP, icmpDstIP, ihl)
 		case 6: // TCP - proxy connections
 			// Copy packet data since goroutine may outlive this iteration
 			tcpPacket := make([]byte, len(packet))
 			copy(tcpPacket, packet)
-			go a.proxyTCP(tc, tcpPacket, srcIP, dstIP, ihl)
+			tcpSrcIP := net.IP(tcpPacket[12:16])
+			tcpDstIP := net.IP(tcpPacket[16:20])
+			go a.proxyTCP(tc, tcpPacket, tcpSrcIP, tcpDstIP, ihl)
 		case 17: // UDP - proxy datagrams
-			go a.proxyUDP(tc, packet, srcIP, dstIP, ihl)
+			// Copy packet data since goroutine may outlive this iteration
+			udpPacket := make([]byte, len(packet))
+			copy(udpPacket, packet)
+			udpSrcIP := net.IP(udpPacket[12:16])
+			udpDstIP := net.IP(udpPacket[16:20])
+			go a.proxyUDP(tc, udpPacket, udpSrcIP, udpDstIP, ihl)
 		default:
 			log.Printf("WS tunnel proxy: unsupported protocol %d", protocol)
 		}
