@@ -1053,11 +1053,26 @@ func (a *Agent) proxyTCP(wsConn *websocket.Conn, packet []byte, srcIP, dstIP net
 	if isSYN && !isACK {
 		log.Printf("WS tunnel proxy TCP SYN: %s", flowKey)
 
+		// Look up workload to translate virtual IP to container IP
+		targetAddr := fmt.Sprintf("%s:%d", dstIP, dstPort)
+
+		a.stateMu.RLock()
+		wl, exists := a.state.Workloads[dstIP.String()]
+		a.stateMu.RUnlock()
+
+		if exists && wl.Owner == a.hwid {
+			// This is our workload, get the actual container IP
+			containerIP := a.getWorkloadContainerIP(wl.Name)
+			if containerIP != "" {
+				targetAddr = fmt.Sprintf("%s:%d", containerIP, dstPort)
+				log.Printf("WS tunnel proxy: translated %s -> %s", dstIP, containerIP)
+			}
+		}
+
 		// Establish TCP connection to workload
-		addr := fmt.Sprintf("%s:%d", dstIP, dstPort)
-		tcpConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		tcpConn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
 		if err != nil {
-			log.Printf("WS tunnel proxy: TCP connect to %s failed: %v", addr, err)
+			log.Printf("WS tunnel proxy: TCP connect to %s failed: %v", targetAddr, err)
 			// Send RST back
 			a.sendTCPResponse(wsConn, dstIP, srcIP, dstPort, srcPort, 0, seqNum+1, 0x14, nil) // RST+ACK
 			return
