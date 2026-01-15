@@ -297,13 +297,16 @@ func (a *Agent) Start() error {
 	// Update hosts file
 	a.updateHosts()
 
+	// Start API first (so cloudflared can connect to it)
+	go a.runAPI()
+
+	// Wait for API to be ready before starting cloudflared
+	a.waitForAPI()
+
 	// Start Cloudflare tunnel if configured
 	if err := a.startCloudflared(); err != nil {
 		log.Printf("Warning: failed to start cloudflared: %v", err)
 	}
-
-	// Start API
-	go a.runAPI()
 
 	// Start gossip
 	go a.gossipLoop()
@@ -1252,6 +1255,26 @@ func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// waitForAPI waits for the API server to be ready by polling the health endpoint.
+// This ensures cloudflared doesn't start before the API is actually listening.
+func (a *Agent) waitForAPI() {
+	addr := fmt.Sprintf("http://127.0.0.1:%d/api/health", a.apiPort)
+	maxRetries := 50 // 5 seconds total (50 * 100ms)
+
+	for i := 0; i < maxRetries; i++ {
+		resp, err := http.Get(addr)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 || resp.StatusCode == 401 { // 401 is OK, means API is up but needs auth
+				log.Printf("API server ready")
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	log.Printf("Warning: API server not responding after 5s, continuing anyway")
+}
+
 func (a *Agent) runAPI() {
 	// Set Swagger host to empty so it uses the current request's host
 	// This makes it work automatically for both localhost and cloudflared tunnels
@@ -1301,7 +1324,9 @@ func (a *Agent) runAPI() {
 
 	addr := fmt.Sprintf(":%d", a.apiPort)
 	log.Printf("API on %s (auth=%v)", addr, a.clusterSecret != "")
-	http.ListenAndServe(addr, handler)
+	if err := http.ListenAndServe(addr, handler); err != nil {
+		log.Fatalf("API server failed: %v", err)
+	}
 }
 
 // apiStatus godoc
