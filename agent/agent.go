@@ -27,6 +27,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/ncwardell/jetty/docs"
+	"github.com/songgao/water"
 	httpSwagger "github.com/swaggo/http-swagger"
 )
 
@@ -146,6 +147,11 @@ type Agent struct {
 	tunnelMode        string            // "ipip", "gre", or "" (none available)
 	ipipWarnedPeers   map[string]bool   // Peers we've already warned about tunnel failure
 	ipipWarnedPeersMu sync.Mutex
+
+	// Userspace tunnel (fallback when kernel IPIP/GRE not available)
+	tunDevice   *water.Interface // TUN device for capturing workload traffic
+	tunIPConn   *net.IPConn      // Raw IP socket for IPIP packets (protocol 4)
+	tunPeerIPs  sync.Map         // peerID -> string (peer WARP IP for IPIP encapsulation)
 
 	stopCh chan struct{}
 }
@@ -546,6 +552,9 @@ func (a *Agent) cleanupNetwork() {
 	}
 	a.stateMu.RUnlock()
 
+	// Clean up userspace tunnel if active
+	a.cleanupUserspaceTunnel()
+
 	// Remove jetty0 interface (this also removes all IPs bound to it)
 	if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
 		log.Printf("Warning: could not remove jetty0 interface: %v", err)
@@ -625,7 +634,16 @@ func (a *Agent) initNetwork() error {
 	// Try IPIP first (most efficient), then GRE as fallback
 	a.tunnelMode = a.detectTunnelMode()
 	if a.tunnelMode == "" {
-		log.Printf("Warning: IPIP/GRE tunnels not available (kernel module not loaded) - using direct WARP routing fallback")
+		log.Printf("IPIP/GRE tunnels not available - will use userspace tunnel for sending")
+	}
+
+	// ALWAYS start userspace tunnel listener - even if we have IPIP for sending,
+	// we need to receive packets from peers that don't have IPIP (e.g., ChromeOS)
+	if err := a.initUserspaceTunnel(); err != nil {
+		log.Printf("Warning: userspace tunnel failed: %v", err)
+		if a.tunnelMode == "" {
+			log.Printf("Warning: no tunnel mode available - cross-node workload routing disabled")
+		}
 	}
 
 	log.Printf("Network ready: %s (WARP), workload interface: jetty0", a.ip)
@@ -663,6 +681,180 @@ func (a *Agent) detectTunnelMode() string {
 
 	// No tunnel mode available
 	return ""
+}
+
+// =============================================================================
+// Userspace Tunnel (fallback when kernel IPIP/GRE not available)
+// =============================================================================
+
+// initUserspaceTunnel creates a TUN device and raw IPIP socket for userspace tunneling.
+// This is used when kernel IPIP/GRE modules aren't available (e.g., ChromeOS).
+// Traffic to remote workloads (10.100.x.x) is captured via TUN, encapsulated in IPIP,
+// and sent to the peer's WARP IP (100.96.x.x). No additional port needed - uses IP protocol 4.
+func (a *Agent) initUserspaceTunnel() error {
+	// Create TUN device
+	config := water.Config{
+		DeviceType: water.TUN,
+	}
+	config.Name = "jetty_tun"
+
+	tun, err := water.New(config)
+	if err != nil {
+		return fmt.Errorf("create TUN device: %w", err)
+	}
+	a.tunDevice = tun
+
+	// Configure TUN device
+	if err := exec.Command("ip", "link", "set", "up", "dev", "jetty_tun").Run(); err != nil {
+		tun.Close()
+		return fmt.Errorf("bring up TUN device: %w", err)
+	}
+
+	// Create raw IP socket for IPIP (protocol 4) packets
+	// This allows us to send/receive IPIP-encapsulated packets in userspace
+	conn, err := net.ListenIP("ip4:4", &net.IPAddr{IP: net.IPv4zero})
+	if err != nil {
+		tun.Close()
+		return fmt.Errorf("create raw IPIP socket: %w", err)
+	}
+	a.tunIPConn = conn
+
+	// Start packet forwarding goroutines
+	go a.tunReadLoop()  // TUN -> IPIP (outgoing)
+	go a.tunRecvLoop()  // IPIP -> local (incoming)
+
+	log.Printf("Userspace tunnel initialized (TUN: jetty_tun, IPIP protocol 4)")
+	return nil
+}
+
+// tunReadLoop reads packets from TUN device and sends them via IPIP to the appropriate peer.
+// The kernel wraps our inner packet with an outer IP header (protocol 4 = IPIP).
+func (a *Agent) tunReadLoop() {
+	buf := make([]byte, 65535)
+	for {
+		n, err := a.tunDevice.Read(buf)
+		if err != nil {
+			select {
+			case <-a.stopCh:
+				return
+			default:
+				log.Printf("TUN read error: %v", err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+		}
+
+		if n < 20 {
+			continue // Too small to be valid IP packet
+		}
+
+		// Parse destination IP from IP header (bytes 16-19 for IPv4)
+		packet := buf[:n]
+		if packet[0]>>4 != 4 {
+			continue // Not IPv4
+		}
+		dstIP := net.IP(packet[16:20])
+
+		// Find peer that owns this workload IP
+		a.workloadRoutesMu.Lock()
+		ownerID, ok := a.workloadRoutes[dstIP.String()]
+		a.workloadRoutesMu.Unlock()
+
+		if !ok {
+			continue // No route for this destination
+		}
+
+		// Get peer's WARP IP for IPIP encapsulation
+		peerIPVal, ok := a.tunPeerIPs.Load(ownerID)
+		if !ok {
+			continue // Peer IP not known
+		}
+		peerIP := net.ParseIP(peerIPVal.(string))
+		if peerIP == nil {
+			continue
+		}
+
+		// Send inner packet - kernel wraps with outer IP header (dst=peerIP, proto=4)
+		_, err = a.tunIPConn.WriteToIP(packet, &net.IPAddr{IP: peerIP})
+		if err != nil {
+			log.Printf("Failed to send IPIP packet to %s: %v", peerIP, err)
+		}
+	}
+}
+
+// tunRecvLoop receives IPIP packets from peers and injects the inner packet into local network.
+// IPIP packets have: [outer IP header (20+ bytes)] [inner IP packet]
+func (a *Agent) tunRecvLoop() {
+	buf := make([]byte, 65535)
+	for {
+		n, _, err := a.tunIPConn.ReadFromIP(buf)
+		if err != nil {
+			select {
+			case <-a.stopCh:
+				return
+			default:
+				log.Printf("IPIP tunnel recv error: %v", err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+		}
+
+		if n < 40 {
+			continue // Too small: need outer header (20) + inner header (20)
+		}
+
+		// The raw socket gives us the full packet including outer IP header
+		// Calculate outer header length (IHL field * 4)
+		outerIHL := int(buf[0]&0x0f) * 4
+		if n < outerIHL+20 {
+			continue // Not enough data for inner packet
+		}
+
+		// Extract inner packet (skip outer header)
+		innerPacket := buf[outerIHL:n]
+		if innerPacket[0]>>4 != 4 {
+			continue // Inner packet not IPv4
+		}
+
+		// Get destination IP from inner packet
+		dstIP := net.IP(innerPacket[16:20])
+
+		// Check if this is for a local workload
+		a.stateMu.RLock()
+		var localWorkload *Workload
+		for _, wl := range a.state.Workloads {
+			if wl.Owner == a.hwid && wl.IP == dstIP.String() {
+				localWorkload = wl
+				break
+			}
+		}
+		a.stateMu.RUnlock()
+
+		if localWorkload != nil {
+			// Write inner packet to local network stack
+			// The iptables DNAT rules will forward to the container
+			a.tunDevice.Write(innerPacket)
+		}
+	}
+}
+
+// updateTunPeerAddr updates the WARP IP for a peer's IPIP tunnel endpoint.
+func (a *Agent) updateTunPeerAddr(peerID, peerIP string) {
+	if a.tunIPConn == nil || peerIP == "" {
+		return
+	}
+	a.tunPeerIPs.Store(peerID, peerIP)
+}
+
+// cleanupUserspaceTunnel closes the TUN device and raw IPIP socket.
+func (a *Agent) cleanupUserspaceTunnel() {
+	if a.tunIPConn != nil {
+		a.tunIPConn.Close()
+	}
+	if a.tunDevice != nil {
+		a.tunDevice.Close()
+		exec.Command("ip", "link", "del", "jetty_tun").Run()
+	}
 }
 
 // initWarpRules sets up nftables rules for WARP traffic routing.
@@ -1035,7 +1227,7 @@ func (a *Agent) updateWorkloadRoutes() {
 		return
 	}
 
-	// If tunnel mode is available, ensure tunnels exist to ALL healthy peers
+	// If kernel tunnel mode is available, ensure tunnels exist to ALL healthy peers
 	// IPIP/GRE requires bidirectional tunnels - if peer A routes to peer B, peer B needs a
 	// tunnel back to A for decapsulation. By creating tunnels to all peers, any node
 	// can receive encapsulated traffic from any other node.
@@ -1045,6 +1237,13 @@ func (a *Agent) updateWorkloadRoutes() {
 				if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
 					log.Printf("Warning: failed to create tunnel to %s: %v", peer.Name, err)
 				}
+			}
+		}
+	} else if a.tunDevice != nil {
+		// Using userspace tunnel - update peer addresses
+		for _, peer := range a.state.Peers {
+			if peer.IP != "" && peer.Healthy {
+				a.updateTunPeerAddr(peer.ID, peer.IP)
 			}
 		}
 	}
@@ -1094,8 +1293,12 @@ func (a *Agent) updateWorkloadRoutes() {
 			tunName := a.getTunnelName(info.ownerID)
 			err = exec.Command("ip", "route", "add", wlIP+"/32", "dev", tunName).Run()
 			routeDesc = "tunnel " + tunName
+		} else if a.tunDevice != nil {
+			// Route through userspace tunnel (TUN device)
+			err = exec.Command("ip", "route", "add", wlIP+"/32", "dev", "jetty_tun").Run()
+			routeDesc = "userspace tunnel to " + info.ownerIP
 		} else {
-			// Fallback: route directly through WARP interface
+			// Last resort: route directly through WARP interface
 			// This works if WARP is configured to route 10.100.x.x traffic
 			err = exec.Command("ip", "route", "add", wlIP+"/32", "via", info.ownerIP, "dev", "CloudflareWARP").Run()
 			routeDesc = "WARP via " + info.ownerIP
@@ -4543,12 +4746,13 @@ func (a *Agent) tunnelModeHealthCheck() {
 
 	// Check peer health based on LastSeen staleness
 	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
 
 	staleThreshold := 45 * time.Second // 3 missed heartbeats (15s interval) + buffer
 	now := time.Now()
+	healthChanged := false
 
 	for _, peer := range a.state.Peers {
+		wasHealthy := peer.Healthy
 		if now.Sub(peer.LastSeen) > staleThreshold {
 			if peer.Healthy {
 				log.Printf("Peer %s marked unhealthy (no heartbeat for %v)", peer.Name, now.Sub(peer.LastSeen))
@@ -4557,7 +4761,17 @@ func (a *Agent) tunnelModeHealthCheck() {
 		} else {
 			peer.Healthy = true
 		}
+		if wasHealthy != peer.Healthy {
+			healthChanged = true
+		}
 	}
+
+	// Update routes if any peer health status changed
+	// This ensures routes to unhealthy peers are removed immediately
+	if healthChanged {
+		a.updateWorkloadRoutes()
+	}
+	a.stateMu.Unlock()
 }
 
 // syncStateOnStartup syncs state from known peers before autostarting workloads.
