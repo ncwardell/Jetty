@@ -1018,8 +1018,19 @@ func (a *Agent) updateWorkloadRoutes() {
 		return
 	}
 
+	// IMPORTANT: Ensure IPIP tunnels exist to ALL healthy peers, not just workload owners.
+	// IPIP requires bidirectional tunnels - if peer A routes to peer B, peer B needs a
+	// tunnel back to A for decapsulation. By creating tunnels to all peers, any node
+	// can receive IPIP traffic from any other node.
+	for _, peer := range a.state.Peers {
+		if peer.IP != "" && peer.Healthy {
+			if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
+				log.Printf("Warning: failed to create tunnel to %s: %v", peer.Name, err)
+			}
+		}
+	}
+
 	// Build map of desired routes: workload IP -> owner ID
-	// Also ensure tunnels exist to owners
 	desiredRoutes := make(map[string]string) // wlIP -> ownerID
 	for _, wl := range a.state.Workloads {
 		if wl.Owner == a.hwid {
@@ -1027,12 +1038,8 @@ func (a *Agent) updateWorkloadRoutes() {
 			continue
 		}
 		// Find owner peer - only route through healthy peers with IPs
+		// (tunnels already ensured above for all healthy peers)
 		if peer, ok := a.state.Peers[wl.Owner]; ok && peer.IP != "" && peer.Healthy {
-			// Ensure tunnel exists to this peer
-			if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
-				log.Printf("Warning: failed to create tunnel to %s: %v", peer.Name, err)
-				continue
-			}
 			desiredRoutes[wl.IP] = peer.ID
 		}
 	}
