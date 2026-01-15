@@ -2909,6 +2909,11 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		args = append(args, "--cap-add", cap)
 	}
 
+	// Pass the cluster secret key to the new container
+	if a.clusterSecret != "" {
+		args = append(args, "-e", "JETTY_SECRET="+a.clusterSecret)
+	}
+
 	// Add restart policy
 	args = append(args, "--restart", "unless-stopped")
 
