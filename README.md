@@ -260,8 +260,7 @@ Full Swagger docs at [`/swagger/index.html`](https://nodes.secretcult.network/sw
 ### Status & Health
 ```bash
 GET  /api/status           # Full cluster status (nodes + workloads)
-GET  /api/health           # Health check
-GET  /api/cluster/health   # Aggregate health from all nodes
+GET  /api/health           # Health check (use ?node=local for single node)
 ```
 
 ### Workloads
@@ -298,6 +297,11 @@ DELETE /api/env/{key}        # Delete env variable
 GET    /api/tunnel           # Get tunnel status
 POST   /api/tunnel           # Configure tunnel with token
 DELETE /api/tunnel           # Remove tunnel
+```
+
+### Proxy
+```bash
+ANY    /api/proxy/{ip}/{path}  # Proxy request to workload by mesh IP
 ```
 
 ---
@@ -339,7 +343,7 @@ No split-brain. No consensus. Just math.
 ```json
 {
   "name": "postgres",
-  "mesh_ip": "10.100.0.50",
+  "ip": "10.100.0.50",
   "compose": "services:\n  db:\n    image: postgres:16\n    ...",
   "compose_amd64": "services:\n  db:\n    image: postgres:16-amd64\n    ...",
   "compose_arm64": "services:\n  db:\n    image: postgres:16-arm64\n    ...",
@@ -349,7 +353,7 @@ No split-brain. No consensus. Just math.
   "owner": {
     "id": "abc123...",
     "name": "node1",
-    "mesh_ip": "10.100.0.1"
+    "ip": "100.96.0.1"
   },
   "version": 1705312200
 }
@@ -358,7 +362,7 @@ No split-brain. No consensus. Just math.
 | Field | What it do |
 |-------|------------|
 | `name` | Workload name. Becomes a DNS hostname. |
-| `mesh_ip` | IP on the mesh network. Auto-assigned if you don't care. |
+| `ip` | IP on the mesh network (10.100.x.x). Auto-assigned if omitted. |
 | `compose` | Default Docker Compose YAML. Used if no arch-specific file matches. |
 | `compose_amd64` | Optional. Compose file for AMD64 nodes. |
 | `compose_arm64` | Optional. Compose file for ARM64 nodes. |
@@ -412,12 +416,14 @@ volumes:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `JETTY_SECRET` | Cluster password. Required. | - |
-| `JETTY_WARP_CONNECTOR_TOKEN` | WARP token. Bootstrap node only. | - |
+| `JETTY_WARP_CONNECTOR_TOKEN` | WARP connector token. Bootstrap node only. | - |
 | `JETTY_CF_TOKEN` | Cloudflare Tunnel token. Bootstrap node only. | - |
 | `JETTY_JOIN` | URL to join existing cluster. | - |
 | `JETTY_DATA_DIR` | Where state lives. | `/data` |
 | `JETTY_API_PORT` | API port. | `6880` |
-| `JETTY_MESH_CIDR` | Mesh network range. | `10.100.0.0/16` |
+| `JETTY_SERVICE_CIDR` | Mesh network CIDR for workload IPs. | `10.100.0.0/16` |
+| `JETTY_TUNNEL_DOMAIN` | Cloudflare tunnel domain (e.g., `cluster.example.com`). | - |
+| `JETTY_TUNNEL_HOST` | This node's specific subdomain. | - |
 
 ---
 
