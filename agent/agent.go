@@ -3269,7 +3269,8 @@ func (a *Agent) getSystemStats() map[string]interface{} {
 		}
 	}
 
-	// Get CPU usage from /proc/stat (calculate over a brief interval)
+	// Get CPU usage from /proc/stat (calculate over a sample interval)
+	// Format: cpu user nice system idle iowait irq softirq steal guest guest_nice
 	getCPUTimes := func() (idle, total uint64) {
 		if data, err := os.ReadFile("/proc/stat"); err == nil {
 			lines := strings.Split(string(data), "\n")
@@ -3280,8 +3281,10 @@ func (a *Agent) getSystemStats() map[string]interface{} {
 					for i := 1; i < len(fields); i++ {
 						val, _ := strconv.ParseUint(fields[i], 10, 64)
 						sum += val
-						if i == 4 { // idle is 4th field (index 4)
-							idle = val
+						// idle is field 4 (index 4), iowait is field 5 (index 5)
+						// Both represent time when CPU is not doing work
+						if i == 4 || i == 5 {
+							idle += val
 						}
 					}
 					total = sum
@@ -3292,7 +3295,7 @@ func (a *Agent) getSystemStats() map[string]interface{} {
 	}
 
 	idle1, total1 := getCPUTimes()
-	time.Sleep(100 * time.Millisecond) // Brief sample period
+	time.Sleep(500 * time.Millisecond) // Sample period (longer for more accuracy)
 	idle2, total2 := getCPUTimes()
 
 	if total2 > total1 {
@@ -4820,7 +4823,32 @@ func getPublicIP() string {
 		return ip
 	}
 
-	// Try to determine IP by dialing out (with timeout to prevent hangs)
+	// Try external services to get actual public IP (with short timeout)
+	client := &http.Client{Timeout: 3 * time.Second}
+	services := []string{
+		"https://api.ipify.org",
+		"https://ifconfig.me/ip",
+		"https://icanhazip.com",
+	}
+
+	for _, svc := range services {
+		resp, err := client.Get(svc)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		ip := strings.TrimSpace(string(body))
+		// Validate it looks like an IP
+		if parsed := net.ParseIP(ip); parsed != nil {
+			return ip
+		}
+	}
+
+	// Fallback: get outbound IP (local IP used to reach internet)
 	dialer := net.Dialer{Timeout: 2 * time.Second}
 	c, err := dialer.Dial("udp", "8.8.8.8:80")
 	if err == nil {
@@ -4830,7 +4858,7 @@ func getPublicIP() string {
 		}
 	}
 
-	// Fallback: find first non-loopback interface IP
+	// Last resort: find first non-loopback interface IP
 	addrs, err := net.InterfaceAddrs()
 	if err == nil {
 		for _, addr := range addrs {
