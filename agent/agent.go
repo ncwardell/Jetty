@@ -4722,12 +4722,13 @@ func (a *Agent) tunnelModeHealthCheck() {
 
 	// Check peer health based on LastSeen staleness
 	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
 
 	staleThreshold := 45 * time.Second // 3 missed heartbeats (15s interval) + buffer
 	now := time.Now()
+	healthChanged := false
 
 	for _, peer := range a.state.Peers {
+		wasHealthy := peer.Healthy
 		if now.Sub(peer.LastSeen) > staleThreshold {
 			if peer.Healthy {
 				log.Printf("Peer %s marked unhealthy (no heartbeat for %v)", peer.Name, now.Sub(peer.LastSeen))
@@ -4736,7 +4737,17 @@ func (a *Agent) tunnelModeHealthCheck() {
 		} else {
 			peer.Healthy = true
 		}
+		if wasHealthy != peer.Healthy {
+			healthChanged = true
+		}
 	}
+
+	// Update routes if any peer health status changed
+	// This ensures routes to unhealthy peers are removed immediately
+	if healthChanged {
+		a.updateWorkloadRoutes()
+	}
+	a.stateMu.Unlock()
 }
 
 // syncStateOnStartup syncs state from known peers before autostarting workloads.
