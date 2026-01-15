@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	"github.com/ncwardell/jetty/docs"
 	"github.com/songgao/water"
 	httpSwagger "github.com/swaggo/http-swagger"
@@ -149,9 +150,10 @@ type Agent struct {
 	ipipWarnedPeersMu sync.Mutex
 
 	// Userspace tunnel (fallback when kernel IPIP/GRE not available)
-	tunDevice  *water.Interface // TUN device for capturing workload traffic
-	tunUDPConn *net.UDPConn     // UDP socket for tunnel encapsulation (port 6892)
-	tunPeerIPs sync.Map         // peerID -> string (peer WARP IP for tunnel)
+	tunDevice    *water.Interface          // TUN device for capturing workload traffic
+	tunPeerConns sync.Map                  // peerID -> *websocket.Conn (outgoing connections to peers)
+	tunPeerIPs   sync.Map                  // peerID -> string (peer WARP IP for tunnel)
+	tunConnMu    sync.Mutex                // Protects WebSocket connection establishment
 
 	stopCh chan struct{}
 }
@@ -687,11 +689,11 @@ func (a *Agent) detectTunnelMode() string {
 // Userspace Tunnel (fallback when kernel IPIP/GRE not available)
 // =============================================================================
 
-// initUserspaceTunnel creates a TUN device and UDP socket for userspace tunneling.
+// initUserspaceTunnel creates a TUN device for userspace tunneling.
 // This is used when kernel IPIP/GRE modules aren't available (e.g., ChromeOS).
-// Traffic to remote workloads (10.100.x.x) is captured via TUN, encapsulated in UDP,
-// and sent to the peer's WARP IP (100.96.x.x) on port 6892.
-// We use UDP because WARP routes TCP/UDP but blocks raw IP protocols like IPIP.
+// Traffic to remote workloads (10.100.x.x) is captured via TUN, sent over WebSocket
+// to the peer's API (port 6880), and injected into their local network.
+// We use WebSocket over the existing API port - no additional ports needed.
 func (a *Agent) initUserspaceTunnel() error {
 	// Create TUN device
 	config := water.Config{
@@ -711,25 +713,14 @@ func (a *Agent) initUserspaceTunnel() error {
 		return fmt.Errorf("bring up TUN device: %w", err)
 	}
 
-	// Create UDP socket for tunnel encapsulation
-	// WARP routes UDP traffic but blocks raw IP protocols (IPIP, GRE, ICMP)
-	udpAddr := &net.UDPAddr{Port: 6892}
-	conn, err := net.ListenUDP("udp4", udpAddr)
-	if err != nil {
-		tun.Close()
-		return fmt.Errorf("create UDP tunnel socket: %w", err)
-	}
-	a.tunUDPConn = conn
+	// Start packet forwarding goroutine (reads from TUN, sends over WebSocket)
+	go a.tunReadLoop()
 
-	// Start packet forwarding goroutines
-	go a.tunReadLoop()  // TUN -> UDP (outgoing)
-	go a.tunRecvLoop()  // UDP -> local (incoming)
-
-	log.Printf("Userspace tunnel initialized (TUN: jetty_tun, UDP port 6892)")
+	log.Printf("Userspace tunnel initialized (TUN: jetty_tun, WebSocket on API port %d)", a.apiPort)
 	return nil
 }
 
-// tunReadLoop reads packets from TUN device and sends them via UDP to the appropriate peer.
+// tunReadLoop reads packets from TUN device and sends them via WebSocket to the appropriate peer.
 func (a *Agent) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -763,106 +754,200 @@ func (a *Agent) tunReadLoop() {
 		a.workloadRoutesMu.Unlock()
 
 		if !ok {
-			log.Printf("UDP tunnel send: no route for %s (src=%s)", dstIP, srcIP)
+			log.Printf("WS tunnel send: no route for %s (src=%s)", dstIP, srcIP)
 			continue // No route for this destination
 		}
 
-		// Get peer's WARP IP for UDP tunnel
+		// Get peer's WARP IP for WebSocket tunnel
 		peerIPVal, ok := a.tunPeerIPs.Load(ownerID)
 		if !ok {
-			log.Printf("UDP tunnel send: no peer IP for owner %s (dst=%s)", ownerID[:8], dstIP)
+			log.Printf("WS tunnel send: no peer IP for owner %s (dst=%s)", ownerID[:8], dstIP)
 			continue // Peer IP not known
 		}
-		peerIP := net.ParseIP(peerIPVal.(string))
-		if peerIP == nil {
+		peerIP := peerIPVal.(string)
+
+		// Get or establish WebSocket connection to peer
+		conn, err := a.getTunPeerConn(ownerID, peerIP)
+		if err != nil {
+			log.Printf("WS tunnel send: failed to connect to %s: %v", peerIP, err)
 			continue
 		}
 
-		log.Printf("UDP tunnel send: %s -> %s via %s:%d (%d bytes)", srcIP, dstIP, peerIP, 6892, n)
+		log.Printf("WS tunnel send: %s -> %s via %s (%d bytes)", srcIP, dstIP, peerIP, n)
 
-		// Send packet via UDP to peer's tunnel port
-		peerAddr := &net.UDPAddr{IP: peerIP, Port: 6892}
-		_, err = a.tunUDPConn.WriteToUDP(packet, peerAddr)
-		if err != nil {
-			log.Printf("UDP tunnel send: failed to send to %s: %v", peerAddr, err)
+		// Send packet as binary WebSocket message
+		if err := conn.WriteMessage(websocket.BinaryMessage, packet); err != nil {
+			log.Printf("WS tunnel send: failed to send to %s: %v", peerIP, err)
+			// Close broken connection so it gets re-established
+			conn.Close()
+			a.tunPeerConns.Delete(ownerID)
 		}
 	}
 }
 
-// tunRecvLoop receives UDP packets from peers and injects them into local network.
-// UDP payload is the raw IP packet that needs to be delivered to local workload.
-func (a *Agent) tunRecvLoop() {
-	buf := make([]byte, 65535)
+// getTunPeerConn gets or creates a WebSocket connection to a peer for tunneling.
+func (a *Agent) getTunPeerConn(peerID, peerIP string) (*websocket.Conn, error) {
+	// Check if we already have a connection
+	if connVal, ok := a.tunPeerConns.Load(peerID); ok {
+		return connVal.(*websocket.Conn), nil
+	}
+
+	// Establish new connection (with lock to prevent duplicate connections)
+	a.tunConnMu.Lock()
+	defer a.tunConnMu.Unlock()
+
+	// Double-check after acquiring lock
+	if connVal, ok := a.tunPeerConns.Load(peerID); ok {
+		return connVal.(*websocket.Conn), nil
+	}
+
+	// Connect to peer's tunnel WebSocket endpoint
+	url := fmt.Sprintf("ws://%s:%d/api/tunnel/ws", peerIP, a.apiPort)
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+
+	// Add cluster secret header if configured
+	headers := http.Header{}
+	if a.clusterSecret != "" {
+		headers.Set("X-API-Key", a.clusterSecret)
+	}
+
+	conn, _, err := dialer.Dial(url, headers)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", url, err)
+	}
+
+	// Store connection and start receiver goroutine
+	a.tunPeerConns.Store(peerID, conn)
+	go a.tunWsRecvLoop(peerID, conn)
+
+	log.Printf("WS tunnel: established connection to %s (%s)", peerID[:8], peerIP)
+	return conn, nil
+}
+
+// tunWsRecvLoop receives packets from a peer's WebSocket connection and injects them locally.
+func (a *Agent) tunWsRecvLoop(peerID string, conn *websocket.Conn) {
+	defer func() {
+		conn.Close()
+		a.tunPeerConns.Delete(peerID)
+	}()
+
 	for {
-		n, srcAddr, err := a.tunUDPConn.ReadFromUDP(buf)
+		msgType, packet, err := conn.ReadMessage()
 		if err != nil {
 			select {
 			case <-a.stopCh:
 				return
 			default:
-				log.Printf("UDP tunnel recv error: %v", err)
-				time.Sleep(100 * time.Millisecond)
-				continue
+				log.Printf("WS tunnel recv: connection to %s closed: %v", peerID[:8], err)
+				return
 			}
 		}
 
-		if n < 20 {
-			continue // Too small for IP header
+		if msgType != websocket.BinaryMessage || len(packet) < 20 {
+			continue
 		}
 
-		// UDP payload is the raw IP packet
-		packet := buf[:n]
+		// Verify it's an IPv4 packet
 		if packet[0]>>4 != 4 {
-			continue // Not IPv4
+			continue
 		}
 
-		// Get destination IP from packet
 		dstIP := net.IP(packet[16:20])
 		srcIP := net.IP(packet[12:16])
 
-		log.Printf("UDP tunnel recv: from %s, packet src=%s -> dst=%s (%d bytes)", srcAddr, srcIP, dstIP, n)
+		log.Printf("WS tunnel recv: from %s, packet %s -> %s (%d bytes)", peerID[:8], srcIP, dstIP, len(packet))
 
-		// Check if this is for a local workload
-		a.stateMu.RLock()
-		var localWorkload *Workload
-		for _, wl := range a.state.Workloads {
-			if wl.Owner == a.hwid && wl.IP == dstIP.String() {
-				localWorkload = wl
-				break
-			}
-		}
-		a.stateMu.RUnlock()
-
-		if localWorkload != nil {
-			log.Printf("UDP tunnel recv: injecting packet for local workload %s (%s)", localWorkload.Name, dstIP)
-			// Write packet to TUN device for local delivery
-			// The iptables DNAT rules will forward to the container
+		// Inject packet into TUN device for local delivery
+		if a.tunDevice != nil {
 			if _, err := a.tunDevice.Write(packet); err != nil {
-				log.Printf("UDP tunnel recv: failed to write to TUN: %v", err)
+				log.Printf("WS tunnel recv: failed to write to TUN: %v", err)
 			}
-		} else {
-			log.Printf("UDP tunnel recv: no local workload for %s (from %s)", dstIP, srcAddr)
 		}
 	}
 }
 
-// updateTunPeerAddr updates the WARP IP for a peer's UDP tunnel endpoint.
+// updateTunPeerAddr updates the WARP IP for a peer's WebSocket tunnel endpoint.
 func (a *Agent) updateTunPeerAddr(peerID, peerIP string) {
-	if a.tunUDPConn == nil || peerIP == "" {
+	if a.tunDevice == nil || peerIP == "" {
 		return
 	}
 	a.tunPeerIPs.Store(peerID, peerIP)
 }
 
-// cleanupUserspaceTunnel closes the TUN device and UDP socket.
+// cleanupUserspaceTunnel closes all WebSocket connections and the TUN device.
 func (a *Agent) cleanupUserspaceTunnel() {
-	if a.tunUDPConn != nil {
-		a.tunUDPConn.Close()
-	}
+	// Close all peer WebSocket connections
+	a.tunPeerConns.Range(func(key, value interface{}) bool {
+		if conn, ok := value.(*websocket.Conn); ok {
+			conn.Close()
+		}
+		return true
+	})
+
 	if a.tunDevice != nil {
 		a.tunDevice.Close()
 		exec.Command("ip", "link", "del", "jetty_tun").Run()
 	}
+}
+
+// WebSocket upgrader for tunnel connections
+var wsUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+// apiTunnelWs handles incoming WebSocket connections for packet tunneling.
+// Peers connect here to send/receive encapsulated IP packets.
+func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WS tunnel: upgrade failed: %v", err)
+		return
+	}
+
+	// Get peer identity from request (could be from header or we can use remote addr)
+	remoteAddr := r.RemoteAddr
+	log.Printf("WS tunnel: incoming connection from %s", remoteAddr)
+
+	// Handle incoming packets from this peer
+	go func() {
+		defer conn.Close()
+
+		for {
+			msgType, packet, err := conn.ReadMessage()
+			if err != nil {
+				select {
+				case <-a.stopCh:
+					return
+				default:
+					log.Printf("WS tunnel: connection from %s closed: %v", remoteAddr, err)
+					return
+				}
+			}
+
+			if msgType != websocket.BinaryMessage || len(packet) < 20 {
+				continue
+			}
+
+			// Verify it's an IPv4 packet
+			if packet[0]>>4 != 4 {
+				continue
+			}
+
+			dstIP := net.IP(packet[16:20])
+			srcIP := net.IP(packet[12:16])
+
+			log.Printf("WS tunnel recv (server): from %s, packet %s -> %s (%d bytes)", remoteAddr, srcIP, dstIP, len(packet))
+
+			// Inject packet into TUN device for local delivery
+			if a.tunDevice != nil {
+				if _, err := a.tunDevice.Write(packet); err != nil {
+					log.Printf("WS tunnel recv: failed to write to TUN: %v", err)
+				}
+			}
+		}
+	}()
 }
 
 // initWarpRules sets up nftables rules for WARP traffic routing.
@@ -1553,6 +1638,7 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/tunnel", a.apiSetTunnel).Methods("POST")
 	r.HandleFunc("/api/tunnel", a.apiDeleteTunnel).Methods("DELETE")
 	r.HandleFunc("/api/tunnel/sync", a.apiTunnelSync).Methods("POST")
+	r.HandleFunc("/api/tunnel/ws", a.apiTunnelWs) // WebSocket for packet tunneling
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 	r.HandleFunc("/api/heartbeat", a.apiHeartbeat).Methods("POST")
 	r.HandleFunc("/api/env", a.apiListEnv).Methods("GET")
