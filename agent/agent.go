@@ -149,9 +149,9 @@ type Agent struct {
 	ipipWarnedPeersMu sync.Mutex
 
 	// Userspace tunnel (fallback when kernel IPIP/GRE not available)
-	tunDevice    *water.Interface // TUN device for capturing workload traffic
-	tunUDPConn   *net.UDPConn     // UDP socket for tunneled packets
-	tunPeerAddrs sync.Map         // peerID -> *net.UDPAddr (peer tunnel endpoints)
+	tunDevice   *water.Interface // TUN device for capturing workload traffic
+	tunIPConn   *net.IPConn      // Raw IP socket for IPIP packets (protocol 4)
+	tunPeerIPs  sync.Map         // peerID -> string (peer WARP IP for IPIP encapsulation)
 
 	stopCh chan struct{}
 }
@@ -687,12 +687,10 @@ func (a *Agent) detectTunnelMode() string {
 // Userspace Tunnel (fallback when kernel IPIP/GRE not available)
 // =============================================================================
 
-const tunUDPPort = 6892 // UDP port for userspace tunnel packets
-
-// initUserspaceTunnel creates a TUN device and UDP listener for userspace tunneling.
+// initUserspaceTunnel creates a TUN device and raw IPIP socket for userspace tunneling.
 // This is used when kernel IPIP/GRE modules aren't available (e.g., ChromeOS).
-// Traffic to remote workloads (10.100.x.x) is captured via TUN, wrapped in UDP,
-// and sent to the peer's WARP IP (100.96.x.x).
+// Traffic to remote workloads (10.100.x.x) is captured via TUN, encapsulated in IPIP,
+// and sent to the peer's WARP IP (100.96.x.x). No additional port needed - uses IP protocol 4.
 func (a *Agent) initUserspaceTunnel() error {
 	// Create TUN device
 	config := water.Config{
@@ -712,24 +710,25 @@ func (a *Agent) initUserspaceTunnel() error {
 		return fmt.Errorf("bring up TUN device: %w", err)
 	}
 
-	// Start UDP listener for incoming tunneled packets
-	addr := &net.UDPAddr{Port: tunUDPPort}
-	conn, err := net.ListenUDP("udp", addr)
+	// Create raw IP socket for IPIP (protocol 4) packets
+	// This allows us to send/receive IPIP-encapsulated packets in userspace
+	conn, err := net.ListenIP("ip4:4", &net.IPAddr{IP: net.IPv4zero})
 	if err != nil {
 		tun.Close()
-		return fmt.Errorf("start UDP tunnel listener: %w", err)
+		return fmt.Errorf("create raw IPIP socket: %w", err)
 	}
-	a.tunUDPConn = conn
+	a.tunIPConn = conn
 
 	// Start packet forwarding goroutines
-	go a.tunReadLoop()  // TUN -> UDP (outgoing)
-	go a.tunRecvLoop()  // UDP -> local (incoming)
+	go a.tunReadLoop()  // TUN -> IPIP (outgoing)
+	go a.tunRecvLoop()  // IPIP -> local (incoming)
 
-	log.Printf("Userspace tunnel initialized (TUN: jetty_tun, UDP port: %d)", tunUDPPort)
+	log.Printf("Userspace tunnel initialized (TUN: jetty_tun, IPIP protocol 4)")
 	return nil
 }
 
-// tunReadLoop reads packets from TUN device and sends them to the appropriate peer via UDP.
+// tunReadLoop reads packets from TUN device and sends them via IPIP to the appropriate peer.
+// The kernel wraps our inner packet with an outer IP header (protocol 4 = IPIP).
 func (a *Agent) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -765,48 +764,60 @@ func (a *Agent) tunReadLoop() {
 			continue // No route for this destination
 		}
 
-		// Get peer's UDP address
-		addrVal, ok := a.tunPeerAddrs.Load(ownerID)
+		// Get peer's WARP IP for IPIP encapsulation
+		peerIPVal, ok := a.tunPeerIPs.Load(ownerID)
 		if !ok {
-			continue // Peer address not known
+			continue // Peer IP not known
 		}
-		peerAddr := addrVal.(*net.UDPAddr)
+		peerIP := net.ParseIP(peerIPVal.(string))
+		if peerIP == nil {
+			continue
+		}
 
-		// Send packet to peer
-		_, err = a.tunUDPConn.WriteToUDP(packet, peerAddr)
+		// Send inner packet - kernel wraps with outer IP header (dst=peerIP, proto=4)
+		_, err = a.tunIPConn.WriteToIP(packet, &net.IPAddr{IP: peerIP})
 		if err != nil {
-			log.Printf("Failed to send tunneled packet to %s: %v", peerAddr, err)
+			log.Printf("Failed to send IPIP packet to %s: %v", peerIP, err)
 		}
 	}
 }
 
-// tunRecvLoop receives UDP packets from peers and injects them into local network.
+// tunRecvLoop receives IPIP packets from peers and injects the inner packet into local network.
+// IPIP packets have: [outer IP header (20+ bytes)] [inner IP packet]
 func (a *Agent) tunRecvLoop() {
 	buf := make([]byte, 65535)
 	for {
-		n, _, err := a.tunUDPConn.ReadFromUDP(buf)
+		n, _, err := a.tunIPConn.ReadFromIP(buf)
 		if err != nil {
 			select {
 			case <-a.stopCh:
 				return
 			default:
-				log.Printf("UDP tunnel recv error: %v", err)
+				log.Printf("IPIP tunnel recv error: %v", err)
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 		}
 
-		if n < 20 {
-			continue // Too small
+		if n < 40 {
+			continue // Too small: need outer header (20) + inner header (20)
 		}
 
-		packet := buf[:n]
-		if packet[0]>>4 != 4 {
-			continue // Not IPv4
+		// The raw socket gives us the full packet including outer IP header
+		// Calculate outer header length (IHL field * 4)
+		outerIHL := int(buf[0]&0x0f) * 4
+		if n < outerIHL+20 {
+			continue // Not enough data for inner packet
 		}
 
-		// Get destination IP to determine how to inject
-		dstIP := net.IP(packet[16:20])
+		// Extract inner packet (skip outer header)
+		innerPacket := buf[outerIHL:n]
+		if innerPacket[0]>>4 != 4 {
+			continue // Inner packet not IPv4
+		}
+
+		// Get destination IP from inner packet
+		dstIP := net.IP(innerPacket[16:20])
 
 		// Check if this is for a local workload
 		a.stateMu.RLock()
@@ -820,29 +831,25 @@ func (a *Agent) tunRecvLoop() {
 		a.stateMu.RUnlock()
 
 		if localWorkload != nil {
-			// Write to jetty0 interface (our dummy interface where workload IPs are bound)
+			// Write inner packet to local network stack
 			// The iptables DNAT rules will forward to the container
-			a.tunDevice.Write(packet)
+			a.tunDevice.Write(innerPacket)
 		}
 	}
 }
 
-// updateTunPeerAddr updates the UDP address for a peer's tunnel endpoint.
+// updateTunPeerAddr updates the WARP IP for a peer's IPIP tunnel endpoint.
 func (a *Agent) updateTunPeerAddr(peerID, peerIP string) {
-	if a.tunUDPConn == nil || peerIP == "" {
+	if a.tunIPConn == nil || peerIP == "" {
 		return
 	}
-	addr := &net.UDPAddr{
-		IP:   net.ParseIP(peerIP),
-		Port: tunUDPPort,
-	}
-	a.tunPeerAddrs.Store(peerID, addr)
+	a.tunPeerIPs.Store(peerID, peerIP)
 }
 
-// cleanupUserspaceTunnel closes the TUN device and UDP socket.
+// cleanupUserspaceTunnel closes the TUN device and raw IPIP socket.
 func (a *Agent) cleanupUserspaceTunnel() {
-	if a.tunUDPConn != nil {
-		a.tunUDPConn.Close()
+	if a.tunIPConn != nil {
+		a.tunIPConn.Close()
 	}
 	if a.tunDevice != nil {
 		a.tunDevice.Close()
