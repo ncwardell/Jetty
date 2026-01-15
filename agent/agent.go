@@ -1,8 +1,12 @@
 package agent
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -82,6 +86,7 @@ type State struct {
 	Workloads map[string]*Workload `json:"workloads"` // IP -> Workload
 	CFToken   string               `json:"cf_token,omitempty"`   // Cloudflare tunnel token (shared cluster-wide)
 	WarpToken string               `json:"warp_token,omitempty"` // Cloudflare WARP connector token (shared cluster-wide)
+	EnvData   map[string]string    `json:"env_data,omitempty"`   // Encrypted environment variables (key -> encrypted value)
 }
 
 // =============================================================================
@@ -161,6 +166,7 @@ func New() (*Agent, error) {
 			Workloads: make(map[string]*Workload),
 			CFToken:   getEnv("JETTY_CF_TOKEN", ""),             // Bootstrap tunnel token
 			WarpToken: getEnv("JETTY_WARP_CONNECTOR_TOKEN", ""), // Bootstrap WARP connector token
+			EnvData:   make(map[string]string),                  // Encrypted environment variables
 		},
 		stopCh: make(chan struct{}),
 	}
@@ -1090,12 +1096,13 @@ func (a *Agent) joinCluster() error {
 
 	// Success - process response
 	var result struct {
-		Peers        []*Peer     `json:"peers"`
-		Workloads    []*Workload `json:"workloads"`
-		CFToken      string      `json:"cf_token,omitempty"`
-		WarpToken    string      `json:"warp_token,omitempty"`
-		ServiceCIDR  string      `json:"service_cidr,omitempty"`
-		TunnelDomain string      `json:"tunnel_domain,omitempty"`
+		Peers        []*Peer           `json:"peers"`
+		Workloads    []*Workload       `json:"workloads"`
+		CFToken      string            `json:"cf_token,omitempty"`
+		WarpToken    string            `json:"warp_token,omitempty"`
+		ServiceCIDR  string            `json:"service_cidr,omitempty"`
+		TunnelDomain string            `json:"tunnel_domain,omitempty"`
+		EnvData      map[string]string `json:"env_data,omitempty"` // Encrypted env vars
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		resp.Body.Close()
@@ -1128,6 +1135,12 @@ func (a *Agent) joinCluster() error {
 	}
 	if result.WarpToken != "" {
 		a.state.WarpToken = result.WarpToken
+	}
+	// Store encrypted env data received from the cluster
+	if len(result.EnvData) > 0 {
+		for k, v := range result.EnvData {
+			a.state.EnvData[k] = v
+		}
 	}
 	a.stateMu.Unlock()
 
@@ -1260,6 +1273,10 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/tunnel/sync", a.apiTunnelSync).Methods("POST")
 	r.HandleFunc("/api/peer-announce", a.apiPeerAnnounce).Methods("POST")
 	r.HandleFunc("/api/heartbeat", a.apiHeartbeat).Methods("POST")
+	r.HandleFunc("/api/env", a.apiListEnv).Methods("GET")
+	r.HandleFunc("/api/env", a.apiSetEnv).Methods("POST")
+	r.HandleFunc("/api/env/{key}", a.apiGetEnv).Methods("GET")
+	r.HandleFunc("/api/env/{key}", a.apiDeleteEnv).Methods("DELETE")
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)
 
 	// Dashboard UI (embedded)
@@ -2611,6 +2628,11 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	cfToken := a.state.CFToken
 	warpToken := a.state.WarpToken
+	// Copy env data (already encrypted, safe to share)
+	envData := make(map[string]string)
+	for k, v := range a.state.EnvData {
+		envData[k] = v
+	}
 	a.stateMu.Unlock()
 
 	a.updateHosts()
@@ -2645,6 +2667,11 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	// Include tunnel domain if configured
 	if a.tunnelDomain != "" {
 		resp["tunnel_domain"] = a.tunnelDomain
+	}
+
+	// Include encrypted env data so joining node has access
+	if len(envData) > 0 {
+		resp["env_data"] = envData
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3475,17 +3502,29 @@ func getHealthStatus() string {
 }
 
 func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
-	// Return all workloads for sync (not just local ones)
+	// Return all workloads and env data for sync (not just local ones)
 	// This allows other nodes to get a complete view of cluster state
 	a.stateMu.RLock()
 	workloads := make([]*Workload, 0, len(a.state.Workloads))
 	for _, wl := range a.state.Workloads {
 		workloads = append(workloads, wl)
 	}
+	envData := make(map[string]string)
+	for k, v := range a.state.EnvData {
+		envData[k] = v
+	}
 	a.stateMu.RUnlock()
 
+	// Return sync response with workloads and env data
+	resp := map[string]interface{}{
+		"workloads": workloads,
+	}
+	if len(envData) > 0 {
+		resp["env_data"] = envData
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(workloads)
+	json.NewEncoder(w).Encode(resp)
 }
 
 // apiGetTunnel godoc
@@ -3575,6 +3614,161 @@ func (a *Agent) apiDeleteTunnel(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(204)
 	log.Printf("Cloudflare tunnel removed")
+}
+
+// apiListEnv godoc
+// @Summary List environment variables
+// @Description Returns all stored environment variable keys (values are encrypted)
+// @Tags env
+// @Produce json
+// @Success 200 {object} EnvListResponse
+// @Router /env [get]
+func (a *Agent) apiListEnv(w http.ResponseWriter, r *http.Request) {
+	a.stateMu.RLock()
+	keys := make([]string, 0, len(a.state.EnvData))
+	for key := range a.state.EnvData {
+		keys = append(keys, key)
+	}
+	a.stateMu.RUnlock()
+
+	sort.Strings(keys)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"keys":  keys,
+		"count": len(keys),
+	})
+}
+
+// apiSetEnv godoc
+// @Summary Set environment variables
+// @Description Stores encrypted environment variables (existing keys are overwritten)
+// @Tags env
+// @Accept json
+// @Param env body EnvSetRequest true "Environment variables to set"
+// @Success 200 {object} EnvSetResponse
+// @Failure 400 {object} ErrorResponse "Invalid request"
+// @Failure 500 {object} ErrorResponse "Encryption error"
+// @Router /env [post]
+func (a *Agent) apiSetEnv(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	if len(req.Env) == 0 {
+		http.Error(w, "env map required", 400)
+		return
+	}
+
+	// Validate keys (alphanumeric and underscore only)
+	envKeyPattern := regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+	for key := range req.Env {
+		if !envKeyPattern.MatchString(key) {
+			http.Error(w, fmt.Sprintf("invalid env key: %s (must start with letter or underscore, contain only alphanumerics and underscores)", key), 400)
+			return
+		}
+	}
+
+	// Encrypt and store values
+	a.stateMu.Lock()
+	added := make([]string, 0)
+	updated := make([]string, 0)
+	for key, value := range req.Env {
+		encrypted, err := a.encryptValue(value)
+		if err != nil {
+			a.stateMu.Unlock()
+			http.Error(w, fmt.Sprintf("encrypt %s: %v", key, err), 500)
+			return
+		}
+		if _, exists := a.state.EnvData[key]; exists {
+			updated = append(updated, key)
+		} else {
+			added = append(added, key)
+		}
+		a.state.EnvData[key] = encrypted
+	}
+	a.stateMu.Unlock()
+
+	a.saveState()
+
+	sort.Strings(added)
+	sort.Strings(updated)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"added":   added,
+		"updated": updated,
+	})
+
+	log.Printf("Env set: added=%v, updated=%v", added, updated)
+}
+
+// apiGetEnv godoc
+// @Summary Get environment variable
+// @Description Returns the decrypted value of a specific environment variable
+// @Tags env
+// @Produce json
+// @Param key path string true "Environment variable key"
+// @Success 200 {object} EnvGetResponse
+// @Failure 404 {object} ErrorResponse "Key not found"
+// @Failure 500 {object} ErrorResponse "Decryption error"
+// @Router /env/{key} [get]
+func (a *Agent) apiGetEnv(w http.ResponseWriter, r *http.Request) {
+	key := mux.Vars(r)["key"]
+
+	a.stateMu.RLock()
+	encrypted, exists := a.state.EnvData[key]
+	a.stateMu.RUnlock()
+
+	if !exists {
+		http.Error(w, "env key not found", 404)
+		return
+	}
+
+	value, err := a.decryptValue(encrypted)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("decrypt: %v", err), 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"key":   key,
+		"value": value,
+	})
+}
+
+// apiDeleteEnv godoc
+// @Summary Delete environment variable
+// @Description Removes an environment variable from storage
+// @Tags env
+// @Param key path string true "Environment variable key"
+// @Success 204 "Variable deleted"
+// @Failure 404 {object} ErrorResponse "Key not found"
+// @Router /env/{key} [delete]
+func (a *Agent) apiDeleteEnv(w http.ResponseWriter, r *http.Request) {
+	key := mux.Vars(r)["key"]
+
+	a.stateMu.Lock()
+	_, exists := a.state.EnvData[key]
+	if exists {
+		delete(a.state.EnvData, key)
+	}
+	a.stateMu.Unlock()
+
+	if !exists {
+		http.Error(w, "env key not found", 404)
+		return
+	}
+
+	a.saveState()
+
+	w.WriteHeader(204)
+	log.Printf("Env deleted: %s", key)
 }
 
 func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
@@ -4047,6 +4241,21 @@ func (a *Agent) composeCmd(name string, args ...string) (string, error) {
 
 	cmd := exec.Command("docker", cmdArgs...)
 	cmd.Dir = dir
+
+	// Inject decrypted environment variables
+	// Start with current environment
+	cmd.Env = os.Environ()
+
+	// Add decrypted Jetty env vars (these can be used in docker-compose.yml)
+	envData, err := a.getDecryptedEnv()
+	if err != nil {
+		log.Printf("Warning: failed to decrypt env data: %v", err)
+	} else {
+		for key, value := range envData {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, value))
+		}
+	}
+
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -4193,12 +4402,15 @@ func (a *Agent) syncStateOnStartup() {
 		url := fmt.Sprintf("https://%s/api/sync", a.tunnelDomain)
 		resp, err := httpClient.Get(url)
 		if err == nil {
-			var workloads []*Workload
-			json.NewDecoder(resp.Body).Decode(&workloads)
+			var syncResp struct {
+				Workloads []*Workload       `json:"workloads"`
+				EnvData   map[string]string `json:"env_data,omitempty"`
+			}
+			json.NewDecoder(resp.Body).Decode(&syncResp)
 			resp.Body.Close()
 
 			a.stateMu.Lock()
-			for _, w := range workloads {
+			for _, w := range syncResp.Workloads {
 				existing := a.state.Workloads[w.IP]
 				if existing == nil || w.Version > existing.Version {
 					if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
@@ -4206,6 +4418,10 @@ func (a *Agent) syncStateOnStartup() {
 					}
 					a.state.Workloads[w.IP] = w
 				}
+			}
+			// Merge env data from peer
+			for k, v := range syncResp.EnvData {
+				a.state.EnvData[k] = v
 			}
 			a.stateMu.Unlock()
 			synced = true
@@ -4220,12 +4436,15 @@ func (a *Agent) syncStateOnStartup() {
 			continue
 		}
 
-		var workloads []*Workload
-		json.NewDecoder(resp.Body).Decode(&workloads)
+		var syncResp struct {
+			Workloads []*Workload       `json:"workloads"`
+			EnvData   map[string]string `json:"env_data,omitempty"`
+		}
+		json.NewDecoder(resp.Body).Decode(&syncResp)
 		resp.Body.Close()
 
 		a.stateMu.Lock()
-		for _, w := range workloads {
+		for _, w := range syncResp.Workloads {
 			existing := a.state.Workloads[w.IP]
 			if existing == nil || w.Version > existing.Version {
 				if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
@@ -4233,6 +4452,10 @@ func (a *Agent) syncStateOnStartup() {
 				}
 				a.state.Workloads[w.IP] = w
 			}
+		}
+		// Merge env data from peer
+		for k, v := range syncResp.EnvData {
+			a.state.EnvData[k] = v
 		}
 		a.stateMu.Unlock()
 		synced = true
@@ -4264,6 +4487,7 @@ func (a *Agent) syncWorkloads() {
 	a.stateMu.RUnlock()
 
 	var lostOwnership []*Workload
+	var envUpdated bool
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/sync", peer.IP, a.apiPort)
@@ -4272,12 +4496,15 @@ func (a *Agent) syncWorkloads() {
 			continue
 		}
 
-		var workloads []*Workload
-		json.NewDecoder(resp.Body).Decode(&workloads)
+		var syncResp struct {
+			Workloads []*Workload       `json:"workloads"`
+			EnvData   map[string]string `json:"env_data,omitempty"`
+		}
+		json.NewDecoder(resp.Body).Decode(&syncResp)
 		resp.Body.Close()
 
 		a.stateMu.Lock()
-		for _, w := range workloads {
+		for _, w := range syncResp.Workloads {
 			existing := a.state.Workloads[w.IP]
 			if existing == nil || w.Version > existing.Version {
 				// Check if we lost ownership (IP collision resolution)
@@ -4288,6 +4515,13 @@ func (a *Agent) syncWorkloads() {
 				a.state.Workloads[w.IP] = w
 			}
 		}
+		// Merge env data from peer (env data is eventually consistent - accept all keys)
+		for k, v := range syncResp.EnvData {
+			if a.state.EnvData[k] != v {
+				a.state.EnvData[k] = v
+				envUpdated = true
+			}
+		}
 		a.stateMu.Unlock()
 	}
 
@@ -4295,6 +4529,10 @@ func (a *Agent) syncWorkloads() {
 	for _, wl := range lostOwnership {
 		log.Printf("Stopping local workload %s - ownership transferred", wl.Name)
 		a.removeWorkload(wl)
+	}
+
+	if envUpdated {
+		a.saveState()
 	}
 
 	a.updateHosts()
@@ -4311,15 +4549,19 @@ func (a *Agent) tunnelModeSyncWorkloads() {
 	}
 	defer resp.Body.Close()
 
-	var workloads []*Workload
-	if err := json.NewDecoder(resp.Body).Decode(&workloads); err != nil {
+	var syncResp struct {
+		Workloads []*Workload       `json:"workloads"`
+		EnvData   map[string]string `json:"env_data,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
 		return
 	}
 
 	var lostOwnership []*Workload
+	var envUpdated bool
 
 	a.stateMu.Lock()
-	for _, w := range workloads {
+	for _, w := range syncResp.Workloads {
 		existing := a.state.Workloads[w.IP]
 		if existing == nil || w.Version > existing.Version {
 			// Check if we lost ownership (IP collision resolution)
@@ -4330,12 +4572,23 @@ func (a *Agent) tunnelModeSyncWorkloads() {
 			a.state.Workloads[w.IP] = w
 		}
 	}
+	// Merge env data from peer (env data is eventually consistent - accept all keys)
+	for k, v := range syncResp.EnvData {
+		if a.state.EnvData[k] != v {
+			a.state.EnvData[k] = v
+			envUpdated = true
+		}
+	}
 	a.stateMu.Unlock()
 
 	// Stop workloads we lost ownership of (outside lock)
 	for _, wl := range lostOwnership {
 		log.Printf("Stopping local workload %s - ownership transferred", wl.Name)
 		a.removeWorkload(wl)
+	}
+
+	if envUpdated {
+		a.saveState()
 	}
 
 	a.updateHosts()
@@ -4529,6 +4782,101 @@ func (a *Agent) shouldClaim(wl *Workload) bool {
 }
 
 // =============================================================================
+// Encryption
+// =============================================================================
+
+// deriveKey derives a 32-byte AES key from the cluster secret using SHA-256.
+func (a *Agent) deriveKey() []byte {
+	hash := sha256.Sum256([]byte(a.clusterSecret))
+	return hash[:]
+}
+
+// encryptValue encrypts a plaintext value using AES-GCM with the cluster secret.
+// Returns base64-encoded ciphertext.
+func (a *Agent) encryptValue(plaintext string) (string, error) {
+	if a.clusterSecret == "" {
+		return "", fmt.Errorf("cluster secret not configured")
+	}
+
+	key := a.deriveKey()
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("create cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("create GCM: %w", err)
+	}
+
+	// Generate random nonce
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", fmt.Errorf("generate nonce: %w", err)
+	}
+
+	// Encrypt and prepend nonce to ciphertext
+	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+// decryptValue decrypts a base64-encoded ciphertext using AES-GCM with the cluster secret.
+// Returns the plaintext value.
+func (a *Agent) decryptValue(encrypted string) (string, error) {
+	if a.clusterSecret == "" {
+		return "", fmt.Errorf("cluster secret not configured")
+	}
+
+	ciphertext, err := base64.StdEncoding.DecodeString(encrypted)
+	if err != nil {
+		return "", fmt.Errorf("decode base64: %w", err)
+	}
+
+	key := a.deriveKey()
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("create cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("create GCM: %w", err)
+	}
+
+	if len(ciphertext) < gcm.NonceSize() {
+		return "", fmt.Errorf("ciphertext too short")
+	}
+
+	// Extract nonce and decrypt
+	nonce := ciphertext[:gcm.NonceSize()]
+	ciphertext = ciphertext[gcm.NonceSize():]
+
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", fmt.Errorf("decrypt: %w", err)
+	}
+
+	return string(plaintext), nil
+}
+
+// getDecryptedEnv returns all environment variables decrypted.
+// Returns a map of key -> decrypted value.
+func (a *Agent) getDecryptedEnv() (map[string]string, error) {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+
+	result := make(map[string]string)
+	for key, encrypted := range a.state.EnvData {
+		value, err := a.decryptValue(encrypted)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt %s: %w", key, err)
+		}
+		result[key] = value
+	}
+	return result, nil
+}
+
+// =============================================================================
 // State Persistence
 // =============================================================================
 
@@ -4568,9 +4916,14 @@ func (a *Agent) loadState() {
 	if envCFToken != "" && a.state.CFToken == "" {
 		a.state.CFToken = envCFToken
 	}
+
+	// Initialize EnvData map if nil (for backwards compatibility)
+	if a.state.EnvData == nil {
+		a.state.EnvData = make(map[string]string)
+	}
 	a.stateMu.Unlock()
 
-	log.Printf("Loaded: %d peers, %d workloads", len(a.state.Peers), len(a.state.Workloads))
+	log.Printf("Loaded: %d peers, %d workloads, %d env vars", len(a.state.Peers), len(a.state.Workloads), len(a.state.EnvData))
 }
 
 // =============================================================================
