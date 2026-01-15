@@ -81,12 +81,19 @@ type Workload struct {
 	Version      int64    `json:"version"`                 // Unix timestamp
 }
 
+// DeletedWorkload represents a tombstone for a deleted workload to propagate deletions
+type DeletedWorkload struct {
+	IP      string `json:"ip"`      // The IP of the deleted workload
+	Version int64  `json:"version"` // Timestamp when deleted (must be > workload version to take effect)
+}
+
 type State struct {
-	Peers     map[string]*Peer     `json:"peers"`     // ID -> Peer
-	Workloads map[string]*Workload `json:"workloads"` // IP -> Workload
-	CFToken   string               `json:"cf_token,omitempty"`   // Cloudflare tunnel token (shared cluster-wide)
-	WarpToken string               `json:"warp_token,omitempty"` // Cloudflare WARP connector token (shared cluster-wide)
-	EnvData   map[string]string    `json:"env_data,omitempty"`   // Encrypted environment variables (key -> encrypted value)
+	Peers            map[string]*Peer            `json:"peers"`                       // ID -> Peer
+	Workloads        map[string]*Workload        `json:"workloads"`                   // IP -> Workload
+	DeletedWorkloads map[string]*DeletedWorkload `json:"deleted_workloads,omitempty"` // IP -> tombstone (for sync propagation)
+	CFToken          string                      `json:"cf_token,omitempty"`          // Cloudflare tunnel token (shared cluster-wide)
+	WarpToken        string                      `json:"warp_token,omitempty"`        // Cloudflare WARP connector token (shared cluster-wide)
+	EnvData          map[string]string           `json:"env_data,omitempty"`          // Encrypted environment variables (key -> encrypted value)
 }
 
 // =============================================================================
@@ -162,11 +169,12 @@ func New() (*Agent, error) {
 		workloadRoutes:  make(map[string]string),
 		ipipWarnedPeers: make(map[string]bool),
 		state: &State{
-			Peers:     make(map[string]*Peer),
-			Workloads: make(map[string]*Workload),
-			CFToken:   getEnv("JETTY_CF_TOKEN", ""),             // Bootstrap tunnel token
-			WarpToken: getEnv("JETTY_WARP_CONNECTOR_TOKEN", ""), // Bootstrap WARP connector token
-			EnvData:   make(map[string]string),                  // Encrypted environment variables
+			Peers:            make(map[string]*Peer),
+			Workloads:        make(map[string]*Workload),
+			DeletedWorkloads: make(map[string]*DeletedWorkload), // Tombstones for deleted workloads
+			CFToken:          getEnv("JETTY_CF_TOKEN", ""),      // Bootstrap tunnel token
+			WarpToken:        getEnv("JETTY_WARP_CONNECTOR_TOKEN", ""), // Bootstrap WARP connector token
+			EnvData:          make(map[string]string),           // Encrypted environment variables
 		},
 		stopCh: make(chan struct{}),
 	}
@@ -2141,10 +2149,18 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Cleaning up orphaned workload %s (owner %s unreachable)", name, found.Owner)
 	}
 
-	// Local workload or orphaned cleanup - delete from state
+	// Local workload or orphaned cleanup - delete from state and add tombstone
 	a.stateMu.Lock()
 	delete(a.state.Workloads, foundIP)
+	// Add tombstone with version greater than the deleted workload's version
+	// This ensures the deletion propagates to peers even if they have older copies
+	a.state.DeletedWorkloads[foundIP] = &DeletedWorkload{
+		IP:      foundIP,
+		Version: time.Now().Unix(),
+	}
 	a.stateMu.Unlock()
+
+	log.Printf("Deleted workload %s (IP %s), created tombstone for sync propagation", name, foundIP)
 
 	// Remove if we're running it
 	if found.Owner == a.hwid {
@@ -3502,12 +3518,16 @@ func getHealthStatus() string {
 }
 
 func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
-	// Return all workloads and env data for sync (not just local ones)
-	// This allows other nodes to get a complete view of cluster state
+	// Return all workloads, deleted workloads (tombstones), and env data for sync
+	// This allows other nodes to get a complete view of cluster state including deletions
 	a.stateMu.RLock()
 	workloads := make([]*Workload, 0, len(a.state.Workloads))
 	for _, wl := range a.state.Workloads {
 		workloads = append(workloads, wl)
+	}
+	deletedWorkloads := make([]*DeletedWorkload, 0, len(a.state.DeletedWorkloads))
+	for _, dw := range a.state.DeletedWorkloads {
+		deletedWorkloads = append(deletedWorkloads, dw)
 	}
 	envData := make(map[string]string)
 	for k, v := range a.state.EnvData {
@@ -3515,9 +3535,12 @@ func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 	}
 	a.stateMu.RUnlock()
 
-	// Return sync response with workloads and env data
+	// Return sync response with workloads, tombstones, and env data
 	resp := map[string]interface{}{
 		"workloads": workloads,
+	}
+	if len(deletedWorkloads) > 0 {
+		resp["deleted_workloads"] = deletedWorkloads
 	}
 	if len(envData) > 0 {
 		resp["env_data"] = envData
@@ -4268,6 +4291,9 @@ func (a *Agent) gossipLoop() {
 	tick := time.NewTicker(10 * time.Second)
 	defer tick.Stop()
 
+	// Run tombstone GC every 10 minutes (every 60th tick)
+	gcCounter := 0
+
 	for {
 		select {
 		case <-a.stopCh:
@@ -4275,7 +4301,36 @@ func (a *Agent) gossipLoop() {
 		case <-tick.C:
 			a.checkPeers()
 			a.syncWorkloads()
+
+			// Garbage collect old tombstones periodically
+			gcCounter++
+			if gcCounter >= 60 { // Every 10 minutes (60 * 10 seconds)
+				a.gcTombstones()
+				gcCounter = 0
+			}
 		}
+	}
+}
+
+// gcTombstones removes tombstones older than 1 hour.
+// This prevents unbounded growth of the tombstone map while ensuring
+// deletions have enough time to propagate across all nodes.
+func (a *Agent) gcTombstones() {
+	cutoff := time.Now().Unix() - 3600 // 1 hour ago
+
+	a.stateMu.Lock()
+	removed := 0
+	for ip, dw := range a.state.DeletedWorkloads {
+		if dw.Version < cutoff {
+			delete(a.state.DeletedWorkloads, ip)
+			removed++
+		}
+	}
+	a.stateMu.Unlock()
+
+	if removed > 0 {
+		log.Printf("GC: removed %d old tombstones", removed)
+		a.saveState()
 	}
 }
 
@@ -4403,20 +4458,41 @@ func (a *Agent) syncStateOnStartup() {
 		resp, err := httpClient.Get(url)
 		if err == nil {
 			var syncResp struct {
-				Workloads []*Workload       `json:"workloads"`
-				EnvData   map[string]string `json:"env_data,omitempty"`
+				Workloads        []*Workload        `json:"workloads"`
+				DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
+				EnvData          map[string]string  `json:"env_data,omitempty"`
 			}
 			json.NewDecoder(resp.Body).Decode(&syncResp)
 			resp.Body.Close()
 
 			a.stateMu.Lock()
+			// Process deleted workloads (tombstones) first
+			for _, dw := range syncResp.DeletedWorkloads {
+				existingTombstone := a.state.DeletedWorkloads[dw.IP]
+				if existingTombstone == nil || dw.Version > existingTombstone.Version {
+					a.state.DeletedWorkloads[dw.IP] = dw
+				}
+				existing := a.state.Workloads[dw.IP]
+				if existing != nil && dw.Version > existing.Version {
+					log.Printf("Startup sync: workload %s was deleted while we were down", existing.Name)
+					delete(a.state.Workloads, dw.IP)
+				}
+			}
+			// Process workloads
 			for _, w := range syncResp.Workloads {
+				tombstone := a.state.DeletedWorkloads[w.IP]
+				if tombstone != nil && tombstone.Version > w.Version {
+					continue
+				}
 				existing := a.state.Workloads[w.IP]
 				if existing == nil || w.Version > existing.Version {
 					if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
 						log.Printf("Workload %s was revived by %s while we were down", w.Name, w.Owner[:12])
 					}
 					a.state.Workloads[w.IP] = w
+					if tombstone != nil {
+						delete(a.state.DeletedWorkloads, w.IP)
+					}
 				}
 			}
 			// Merge env data from peer
@@ -4437,20 +4513,41 @@ func (a *Agent) syncStateOnStartup() {
 		}
 
 		var syncResp struct {
-			Workloads []*Workload       `json:"workloads"`
-			EnvData   map[string]string `json:"env_data,omitempty"`
+			Workloads        []*Workload        `json:"workloads"`
+			DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
+			EnvData          map[string]string  `json:"env_data,omitempty"`
 		}
 		json.NewDecoder(resp.Body).Decode(&syncResp)
 		resp.Body.Close()
 
 		a.stateMu.Lock()
+		// Process deleted workloads (tombstones) first
+		for _, dw := range syncResp.DeletedWorkloads {
+			existingTombstone := a.state.DeletedWorkloads[dw.IP]
+			if existingTombstone == nil || dw.Version > existingTombstone.Version {
+				a.state.DeletedWorkloads[dw.IP] = dw
+			}
+			existing := a.state.Workloads[dw.IP]
+			if existing != nil && dw.Version > existing.Version {
+				log.Printf("Startup sync: workload %s was deleted while we were down", existing.Name)
+				delete(a.state.Workloads, dw.IP)
+			}
+		}
+		// Process workloads
 		for _, w := range syncResp.Workloads {
+			tombstone := a.state.DeletedWorkloads[w.IP]
+			if tombstone != nil && tombstone.Version > w.Version {
+				continue
+			}
 			existing := a.state.Workloads[w.IP]
 			if existing == nil || w.Version > existing.Version {
 				if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
 					log.Printf("Workload %s was revived by %s while we were down", w.Name, w.Owner[:12])
 				}
 				a.state.Workloads[w.IP] = w
+				if tombstone != nil {
+					delete(a.state.DeletedWorkloads, w.IP)
+				}
 			}
 		}
 		// Merge env data from peer
@@ -4497,14 +4594,40 @@ func (a *Agent) syncWorkloads() {
 		}
 
 		var syncResp struct {
-			Workloads []*Workload       `json:"workloads"`
-			EnvData   map[string]string `json:"env_data,omitempty"`
+			Workloads        []*Workload        `json:"workloads"`
+			DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
+			EnvData          map[string]string  `json:"env_data,omitempty"`
 		}
 		json.NewDecoder(resp.Body).Decode(&syncResp)
 		resp.Body.Close()
 
 		a.stateMu.Lock()
+		// Process deleted workloads (tombstones) first
+		for _, dw := range syncResp.DeletedWorkloads {
+			// Merge tombstone if we don't have it or peer's is newer
+			existingTombstone := a.state.DeletedWorkloads[dw.IP]
+			if existingTombstone == nil || dw.Version > existingTombstone.Version {
+				a.state.DeletedWorkloads[dw.IP] = dw
+			}
+			// Check if we have a local workload that should be deleted
+			existing := a.state.Workloads[dw.IP]
+			if existing != nil && dw.Version > existing.Version {
+				log.Printf("Sync: removing workload %s (IP %s) - deleted by peer (tombstone version %d > workload version %d)",
+					existing.Name, dw.IP, dw.Version, existing.Version)
+				if existing.Owner == a.hwid {
+					lostOwnership = append(lostOwnership, existing)
+				}
+				delete(a.state.Workloads, dw.IP)
+			}
+		}
+		// Process workloads - only add/update if not tombstoned with a newer version
 		for _, w := range syncResp.Workloads {
+			// Check if there's a tombstone that supersedes this workload
+			tombstone := a.state.DeletedWorkloads[w.IP]
+			if tombstone != nil && tombstone.Version > w.Version {
+				// Tombstone is newer, ignore this workload
+				continue
+			}
 			existing := a.state.Workloads[w.IP]
 			if existing == nil || w.Version > existing.Version {
 				// Check if we lost ownership (IP collision resolution)
@@ -4513,6 +4636,10 @@ func (a *Agent) syncWorkloads() {
 					lostOwnership = append(lostOwnership, existing)
 				}
 				a.state.Workloads[w.IP] = w
+				// Clear any older tombstone since we're accepting a newer workload
+				if tombstone != nil {
+					delete(a.state.DeletedWorkloads, w.IP)
+				}
 			}
 		}
 		// Merge env data from peer (env data is eventually consistent - accept all keys)
@@ -4550,8 +4677,9 @@ func (a *Agent) tunnelModeSyncWorkloads() {
 	defer resp.Body.Close()
 
 	var syncResp struct {
-		Workloads []*Workload       `json:"workloads"`
-		EnvData   map[string]string `json:"env_data,omitempty"`
+		Workloads        []*Workload        `json:"workloads"`
+		DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
+		EnvData          map[string]string  `json:"env_data,omitempty"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
 		return
@@ -4561,7 +4689,32 @@ func (a *Agent) tunnelModeSyncWorkloads() {
 	var envUpdated bool
 
 	a.stateMu.Lock()
+	// Process deleted workloads (tombstones) first
+	for _, dw := range syncResp.DeletedWorkloads {
+		// Merge tombstone if we don't have it or peer's is newer
+		existingTombstone := a.state.DeletedWorkloads[dw.IP]
+		if existingTombstone == nil || dw.Version > existingTombstone.Version {
+			a.state.DeletedWorkloads[dw.IP] = dw
+		}
+		// Check if we have a local workload that should be deleted
+		existing := a.state.Workloads[dw.IP]
+		if existing != nil && dw.Version > existing.Version {
+			log.Printf("Sync: removing workload %s (IP %s) - deleted by peer (tombstone version %d > workload version %d)",
+				existing.Name, dw.IP, dw.Version, existing.Version)
+			if existing.Owner == a.hwid {
+				lostOwnership = append(lostOwnership, existing)
+			}
+			delete(a.state.Workloads, dw.IP)
+		}
+	}
+	// Process workloads - only add/update if not tombstoned with a newer version
 	for _, w := range syncResp.Workloads {
+		// Check if there's a tombstone that supersedes this workload
+		tombstone := a.state.DeletedWorkloads[w.IP]
+		if tombstone != nil && tombstone.Version > w.Version {
+			// Tombstone is newer, ignore this workload
+			continue
+		}
 		existing := a.state.Workloads[w.IP]
 		if existing == nil || w.Version > existing.Version {
 			// Check if we lost ownership (IP collision resolution)
@@ -4570,6 +4723,10 @@ func (a *Agent) tunnelModeSyncWorkloads() {
 				lostOwnership = append(lostOwnership, existing)
 			}
 			a.state.Workloads[w.IP] = w
+			// Clear any older tombstone since we're accepting a newer workload
+			if tombstone != nil {
+				delete(a.state.DeletedWorkloads, w.IP)
+			}
 		}
 	}
 	// Merge env data from peer (env data is eventually consistent - accept all keys)
@@ -4920,6 +5077,10 @@ func (a *Agent) loadState() {
 	// Initialize EnvData map if nil (for backwards compatibility)
 	if a.state.EnvData == nil {
 		a.state.EnvData = make(map[string]string)
+	}
+	// Initialize DeletedWorkloads map if nil (for backwards compatibility)
+	if a.state.DeletedWorkloads == nil {
+		a.state.DeletedWorkloads = make(map[string]*DeletedWorkload)
 	}
 	a.stateMu.Unlock()
 
