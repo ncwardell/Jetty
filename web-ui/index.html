@@ -668,6 +668,13 @@
         .actions-cell {
             display: flex;
             gap: 8px;
+            align-items: center;
+        }
+
+        .value-cell {
+            display: flex;
+            gap: 8px;
+            align-items: center;
         }
 
         /* Logs Container */
@@ -2100,6 +2107,51 @@
         </div>
     </div>
 
+    <!-- Edit Workload Modal -->
+    <div class="modal-overlay hidden" id="editWorkloadModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title">Edit Workload: <span id="editWorkloadName"></span></h2>
+                <button class="modal-close" onclick="closeEditWorkloadModal()">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">Mesh IP</label>
+                    <input type="text" class="form-input" id="editWorkloadIP" placeholder="10.100.0.x">
+                    <small style="color: var(--text-muted);">Changing IP will trigger a redeploy</small>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" style="display: flex; align-items: center; gap: 8px;">
+                        <input type="checkbox" id="editWorkloadRevive">
+                        Revive
+                    </label>
+                    <small style="color: var(--text-muted);">Automatically restart on another node if owner goes down</small>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" style="display: flex; align-items: center; gap: 8px;">
+                        <input type="checkbox" id="editWorkloadAutostart">
+                        Autostart
+                    </label>
+                    <small style="color: var(--text-muted);">Start workload automatically when agent starts</small>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Allowed Nodes</label>
+                    <input type="text" class="form-input" id="editWorkloadAllowedNodes" placeholder="node1, node2, node3">
+                    <small style="color: var(--text-muted);">Comma-separated list of nodes allowed to run this workload (empty = all)</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeEditWorkloadModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveWorkloadEdit()">Save Changes</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Add/Edit Secret Modal -->
     <div class="modal-overlay hidden" id="secretModal">
         <div class="modal">
@@ -2331,6 +2383,9 @@
         function setRefreshInterval(ms) {
             refreshState.intervalMs = parseInt(ms);
 
+            // Save to localStorage
+            localStorage.setItem('jetty_refresh_interval', refreshState.intervalMs);
+
             // Clear existing interval
             if (refreshState.intervalId) {
                 clearInterval(refreshState.intervalId);
@@ -2343,6 +2398,19 @@
             }
 
             updateLastRefreshedDisplay();
+        }
+
+        // Load saved refresh interval from localStorage
+        function loadSavedRefreshInterval() {
+            const saved = localStorage.getItem('jetty_refresh_interval');
+            if (saved !== null) {
+                const ms = parseInt(saved);
+                const select = document.getElementById('refreshInterval');
+                if (select) {
+                    select.value = ms;
+                }
+                refreshState.intervalMs = ms;
+            }
         }
 
         // Perform auto-refresh of all data
@@ -2845,6 +2913,7 @@
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
             loadSavedConnection();
+            loadSavedRefreshInterval();
             loadActivityLog();
             setupKeyboardShortcuts();
             if (state.apiUrl && state.secretKey) {
@@ -2906,6 +2975,8 @@
                 updateLastRefreshedDisplay();
                 updateConnectionStatus();
                 saveConnection();
+                // Start auto-refresh with saved interval
+                setRefreshInterval(refreshState.intervalMs);
                 closeConnectModal();
                 showToast('Connected to Jetty cluster', 'success');
                 addActivity('connect', 'Connected to cluster', `${state.node?.name || 'Cluster'} at ${state.apiUrl}`);
@@ -2999,7 +3070,7 @@
 
             state.node = status.node;
             state.peers = status.peers || [];
-            state.workloads = status.workloads || [];
+            state.workloads = (status.workloads || []).sort((a, b) => a.name.localeCompare(b.name));
             state.tunnel = status.tunnel || { configured: false, running: false };
             state.warp = status.warp || { enabled: false, ip: '' };
 
@@ -3338,7 +3409,18 @@
                         <td>${ownerName}</td>
                         <td>${w.revive ? 'Yes' : 'No'}</td>
                         <td class="actions-cell">
-                            ${isLocal ? (isRunning ? `
+                            ${isRunning ? `
+                                <button class="btn btn-sm" onclick="stopWorkload('${w.name}')" title="Stop">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <rect x="6" y="6" width="12" height="12"/>
+                                    </svg>
+                                </button>
+                            ` : w.status === 'remote' ? `
+                                <button class="btn btn-sm btn-success" onclick="startWorkload('${w.name}')" title="Start">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <polygon points="5 3 19 12 5 21 5 3"/>
+                                    </svg>
+                                </button>
                                 <button class="btn btn-sm" onclick="stopWorkload('${w.name}')" title="Stop">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                         <rect x="6" y="6" width="12" height="12"/>
@@ -3350,7 +3432,13 @@
                                         <polygon points="5 3 19 12 5 21 5 3"/>
                                     </svg>
                                 </button>
-                            `) : ''}
+                            `}
+                            <button class="btn btn-sm" onclick="openEditWorkloadModal('${w.name}')" title="Edit">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                                </svg>
+                            </button>
                             <button class="btn btn-sm" onclick="openMoveModal('${w.name}')" title="Move">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <polyline points="5 9 2 12 5 15"/>
@@ -3680,6 +3768,77 @@
             } catch (error) {
                 showToast(`Move failed: ${error.message}`, 'error');
                 addActivity('error', `Failed to move "${workloadToMove}"`, error.message);
+            }
+        }
+
+        // Edit Workload
+        let workloadToEdit = null;
+
+        function openEditWorkloadModal(name) {
+            workloadToEdit = name;
+            const workload = state.workloads.find(w => w.name === name);
+            if (!workload) {
+                showToast('Workload not found', 'error');
+                return;
+            }
+
+            document.getElementById('editWorkloadName').textContent = name;
+            document.getElementById('editWorkloadIP').value = workload.ip || '';
+            document.getElementById('editWorkloadRevive').checked = workload.revive || false;
+            document.getElementById('editWorkloadAutostart').checked = workload.autostart || false;
+            document.getElementById('editWorkloadAllowedNodes').value = (workload.allowed_nodes || []).join(', ');
+
+            document.getElementById('editWorkloadModal').classList.remove('hidden');
+        }
+
+        function closeEditWorkloadModal() {
+            document.getElementById('editWorkloadModal').classList.add('hidden');
+            workloadToEdit = null;
+        }
+
+        async function saveWorkloadEdit() {
+            if (!workloadToEdit) return;
+
+            const update = {};
+            const workload = state.workloads.find(w => w.name === workloadToEdit);
+
+            const newIP = document.getElementById('editWorkloadIP').value.trim();
+            const newRevive = document.getElementById('editWorkloadRevive').checked;
+            const newAutostart = document.getElementById('editWorkloadAutostart').checked;
+            const allowedNodesStr = document.getElementById('editWorkloadAllowedNodes').value.trim();
+            const newAllowedNodes = allowedNodesStr ? allowedNodesStr.split(',').map(s => s.trim()).filter(s => s) : [];
+
+            // Only include changed fields
+            if (newIP && newIP !== workload.ip) {
+                update.ip = newIP;
+            }
+            if (newRevive !== workload.revive) {
+                update.revive = newRevive;
+            }
+            if (newAutostart !== workload.autostart) {
+                update.autostart = newAutostart;
+            }
+            // Compare allowed_nodes arrays
+            const currentAllowed = workload.allowed_nodes || [];
+            if (JSON.stringify(newAllowedNodes.sort()) !== JSON.stringify([...currentAllowed].sort())) {
+                update.allowed_nodes = newAllowedNodes;
+            }
+
+            if (Object.keys(update).length === 0) {
+                showToast('No changes to save', 'info');
+                closeEditWorkloadModal();
+                return;
+            }
+
+            try {
+                await apiCall(`/workloads/${workloadToEdit}`, 'PATCH', update);
+                showToast(`Workload "${workloadToEdit}" updated`, 'success');
+                addActivity('edit', `Updated workload "${workloadToEdit}"`, Object.keys(update).join(', '));
+                closeEditWorkloadModal();
+                await refreshStatus();
+            } catch (error) {
+                showToast(`Update failed: ${error.message}`, 'error');
+                addActivity('error', `Failed to update "${workloadToEdit}"`, error.message);
             }
         }
 
@@ -4186,7 +4345,7 @@
             tbody.innerHTML = secretsData.keys.map(key => `
                 <tr>
                     <td><code>${escapeHtml(key)}</code></td>
-                    <td>
+                    <td class="value-cell">
                         <span class="secret-value-hidden" id="secret-value-${key}" style="color: var(--text-muted);">
                             ••••••••
                         </span>
