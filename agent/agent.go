@@ -27,6 +27,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/ncwardell/jetty/docs"
+	"github.com/songgao/water"
 	httpSwagger "github.com/swaggo/http-swagger"
 )
 
@@ -146,6 +147,11 @@ type Agent struct {
 	tunnelMode        string            // "ipip", "gre", or "" (none available)
 	ipipWarnedPeers   map[string]bool   // Peers we've already warned about tunnel failure
 	ipipWarnedPeersMu sync.Mutex
+
+	// Userspace tunnel (fallback when kernel IPIP/GRE not available)
+	tunDevice    *water.Interface // TUN device for capturing workload traffic
+	tunUDPConn   *net.UDPConn     // UDP socket for tunneled packets
+	tunPeerAddrs sync.Map         // peerID -> *net.UDPAddr (peer tunnel endpoints)
 
 	stopCh chan struct{}
 }
@@ -546,6 +552,9 @@ func (a *Agent) cleanupNetwork() {
 	}
 	a.stateMu.RUnlock()
 
+	// Clean up userspace tunnel if active
+	a.cleanupUserspaceTunnel()
+
 	// Remove jetty0 interface (this also removes all IPs bound to it)
 	if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
 		log.Printf("Warning: could not remove jetty0 interface: %v", err)
@@ -625,7 +634,10 @@ func (a *Agent) initNetwork() error {
 	// Try IPIP first (most efficient), then GRE as fallback
 	a.tunnelMode = a.detectTunnelMode()
 	if a.tunnelMode == "" {
-		log.Printf("Warning: IPIP/GRE tunnels not available (kernel module not loaded) - using direct WARP routing fallback")
+		log.Printf("Warning: IPIP/GRE tunnels not available (kernel module not loaded) - trying userspace tunnel")
+		if err := a.initUserspaceTunnel(); err != nil {
+			log.Printf("Warning: userspace tunnel also failed: %v - cross-node workload routing disabled", err)
+		}
 	}
 
 	log.Printf("Network ready: %s (WARP), workload interface: jetty0", a.ip)
@@ -663,6 +675,173 @@ func (a *Agent) detectTunnelMode() string {
 
 	// No tunnel mode available
 	return ""
+}
+
+// =============================================================================
+// Userspace Tunnel (fallback when kernel IPIP/GRE not available)
+// =============================================================================
+
+const tunUDPPort = 6892 // UDP port for userspace tunnel packets
+
+// initUserspaceTunnel creates a TUN device and UDP listener for userspace tunneling.
+// This is used when kernel IPIP/GRE modules aren't available (e.g., ChromeOS).
+// Traffic to remote workloads (10.100.x.x) is captured via TUN, wrapped in UDP,
+// and sent to the peer's WARP IP (100.96.x.x).
+func (a *Agent) initUserspaceTunnel() error {
+	// Create TUN device
+	config := water.Config{
+		DeviceType: water.TUN,
+	}
+	config.Name = "jetty_tun"
+
+	tun, err := water.New(config)
+	if err != nil {
+		return fmt.Errorf("create TUN device: %w", err)
+	}
+	a.tunDevice = tun
+
+	// Configure TUN device
+	if err := exec.Command("ip", "link", "set", "up", "dev", "jetty_tun").Run(); err != nil {
+		tun.Close()
+		return fmt.Errorf("bring up TUN device: %w", err)
+	}
+
+	// Start UDP listener for incoming tunneled packets
+	addr := &net.UDPAddr{Port: tunUDPPort}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		tun.Close()
+		return fmt.Errorf("start UDP tunnel listener: %w", err)
+	}
+	a.tunUDPConn = conn
+
+	// Start packet forwarding goroutines
+	go a.tunReadLoop()  // TUN -> UDP (outgoing)
+	go a.tunRecvLoop()  // UDP -> local (incoming)
+
+	log.Printf("Userspace tunnel initialized (TUN: jetty_tun, UDP port: %d)", tunUDPPort)
+	return nil
+}
+
+// tunReadLoop reads packets from TUN device and sends them to the appropriate peer via UDP.
+func (a *Agent) tunReadLoop() {
+	buf := make([]byte, 65535)
+	for {
+		n, err := a.tunDevice.Read(buf)
+		if err != nil {
+			select {
+			case <-a.stopCh:
+				return
+			default:
+				log.Printf("TUN read error: %v", err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+		}
+
+		if n < 20 {
+			continue // Too small to be valid IP packet
+		}
+
+		// Parse destination IP from IP header (bytes 16-19 for IPv4)
+		packet := buf[:n]
+		if packet[0]>>4 != 4 {
+			continue // Not IPv4
+		}
+		dstIP := net.IP(packet[16:20])
+
+		// Find peer that owns this workload IP
+		a.workloadRoutesMu.Lock()
+		ownerID, ok := a.workloadRoutes[dstIP.String()]
+		a.workloadRoutesMu.Unlock()
+
+		if !ok {
+			continue // No route for this destination
+		}
+
+		// Get peer's UDP address
+		addrVal, ok := a.tunPeerAddrs.Load(ownerID)
+		if !ok {
+			continue // Peer address not known
+		}
+		peerAddr := addrVal.(*net.UDPAddr)
+
+		// Send packet to peer
+		_, err = a.tunUDPConn.WriteToUDP(packet, peerAddr)
+		if err != nil {
+			log.Printf("Failed to send tunneled packet to %s: %v", peerAddr, err)
+		}
+	}
+}
+
+// tunRecvLoop receives UDP packets from peers and injects them into local network.
+func (a *Agent) tunRecvLoop() {
+	buf := make([]byte, 65535)
+	for {
+		n, _, err := a.tunUDPConn.ReadFromUDP(buf)
+		if err != nil {
+			select {
+			case <-a.stopCh:
+				return
+			default:
+				log.Printf("UDP tunnel recv error: %v", err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+		}
+
+		if n < 20 {
+			continue // Too small
+		}
+
+		packet := buf[:n]
+		if packet[0]>>4 != 4 {
+			continue // Not IPv4
+		}
+
+		// Get destination IP to determine how to inject
+		dstIP := net.IP(packet[16:20])
+
+		// Check if this is for a local workload
+		a.stateMu.RLock()
+		var localWorkload *Workload
+		for _, wl := range a.state.Workloads {
+			if wl.Owner == a.hwid && wl.IP == dstIP.String() {
+				localWorkload = wl
+				break
+			}
+		}
+		a.stateMu.RUnlock()
+
+		if localWorkload != nil {
+			// Write to jetty0 interface (our dummy interface where workload IPs are bound)
+			// The iptables DNAT rules will forward to the container
+			a.tunDevice.Write(packet)
+		}
+	}
+}
+
+// updateTunPeerAddr updates the UDP address for a peer's tunnel endpoint.
+func (a *Agent) updateTunPeerAddr(peerID, peerIP string) {
+	if a.tunUDPConn == nil || peerIP == "" {
+		return
+	}
+	addr := &net.UDPAddr{
+		IP:   net.ParseIP(peerIP),
+		Port: tunUDPPort,
+	}
+	a.tunPeerAddrs.Store(peerID, addr)
+}
+
+// cleanupUserspaceTunnel closes the TUN device and UDP socket.
+func (a *Agent) cleanupUserspaceTunnel() {
+	if a.tunUDPConn != nil {
+		a.tunUDPConn.Close()
+	}
+	if a.tunDevice != nil {
+		a.tunDevice.Close()
+		exec.Command("ip", "link", "del", "jetty_tun").Run()
+	}
 }
 
 // initWarpRules sets up nftables rules for WARP traffic routing.
@@ -1035,7 +1214,7 @@ func (a *Agent) updateWorkloadRoutes() {
 		return
 	}
 
-	// If tunnel mode is available, ensure tunnels exist to ALL healthy peers
+	// If kernel tunnel mode is available, ensure tunnels exist to ALL healthy peers
 	// IPIP/GRE requires bidirectional tunnels - if peer A routes to peer B, peer B needs a
 	// tunnel back to A for decapsulation. By creating tunnels to all peers, any node
 	// can receive encapsulated traffic from any other node.
@@ -1045,6 +1224,13 @@ func (a *Agent) updateWorkloadRoutes() {
 				if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
 					log.Printf("Warning: failed to create tunnel to %s: %v", peer.Name, err)
 				}
+			}
+		}
+	} else if a.tunDevice != nil {
+		// Using userspace tunnel - update peer addresses
+		for _, peer := range a.state.Peers {
+			if peer.IP != "" && peer.Healthy {
+				a.updateTunPeerAddr(peer.ID, peer.IP)
 			}
 		}
 	}
@@ -1094,8 +1280,12 @@ func (a *Agent) updateWorkloadRoutes() {
 			tunName := a.getTunnelName(info.ownerID)
 			err = exec.Command("ip", "route", "add", wlIP+"/32", "dev", tunName).Run()
 			routeDesc = "tunnel " + tunName
+		} else if a.tunDevice != nil {
+			// Route through userspace tunnel (TUN device)
+			err = exec.Command("ip", "route", "add", wlIP+"/32", "dev", "jetty_tun").Run()
+			routeDesc = "userspace tunnel to " + info.ownerIP
 		} else {
-			// Fallback: route directly through WARP interface
+			// Last resort: route directly through WARP interface
 			// This works if WARP is configured to route 10.100.x.x traffic
 			err = exec.Command("ip", "route", "add", wlIP+"/32", "via", info.ownerIP, "dev", "CloudflareWARP").Run()
 			routeDesc = "WARP via " + info.ownerIP
