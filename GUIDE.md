@@ -46,7 +46,7 @@ A workload is a Docker Compose application with a dedicated mesh IP:
 ```json
 {
   "name": "nginx",
-  "mesh_ip": "10.100.50.1",
+  "ip": "10.100.50.1",
   "compose": "services:\n  web:\n    image: nginx",
   "revive": true,
   "autostart": true,
@@ -54,19 +54,19 @@ A workload is a Docker Compose application with a dedicated mesh IP:
   "owner": {
     "id": "abc123...",
     "name": "node1",
-    "mesh_ip": "10.100.0.1"
+    "ip": "10.100.0.1"
   },
   "version": 1704067200
 }
 ```
 
 - **name**: DNS hostname (accessible as `nginx` from any node)
-- **mesh_ip**: Unique IP on the mesh network (auto-assigned if omitted)
+- **ip**: Unique IP on the mesh network (10.100.x.x, auto-assigned if omitted)
 - **compose**: Docker Compose YAML content
 - **revive**: If true, auto-failover to another node if owner dies
 - **autostart**: If true, auto-start when Jetty starts up (on the owning node)
 - **allowed_nodes**: Whitelist of nodes that can run this workload
-- **owner**: Full info (id, name, mesh_ip) of the node running this workload
+- **owner**: Full info (id, name, ip) of the node running this workload
 - **version**: Unix timestamp for conflict resolution
 
 ### 3. Gossip Protocol
@@ -142,7 +142,7 @@ sudo JETTY_SECRET=my-cluster-password ./jetty
 | `JETTY_PUBLIC_IP` | (auto) | Override public IP detection (useful in containers). |
 | `JETTY_DATA_DIR` | `/data` | Directory for state and compose files. |
 | `JETTY_API_PORT` | `6880` | REST API port. |
-| `JETTY_MESH_CIDR` | `10.100.0.0/16` | Mesh network IP range. |
+| `JETTY_SERVICE_CIDR` | `10.100.0.0/16` | Mesh network CIDR for workload IPs. |
 | `JETTY_JOIN` | (none) | URL of existing node to join (e.g., `http://node1:6880`). |
 
 ---
@@ -176,11 +176,11 @@ curl http://localhost:6880/api/status
   "node": {
     "id": "abc123...",
     "name": "node1",
-    "mesh_ip": "10.100.42.1",
+    "ip": "10.100.42.1",
     "warp_ip": "100.96.0.5"
   },
   "peers": [
-    {"id": "def456...", "name": "node2", "mesh_ip": "10.100.87.3", "healthy": true}
+    {"id": "def456...", "name": "node2", "ip": "10.100.87.3", "healthy": true}
   ],
   "workloads": [...],
   "tunnel": {
@@ -197,11 +197,14 @@ curl http://localhost:6880/api/status
 ### Aggregate Cluster Health
 
 ```bash
-# Get health from all nodes
-curl http://localhost:6880/api/cluster/health
+# Get health from all nodes (cluster-wide)
+curl http://localhost:6880/api/health
 
-# Filter by specific node
-curl http://localhost:6880/api/cluster/health?node=node1
+# Get health from just this node
+curl http://localhost:6880/api/health?node=local
+
+# Filter by specific node name
+curl http://localhost:6880/api/health?node=node1
 ```
 
 ```json
@@ -215,7 +218,7 @@ curl http://localhost:6880/api/cluster/health?node=node1
     {
       "id": "abc123...",
       "name": "node1",
-      "mesh_ip": "10.100.0.1",
+      "ip": "100.96.0.1",
       "healthy": true,
       "status": "healthy",
       "workloads": ["nginx", "redis"]
@@ -235,7 +238,7 @@ curl -X POST http://localhost:6880/api/workloads \
   -H "Content-Type: application/json" \
   -d '{
     "name": "nginx",
-    "mesh_ip": "10.100.50.1",
+    "ip": "10.100.50.1",
     "revive": true,
     "autostart": true,
     "allowed_nodes": ["node1", "node2"],
@@ -243,7 +246,7 @@ curl -X POST http://localhost:6880/api/workloads \
   }'
 ```
 
-If `mesh_ip` is omitted, one will be automatically assigned.
+If `ip` is omitted, one will be automatically assigned from the mesh CIDR.
 
 If `allowed_nodes` is specified and the current node is not in the list, the request will be proxied to an allowed node.
 
@@ -267,11 +270,11 @@ Returns container runtime info if the workload is local:
 ```json
 {
   "name": "nginx",
-  "mesh_ip": "10.100.50.1",
+  "ip": "10.100.50.1",
   "owner": {
     "id": "abc123...",
     "name": "node1",
-    "mesh_ip": "10.100.0.1"
+    "ip": "10.100.0.1"
   },
   "is_local": true,
   "containers": [
@@ -300,12 +303,12 @@ curl -X PATCH http://localhost:6880/api/workloads/nginx \
     "allowed_nodes": ["node1", "node2", "node3"]
   }'
 
-# Update compose or mesh_ip (triggers redeploy)
+# Update compose or ip (triggers redeploy)
 curl -X PATCH http://localhost:6880/api/workloads/nginx \
   -H "Content-Type: application/json" \
   -d '{
     "compose": "services:\n  web:\n    image: nginx:latest",
-    "mesh_ip": "10.100.50.2"
+    "ip": "10.100.50.2"
   }'
 ```
 
@@ -448,8 +451,7 @@ curl http://localhost:6880/api/status | jq '.warp'
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `GET /api/status` | GET | Full cluster status |
-| `GET /api/health` | GET | Health check (for peers) |
-| `GET /api/cluster/health` | GET | Aggregate health from all nodes |
+| `GET /api/health` | GET | Health check (cluster-wide or ?node=local for single) |
 | `POST /api/join` | POST | Join cluster with secret |
 | `GET /api/sync` | GET | Get local workloads (for gossip) |
 
@@ -479,7 +481,7 @@ curl http://localhost:6880/api/status | jq '.warp'
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/proxy/{mesh_ip}/{path}` | ANY | Proxy request to workload |
+| `/api/proxy/{ip}/{path}` | ANY | Proxy request to workload by mesh IP |
 
 ### Internal (Peer-to-Peer)
 
@@ -524,7 +526,7 @@ main.go
 New Node                                    Existing Node
    │                                             │
    │  POST /api/join                             │
-   │  {secret, id, name, mesh_ip, warp_ip}       │
+   │  {secret, id, name, ip, warp_ip}            │
    ├────────────────────────────────────────────►│
    │                                             │
    │                            1. Validate secret
@@ -581,10 +583,10 @@ New Node                                    Existing Node
 │                         STATE                                   │
 │                                                                 │
 │  Peers: map[HWID]*Peer                                          │
-│    └── {ID, Name, MeshIP, TunnelHost, WarpIP, Healthy, ...}     │
+│    └── {ID, Name, IP, TunnelHost, WarpIP, Healthy, ...}         │
 │                                                                 │
-│  Workloads: map[MeshIP]*Workload                                │
-│    └── {Name, MeshIP, Compose, Revive, AllowedNodes, Owner, ...}│
+│  Workloads: map[IP]*Workload                                    │
+│    └── {Name, IP, Compose, Revive, AllowedNodes, Owner, ...}    │
 │                                                                 │
 │  CFToken: string                                                │
 │                                                                 │
@@ -700,8 +702,8 @@ iptables -t nat -L -n | grep 10.100.50.1
 # Check WARP status
 curl http://localhost:6880/api/status | jq '.warp'
 
-# Check peer health
-curl http://localhost:6880/api/cluster/health
+# Check cluster health
+curl http://localhost:6880/api/health
 ```
 
 ### Cloudflare Tunnel Not Working
