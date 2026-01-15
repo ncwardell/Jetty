@@ -150,12 +150,11 @@ type Agent struct {
 	ipipWarnedPeersMu sync.Mutex
 
 	// Userspace tunnel (fallback when kernel IPIP/GRE not available)
-	tunDevice    *water.Interface // TUN device for capturing workload traffic
-	tunPeerConns sync.Map         // peerID -> *websocket.Conn (outgoing connections to peers)
-	tunPeerIPs   sync.Map         // peerID -> string (peer WARP IP for tunnel)
-	tunConnMu    sync.Mutex       // Protects WebSocket connection establishment
-	tunLocalIP   string           // Our WARP IP (used as source for tunnel NAT)
-	tunNATTable  sync.Map         // natKey -> original src IP (for DNAT on responses)
+	tunDevice       *water.Interface // TUN device for capturing workload traffic
+	tunPeerConns    sync.Map         // peerID -> *websocket.Conn (outgoing connections to peers)
+	tunPeerIPs      sync.Map         // peerID -> string (peer WARP IP for tunnel)
+	tunConnMu       sync.Mutex       // Protects WebSocket connection establishment
+	tunProxyRoutes  sync.Map         // srcIP -> *websocket.Conn (for TCP/UDP response routing)
 
 	stopCh chan struct{}
 }
@@ -240,6 +239,38 @@ func (a *Agent) cleanupOrphanedState() {
 			if len(parts) > 0 {
 				exec.Command("ip", "route", "del", parts[0]).Run()
 				log.Printf("Cleaned up orphaned route: %s", parts[0])
+			}
+		}
+	}
+
+	// Clean up any orphaned nftables rules from previous runs
+	// Delete our jetty table if it exists (will be recreated in initWarpRules)
+	exec.Command("nft", "delete", "table", "ip", "jetty").Run()
+
+	// Also clean up any old-style masquerade rules left in the main nat table
+	// These were added before we moved to using our own table
+	a.cleanupLegacyNftRules()
+}
+
+// cleanupLegacyNftRules removes old masquerade rules that were added directly to nat POSTROUTING
+func (a *Agent) cleanupLegacyNftRules() {
+	// Get all rules in nat POSTROUTING chain and remove CloudflareWARP masquerade rules
+	output, err := exec.Command("nft", "-a", "list", "chain", "ip", "nat", "POSTROUTING").CombinedOutput()
+	if err != nil {
+		return // Chain might not exist
+	}
+
+	// Parse output and find handles of CloudflareWARP masquerade rules
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.Contains(line, "CloudflareWARP") && strings.Contains(line, "masquerade") {
+			// Extract handle number from line like: "oifname "CloudflareWARP" masquerade # handle 123"
+			parts := strings.Split(line, "handle")
+			if len(parts) == 2 {
+				handle := strings.TrimSpace(parts[1])
+				if handle != "" {
+					exec.Command("nft", "delete", "rule", "ip", "nat", "POSTROUTING", "handle", handle).Run()
+					log.Printf("Cleaned up legacy nft rule handle %s", handle)
+				}
 			}
 		}
 	}
@@ -559,6 +590,9 @@ func (a *Agent) cleanupNetwork() {
 	// Clean up userspace tunnel if active
 	a.cleanupUserspaceTunnel()
 
+	// Clean up nftables rules
+	a.cleanupWarpRules()
+
 	// Remove jetty0 interface (this also removes all IPs bound to it)
 	if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
 		log.Printf("Warning: could not remove jetty0 interface: %v", err)
@@ -694,18 +728,9 @@ func (a *Agent) detectTunnelMode() string {
 // initUserspaceTunnel creates a TUN device for userspace tunneling.
 // This is used when kernel IPIP/GRE modules aren't available (e.g., ChromeOS).
 // Traffic to remote workloads (10.100.x.x) is captured via TUN, sent over WebSocket
-// to the peer's API (port 6880), and injected into their local network.
-// We use WebSocket over the existing API port - no additional ports needed.
-// Packets are SNATed to use our WARP IP, so responses can be routed back correctly.
+// to the peer's API (port 6880), and proxied to the local workload.
+// Responses are proxied back through the same WebSocket connection.
 func (a *Agent) initUserspaceTunnel() error {
-	// Get our WARP IP for NAT
-	a.tunLocalIP = a.getWarpIP()
-	if a.tunLocalIP == "" {
-		log.Printf("Warning: WARP IP not available, tunnel NAT may not work correctly")
-	} else {
-		log.Printf("Tunnel will use WARP IP %s for NAT", a.tunLocalIP)
-	}
-
 	// Create TUN device
 	config := water.Config{
 		DeviceType: water.TUN,
@@ -732,7 +757,7 @@ func (a *Agent) initUserspaceTunnel() error {
 }
 
 // tunReadLoop reads packets from TUN device and sends them via WebSocket to the appropriate peer.
-// Outgoing packets are SNATed to use our WARP IP so responses can be routed back.
+// This handles both outgoing traffic (to remote workloads) and response traffic (back to tunnel sources).
 func (a *Agent) tunReadLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -752,7 +777,6 @@ func (a *Agent) tunReadLoop() {
 			continue // Too small to be valid IP packet
 		}
 
-		// Make a copy of the packet since we'll modify it
 		packet := make([]byte, n)
 		copy(packet, buf[:n])
 
@@ -762,40 +786,33 @@ func (a *Agent) tunReadLoop() {
 		dstIP := net.IP(packet[16:20])
 		srcIP := net.IP(packet[12:16])
 
-		// Find peer to route this packet to via workload routes
+		// First check: is this a response to a tunneled request? (TCP/UDP responses)
+		dstIPStr := dstIP.String()
+		if connVal, ok := a.tunProxyRoutes.Load(dstIPStr); ok {
+			conn := connVal.(*websocket.Conn)
+			log.Printf("WS tunnel response: %s -> %s (%d bytes)", srcIP, dstIP, n)
+			if err := conn.WriteMessage(websocket.BinaryMessage, packet); err != nil {
+				log.Printf("WS tunnel response: send failed: %v", err)
+			}
+			continue
+		}
+
+		// Second check: is this outgoing traffic to a remote workload?
 		a.workloadRoutesMu.Lock()
-		ownerID := a.workloadRoutes[dstIP.String()]
+		ownerID := a.workloadRoutes[dstIPStr]
 		a.workloadRoutesMu.Unlock()
 
 		if ownerID == "" {
-			// No route - this is normal for local traffic, don't spam logs
-			continue
+			continue // No route for this destination
 		}
 
 		// Get peer's WARP IP for WebSocket tunnel
 		peerIPVal, ok := a.tunPeerIPs.Load(ownerID)
 		if !ok {
 			log.Printf("WS tunnel send: no peer IP for owner %s (dst=%s)", ownerID[:8], dstIP)
-			continue // Peer IP not known
+			continue
 		}
 		peerIP := peerIPVal.(string)
-
-		// SNAT: Replace source IP with our WARP IP so responses come back to us
-		origSrcIP := srcIP.String()
-		if a.tunLocalIP != "" && origSrcIP != a.tunLocalIP {
-			// Create NAT key based on protocol/ports/dst for tracking
-			natKey := a.createNATKey(packet, dstIP.String())
-			a.tunNATTable.Store(natKey, origSrcIP)
-
-			// Rewrite source IP to our WARP IP
-			newSrcIP := net.ParseIP(a.tunLocalIP).To4()
-			if newSrcIP != nil {
-				copy(packet[12:16], newSrcIP)
-				// Recalculate IP header checksum
-				a.updateIPChecksum(packet)
-				log.Printf("WS tunnel SNAT: %s -> %s (original src %s)", a.tunLocalIP, dstIP, origSrcIP)
-			}
-		}
 
 		// Get or establish WebSocket connection to peer
 		conn, err := a.getTunPeerConn(ownerID, peerIP)
@@ -804,12 +821,11 @@ func (a *Agent) tunReadLoop() {
 			continue
 		}
 
-		log.Printf("WS tunnel send: %s -> %s via %s (%d bytes)", a.tunLocalIP, dstIP, peerIP, n)
+		log.Printf("WS tunnel send: %s -> %s via %s (%d bytes)", srcIP, dstIP, peerIP, n)
 
 		// Send packet as binary WebSocket message
 		if err := conn.WriteMessage(websocket.BinaryMessage, packet); err != nil {
 			log.Printf("WS tunnel send: failed to send to %s: %v", peerIP, err)
-			// Close broken connection so it gets re-established
 			conn.Close()
 			a.tunPeerConns.Delete(ownerID)
 		}
@@ -858,7 +874,6 @@ func (a *Agent) getTunPeerConn(peerID, peerIP string) (*websocket.Conn, error) {
 }
 
 // tunWsRecvLoop receives packets from a peer's WebSocket connection and injects them locally.
-// For response packets (dst is our WARP IP), DNAT back to original destination.
 func (a *Agent) tunWsRecvLoop(peerID string, conn *websocket.Conn) {
 	defer func() {
 		conn.Close()
@@ -889,25 +904,7 @@ func (a *Agent) tunWsRecvLoop(peerID string, conn *websocket.Conn) {
 		dstIP := net.IP(packet[16:20])
 		srcIP := net.IP(packet[12:16])
 
-		// DNAT: If destination is our WARP IP, this is a response - restore original dst
-		if a.tunLocalIP != "" && dstIP.String() == a.tunLocalIP {
-			natKey := a.createReverseNATKey(packet, srcIP.String())
-			if origDstVal, ok := a.tunNATTable.Load(natKey); ok {
-				origDst := origDstVal.(string)
-				newDstIP := net.ParseIP(origDst).To4()
-				if newDstIP != nil {
-					copy(packet[16:20], newDstIP)
-					a.updateIPChecksum(packet)
-					log.Printf("WS tunnel DNAT: %s -> %s (restored from %s)", srcIP, origDst, a.tunLocalIP)
-					// Clean up NAT entry (for ICMP; TCP/UDP should use timeout)
-					a.tunNATTable.Delete(natKey)
-				}
-			} else {
-				log.Printf("WS tunnel recv: no NAT entry for response %s -> %s", srcIP, dstIP)
-			}
-		}
-
-		log.Printf("WS tunnel recv: from %s, packet %s -> %s (%d bytes)", peerID[:8], srcIP, net.IP(packet[16:20]), len(packet))
+		log.Printf("WS tunnel recv: from %s, packet %s -> %s (%d bytes)", peerID[:8], srcIP, dstIP, len(packet))
 
 		// Inject packet into TUN device for local delivery
 		if a.tunDevice != nil {
@@ -919,118 +916,11 @@ func (a *Agent) tunWsRecvLoop(peerID string, conn *websocket.Conn) {
 }
 
 // updateTunPeerAddr updates the WARP IP for a peer's WebSocket tunnel endpoint.
-// Also adds a route for the peer's WARP IP so responses to them go through our TUN.
 func (a *Agent) updateTunPeerAddr(peerID, peerIP string) {
 	if a.tunDevice == nil || peerIP == "" {
 		return
 	}
-
-	// Check if we already have this peer registered
-	oldIP, existed := a.tunPeerIPs.Load(peerID)
-
 	a.tunPeerIPs.Store(peerID, peerIP)
-
-	// Add route for peer's WARP IP so responses go through our TUN
-	// This allows us to capture and tunnel response traffic
-	if !existed || oldIP.(string) != peerIP {
-		// Remove old route if IP changed
-		if existed && oldIP.(string) != peerIP {
-			exec.Command("ip", "route", "del", oldIP.(string)+"/32", "dev", "jetty_tun").Run()
-		}
-		// Add new route
-		if err := exec.Command("ip", "route", "add", peerIP+"/32", "dev", "jetty_tun").Run(); err != nil {
-			log.Printf("WS tunnel: failed to add route for peer %s (%s): %v", peerID[:8], peerIP, err)
-		} else {
-			log.Printf("WS tunnel: added route for peer %s WARP IP %s via jetty_tun", peerID[:8], peerIP)
-		}
-	}
-}
-
-// createNATKey creates a key for tracking NAT mappings based on protocol/ports/dst.
-func (a *Agent) createNATKey(packet []byte, dstIP string) string {
-	if len(packet) < 20 {
-		return ""
-	}
-
-	protocol := packet[9]
-	ihl := int(packet[0]&0x0f) * 4
-
-	switch protocol {
-	case 1: // ICMP
-		if len(packet) >= ihl+8 {
-			// Use ICMP ID for tracking (bytes 4-5 of ICMP header)
-			icmpID := uint16(packet[ihl+4])<<8 | uint16(packet[ihl+5])
-			return fmt.Sprintf("icmp:%d:%s", icmpID, dstIP)
-		}
-	case 6, 17: // TCP, UDP
-		if len(packet) >= ihl+4 {
-			srcPort := uint16(packet[ihl])<<8 | uint16(packet[ihl+1])
-			dstPort := uint16(packet[ihl+2])<<8 | uint16(packet[ihl+3])
-			return fmt.Sprintf("%d:%d:%d:%s", protocol, srcPort, dstPort, dstIP)
-		}
-	}
-
-	// Fallback: just use protocol and dst
-	return fmt.Sprintf("%d:0:0:%s", protocol, dstIP)
-}
-
-// createReverseNATKey creates the reverse NAT key for response packets.
-func (a *Agent) createReverseNATKey(packet []byte, srcIP string) string {
-	if len(packet) < 20 {
-		return ""
-	}
-
-	protocol := packet[9]
-	ihl := int(packet[0]&0x0f) * 4
-
-	switch protocol {
-	case 1: // ICMP
-		if len(packet) >= ihl+8 {
-			// Use ICMP ID for tracking
-			icmpID := uint16(packet[ihl+4])<<8 | uint16(packet[ihl+5])
-			return fmt.Sprintf("icmp:%d:%s", icmpID, srcIP)
-		}
-	case 6, 17: // TCP, UDP
-		if len(packet) >= ihl+4 {
-			// For responses, src/dst ports are swapped
-			srcPort := uint16(packet[ihl])<<8 | uint16(packet[ihl+1])
-			dstPort := uint16(packet[ihl+2])<<8 | uint16(packet[ihl+3])
-			return fmt.Sprintf("%d:%d:%d:%s", protocol, dstPort, srcPort, srcIP)
-		}
-	}
-
-	return fmt.Sprintf("%d:0:0:%s", protocol, srcIP)
-}
-
-// updateIPChecksum recalculates the IP header checksum after modifying the packet.
-func (a *Agent) updateIPChecksum(packet []byte) {
-	if len(packet) < 20 {
-		return
-	}
-
-	ihl := int(packet[0]&0x0f) * 4
-	if len(packet) < ihl {
-		return
-	}
-
-	// Clear existing checksum
-	packet[10] = 0
-	packet[11] = 0
-
-	// Calculate new checksum
-	var sum uint32
-	for i := 0; i < ihl; i += 2 {
-		sum += uint32(packet[i])<<8 | uint32(packet[i+1])
-	}
-
-	// Fold 32-bit sum to 16 bits
-	for sum > 0xffff {
-		sum = (sum & 0xffff) + (sum >> 16)
-	}
-
-	checksum := ^uint16(sum)
-	packet[10] = byte(checksum >> 8)
-	packet[11] = byte(checksum)
 }
 
 // cleanupUserspaceTunnel closes all WebSocket connections and the TUN device.
@@ -1043,9 +933,9 @@ func (a *Agent) cleanupUserspaceTunnel() {
 		return true
 	})
 
-	// Remove all peer WARP IP routes
-	a.tunPeerIPs.Range(func(key, value interface{}) bool {
-		if ip, ok := value.(string); ok {
+	// Remove all proxy routes (source IPs we added routes for)
+	a.tunProxyRoutes.Range(func(key, value interface{}) bool {
+		if ip, ok := key.(string); ok {
 			exec.Command("ip", "route", "del", ip+"/32", "dev", "jetty_tun").Run()
 		}
 		return true
@@ -1066,6 +956,9 @@ var wsUpgrader = websocket.Upgrader{
 // Peers connect here to send/receive encapsulated IP packets.
 // SECURITY: This endpoint is protected by apiKeyMiddleware (requires JETTY_SECRET).
 // Only authenticated cluster peers can establish tunnel connections.
+//
+// This uses a PROXY model: packets are forwarded to workloads via raw sockets,
+// and responses are captured and sent back through the same WebSocket connection.
 func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 	// Defense-in-depth: verify auth even though middleware should have checked
 	if a.clusterSecret != "" {
@@ -1086,91 +979,251 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 	remoteAddr := r.RemoteAddr
 	log.Printf("WS tunnel: authenticated connection from %s", remoteAddr)
 
-	// Extract peer's WARP IP from remote address (format: "ip:port")
-	peerWarpIP := remoteAddr
-	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
-		peerWarpIP = host
-	}
+	// Handle incoming packets from this peer using proxy model
+	go a.handleTunnelProxy(conn, remoteAddr)
+}
 
-	// Find peer ID from WARP IP
-	var peerID string
-	a.stateMu.RLock()
-	for _, p := range a.state.Peers {
-		if p.IP == peerWarpIP {
-			peerID = p.ID
-			break
-		}
-	}
-	a.stateMu.RUnlock()
+// handleTunnelProxy proxies packets from a peer to local workloads and captures responses.
+// This uses proper ICMP proxying: parse request, send our own ping, repackage response.
+func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
+	defer conn.Close()
 
-	if peerID == "" {
-		log.Printf("WS tunnel: unknown peer from %s (not in peer list)", peerWarpIP)
-		// Still allow connection but we won't be able to send return traffic
-	}
-
-	// Handle incoming packets from this peer
-	go func() {
-		defer conn.Close()
-
-		for {
-			msgType, packet, err := conn.ReadMessage()
-			if err != nil {
-				select {
-				case <-a.stopCh:
-					return
-				default:
-					log.Printf("WS tunnel: connection from %s closed: %v", remoteAddr, err)
-					return
-				}
-			}
-
-			if msgType != websocket.BinaryMessage || len(packet) < 20 {
-				continue
-			}
-
-			// Verify it's an IPv4 packet
-			if packet[0]>>4 != 4 {
-				continue
-			}
-
-			dstIP := net.IP(packet[16:20])
-			srcIP := net.IP(packet[12:16])
-
-			// Security: only accept packets destined for our local workloads
-			// This prevents using the tunnel as an arbitrary packet injection point
-			a.stateMu.RLock()
-			var isLocalWorkload bool
-			for _, wl := range a.state.Workloads {
-				if wl.Owner == a.hwid && wl.IP == dstIP.String() {
-					isLocalWorkload = true
-					break
-				}
-			}
-			a.stateMu.RUnlock()
-
-			if !isLocalWorkload {
-				log.Printf("WS tunnel: rejected packet to non-local IP %s from %s", dstIP, remoteAddr)
-				continue
-			}
-
-			// Note: sender SNATs packets to their WARP IP, so srcIP should be their WARP IP
-			// Responses will be routed back through the tunnel via the peer WARP IP route
-
-			peerIDShort := peerID
-			if len(peerIDShort) > 8 {
-				peerIDShort = peerIDShort[:8]
-			}
-			log.Printf("WS tunnel recv: from %s (peer %s), packet %s -> %s (%d bytes)",
-				remoteAddr, peerIDShort, srcIP, dstIP, len(packet))
-
-			// Inject packet into TUN device for local delivery
-			if a.tunDevice != nil {
-				if _, err := a.tunDevice.Write(packet); err != nil {
-					log.Printf("WS tunnel recv: failed to write to TUN: %v", err)
-				}
+	for {
+		msgType, packet, err := conn.ReadMessage()
+		if err != nil {
+			select {
+			case <-a.stopCh:
+				return
+			default:
+				log.Printf("WS tunnel: connection from %s closed: %v", remoteAddr, err)
+				return
 			}
 		}
-	}()
+
+		if msgType != websocket.BinaryMessage || len(packet) < 20 {
+			continue
+		}
+
+		// Verify it's an IPv4 packet
+		if packet[0]>>4 != 4 {
+			continue
+		}
+
+		dstIP := net.IP(packet[16:20])
+		srcIP := net.IP(packet[12:16])
+
+		// Security: only accept packets destined for our local workloads
+		a.stateMu.RLock()
+		var isLocalWorkload bool
+		for _, wl := range a.state.Workloads {
+			if wl.Owner == a.hwid && wl.IP == dstIP.String() {
+				isLocalWorkload = true
+				break
+			}
+		}
+		a.stateMu.RUnlock()
+
+		if !isLocalWorkload {
+			log.Printf("WS tunnel: rejected packet to non-local IP %s from %s", dstIP, remoteAddr)
+			continue
+		}
+
+		log.Printf("WS tunnel proxy: %s -> %s (%d bytes)", srcIP, dstIP, len(packet))
+
+		// Parse IP header to determine protocol
+		ihl := int(packet[0]&0x0f) * 4
+		if len(packet) < ihl+8 {
+			continue
+		}
+		protocol := packet[9]
+
+		// Handle by protocol
+		switch protocol {
+		case 1: // ICMP - proxy at application level
+			go a.proxyICMP(conn, packet, srcIP, dstIP, ihl)
+		case 6, 17: // TCP (6) and UDP (17) - inject into TUN with response routing
+			go a.proxyTCPUDP(conn, packet, srcIP, dstIP, protocol)
+		default:
+			log.Printf("WS tunnel proxy: unsupported protocol %d", protocol)
+		}
+	}
+}
+
+// proxyICMP proxies an ICMP packet by sending our own request and repackaging the response.
+func (a *Agent) proxyICMP(conn *websocket.Conn, origPacket []byte, origSrc, dstIP net.IP, ihl int) {
+	icmpData := origPacket[ihl:]
+	if len(icmpData) < 8 {
+		return
+	}
+
+	icmpType := icmpData[0]
+	// Only proxy echo requests (type 8)
+	if icmpType != 8 {
+		return
+	}
+
+	// Extract ICMP ID and sequence for matching
+	icmpID := uint16(icmpData[4])<<8 | uint16(icmpData[5])
+	icmpSeq := uint16(icmpData[6])<<8 | uint16(icmpData[7])
+
+	// Send our own ICMP echo request to the workload and wait for reply
+	icmpConn, err := net.DialTimeout("ip4:icmp", dstIP.String(), 5*time.Second)
+	if err != nil {
+		log.Printf("WS tunnel proxy: failed to dial ICMP to %s: %v", dstIP, err)
+		return
+	}
+	defer icmpConn.Close()
+
+	// Build ICMP echo request with same ID and sequence
+	icmpReq := make([]byte, len(icmpData))
+	copy(icmpReq, icmpData)
+	// Recalculate checksum (set to 0 first)
+	icmpReq[2] = 0
+	icmpReq[3] = 0
+	checksum := icmpChecksum(icmpReq)
+	icmpReq[2] = byte(checksum >> 8)
+	icmpReq[3] = byte(checksum)
+
+	// Set deadline for receive
+	icmpConn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// Send our ICMP request
+	if _, err := icmpConn.Write(icmpReq); err != nil {
+		log.Printf("WS tunnel proxy: failed to send ICMP: %v", err)
+		return
+	}
+
+	// Read response
+	reply := make([]byte, 1500)
+	n, err := icmpConn.Read(reply)
+	if err != nil {
+		log.Printf("WS tunnel proxy: failed to receive ICMP reply: %v", err)
+		return
+	}
+
+	// Parse reply - skip IP header to get ICMP data
+	replyIPHdrLen := int(reply[0]&0x0f) * 4
+	if n < replyIPHdrLen+8 {
+		return
+	}
+	replyICMP := reply[replyIPHdrLen:n]
+
+	// Verify it's an echo reply (type 0) with matching ID and sequence
+	if replyICMP[0] != 0 {
+		return
+	}
+	replyID := uint16(replyICMP[4])<<8 | uint16(replyICMP[5])
+	replySeq := uint16(replyICMP[6])<<8 | uint16(replyICMP[7])
+	if replyID != icmpID || replySeq != icmpSeq {
+		return
+	}
+
+	log.Printf("WS tunnel proxy: got ICMP reply from %s (id=%d seq=%d)", dstIP, icmpID, icmpSeq)
+
+	// Build response packet with original src/dst swapped
+	respPacket := buildIPPacket(dstIP, origSrc, 1, replyICMP)
+
+	// Send response back through WebSocket
+	if err := conn.WriteMessage(websocket.BinaryMessage, respPacket); err != nil {
+		log.Printf("WS tunnel proxy: failed to send response: %v", err)
+	}
+}
+
+// proxyTCPUDP handles TCP and UDP packets by injecting into TUN and routing responses back.
+func (a *Agent) proxyTCPUDP(conn *websocket.Conn, packet []byte, srcIP, dstIP net.IP, protocol byte) {
+	protoName := "TCP"
+	if protocol == 17 {
+		protoName = "UDP"
+	}
+
+	srcIPStr := srcIP.String()
+
+	// Add route for source IP so responses come back through TUN
+	if _, exists := a.tunProxyRoutes.Load(srcIPStr); !exists {
+		if err := exec.Command("ip", "route", "add", srcIPStr+"/32", "dev", "jetty_tun").Run(); err != nil {
+			// Route may already exist, that's fine
+			log.Printf("WS tunnel proxy: route add for %s: %v", srcIPStr, err)
+		} else {
+			log.Printf("WS tunnel proxy: added response route for %s", srcIPStr)
+		}
+	}
+	a.tunProxyRoutes.Store(srcIPStr, conn)
+
+	log.Printf("WS tunnel proxy %s: %s -> %s", protoName, srcIP, dstIP)
+
+	// Inject packet into TUN for local delivery to workload
+	if a.tunDevice != nil {
+		if _, err := a.tunDevice.Write(packet); err != nil {
+			log.Printf("WS tunnel proxy: TUN write failed: %v", err)
+		}
+	}
+}
+
+// buildIPPacket constructs an IPv4 packet with the given parameters.
+func buildIPPacket(srcIP, dstIP net.IP, protocol byte, payload []byte) []byte {
+	totalLen := 20 + len(payload)
+	packet := make([]byte, totalLen)
+
+	// Version (4) + IHL (5 = 20 bytes)
+	packet[0] = 0x45
+	// TOS
+	packet[1] = 0
+	// Total length
+	packet[2] = byte(totalLen >> 8)
+	packet[3] = byte(totalLen)
+	// Identification (random)
+	packet[4] = byte(time.Now().UnixNano() >> 8)
+	packet[5] = byte(time.Now().UnixNano())
+	// Flags + Fragment offset
+	packet[6] = 0x40 // Don't fragment
+	packet[7] = 0
+	// TTL
+	packet[8] = 64
+	// Protocol
+	packet[9] = protocol
+	// Checksum (set to 0 for calculation)
+	packet[10] = 0
+	packet[11] = 0
+	// Source IP
+	copy(packet[12:16], srcIP.To4())
+	// Destination IP
+	copy(packet[16:20], dstIP.To4())
+	// Payload
+	copy(packet[20:], payload)
+
+	// Calculate IP header checksum
+	checksum := ipChecksum(packet[:20])
+	packet[10] = byte(checksum >> 8)
+	packet[11] = byte(checksum)
+
+	return packet
+}
+
+// icmpChecksum calculates the ICMP checksum.
+func icmpChecksum(data []byte) uint16 {
+	var sum uint32
+	for i := 0; i < len(data)-1; i += 2 {
+		sum += uint32(data[i])<<8 | uint32(data[i+1])
+	}
+	if len(data)%2 == 1 {
+		sum += uint32(data[len(data)-1]) << 8
+	}
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+// ipChecksum calculates the IP header checksum.
+func ipChecksum(header []byte) uint16 {
+	var sum uint32
+	for i := 0; i < len(header)-1; i += 2 {
+		sum += uint32(header[i])<<8 | uint32(header[i+1])
+	}
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
 }
 
 // initWarpRules sets up nftables rules for WARP traffic routing.
@@ -1179,9 +1232,17 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 // 2. Route for WARP client IP range (100.96.0.0/12)
 // 3. Rules to allow cloudflared QUIC traffic through WARP firewall
 func (a *Agent) initWarpRules() error {
+	// First, clean up any existing Jetty nft rules to avoid duplicates
+	a.cleanupWarpRules()
+
+	// Create Jetty's own nft table for our rules (easier to clean up)
+	exec.Command("nft", "add", "table", "ip", "jetty").Run()
+	exec.Command("nft", "add", "chain", "ip", "jetty", "postrouting",
+		"{ type nat hook postrouting priority srcnat; }").Run()
+
 	// Add masquerade rule for traffic going out through CloudflareWARP
 	// This ensures responses from our mesh IPs route back through WARP
-	if err := exec.Command("nft", "add", "rule", "ip", "nat", "POSTROUTING",
+	if err := exec.Command("nft", "add", "rule", "ip", "jetty", "postrouting",
 		"oifname", "CloudflareWARP", "masquerade").Run(); err != nil {
 		log.Printf("Warning: failed to add WARP masquerade rule: %v", err)
 	}
@@ -1202,8 +1263,14 @@ func (a *Agent) initWarpRules() error {
 		}
 	}
 
-	log.Printf("WARP nft rules initialized")
+	log.Printf("WARP nft rules initialized (table: ip jetty)")
 	return nil
+}
+
+// cleanupWarpRules removes all Jetty nftables rules
+func (a *Agent) cleanupWarpRules() {
+	// Delete our entire table - this removes all our rules cleanly
+	exec.Command("nft", "delete", "table", "ip", "jetty").Run()
 }
 
 // =============================================================================
