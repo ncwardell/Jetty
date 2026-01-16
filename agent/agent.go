@@ -1223,7 +1223,11 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 
 // tcpProxyReadLoop reads from the TCP connection and sends data back via WebSocket.
 func (a *Agent) tcpProxyReadLoop(flowKey string, proxyConn *tcpProxyConn) {
-	buf := make([]byte, 65535)
+	// Read buffer - can be large since we'll chunk it for sending
+	buf := make([]byte, 32768)
+	// Maximum payload size per packet: MTU(1280) - IP header(20) - TCP header(20) = 1240
+	const maxSegmentSize = 1240
+
 	for {
 		n, err := proxyConn.conn.Read(buf)
 		if err != nil {
@@ -1241,15 +1245,26 @@ func (a *Agent) tcpProxyReadLoop(flowKey string, proxyConn *tcpProxyConn) {
 		}
 
 		if n > 0 {
-			proxyConn.mu.Lock()
-			seq := proxyConn.localSeq
-			proxyConn.localSeq += uint32(n)
-			ack := proxyConn.remoteSeq
-			proxyConn.mu.Unlock()
+			// Chunk data into MSS-sized segments to fit within MTU
+			data := buf[:n]
+			for len(data) > 0 {
+				segmentSize := len(data)
+				if segmentSize > maxSegmentSize {
+					segmentSize = maxSegmentSize
+				}
 
-			// Send data with PSH+ACK
-			a.sendTCPResponse(proxyConn.wsConn, proxyConn.dstIP, proxyConn.srcIP,
-				proxyConn.dstPort, proxyConn.srcPort, seq, ack, 0x18, buf[:n]) // PSH+ACK
+				proxyConn.mu.Lock()
+				seq := proxyConn.localSeq
+				proxyConn.localSeq += uint32(segmentSize)
+				ack := proxyConn.remoteSeq
+				proxyConn.mu.Unlock()
+
+				// Send segment with PSH+ACK
+				a.sendTCPResponse(proxyConn.wsConn, proxyConn.dstIP, proxyConn.srcIP,
+					proxyConn.dstPort, proxyConn.srcPort, seq, ack, 0x18, data[:segmentSize])
+
+				data = data[segmentSize:]
+			}
 		}
 	}
 }
