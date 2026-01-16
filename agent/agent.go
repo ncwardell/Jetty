@@ -1139,8 +1139,9 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 		proxyConn.mu.Unlock()
 		close(proxyConn.ready)
 
-		// Send SYN-ACK
-		a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x12, nil) // SYN+ACK
+		// Send SYN-ACK with MSS option to limit segment sizes and prevent fragmentation.
+		// MSS = MTU(1280) - IP header(20) - TCP header(20) = 1240
+		a.sendTCPSynAck(tc, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 1240)
 		proxyConn.mu.Lock()
 		proxyConn.localSeq++
 		proxyConn.mu.Unlock()
@@ -1300,6 +1301,59 @@ func (a *Agent) sendTCPResponse(tc *tunnelConn, srcIP, dstIP net.IP, srcPort, ds
 	// Send via WebSocket (synchronized)
 	if err := tc.WriteMessage(websocket.BinaryMessage, packet); err != nil {
 		log.Printf("WS tunnel proxy: failed to send TCP response: %v", err)
+	}
+}
+
+// sendTCPSynAck sends a SYN-ACK with MSS option to advertise maximum segment size.
+// This prevents the client from sending segments larger than the tunnel MTU can handle.
+func (a *Agent) sendTCPSynAck(tc *tunnelConn, srcIP, dstIP net.IP, srcPort, dstPort uint16, seq, ack uint32, mss uint16) {
+	// Build TCP header with MSS option (24 bytes total)
+	tcp := make([]byte, 24)
+
+	// Source port
+	tcp[0] = byte(srcPort >> 8)
+	tcp[1] = byte(srcPort)
+	// Dest port
+	tcp[2] = byte(dstPort >> 8)
+	tcp[3] = byte(dstPort)
+	// Sequence number
+	tcp[4] = byte(seq >> 24)
+	tcp[5] = byte(seq >> 16)
+	tcp[6] = byte(seq >> 8)
+	tcp[7] = byte(seq)
+	// ACK number
+	tcp[8] = byte(ack >> 24)
+	tcp[9] = byte(ack >> 16)
+	tcp[10] = byte(ack >> 8)
+	tcp[11] = byte(ack)
+	// Data offset (6 = 24 bytes header with options) + reserved
+	tcp[12] = 0x60
+	// Flags: SYN+ACK
+	tcp[13] = 0x12
+	// Window size
+	tcp[14] = 0xFF
+	tcp[15] = 0xFF
+	// Checksum (calculated below)
+	tcp[16] = 0
+	tcp[17] = 0
+	// Urgent pointer
+	tcp[18] = 0
+	tcp[19] = 0
+	// TCP Options: MSS (Kind=2, Length=4, MSS value)
+	tcp[20] = 2           // Kind: MSS
+	tcp[21] = 4           // Length: 4 bytes
+	tcp[22] = byte(mss >> 8)
+	tcp[23] = byte(mss)
+
+	// Calculate TCP checksum with pseudo-header
+	tcp[16], tcp[17] = tcpChecksum(srcIP, dstIP, tcp)
+
+	// Build full IP packet
+	packet := buildIPPacket(srcIP, dstIP, 6, tcp)
+
+	// Send via WebSocket (synchronized)
+	if err := tc.WriteMessage(websocket.BinaryMessage, packet); err != nil {
+		log.Printf("WS tunnel proxy: failed to send TCP SYN-ACK: %v", err)
 	}
 }
 
