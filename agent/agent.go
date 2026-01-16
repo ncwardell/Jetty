@@ -575,6 +575,15 @@ func (a *Agent) initNetwork() error {
 	// Enable forwarding for workload traffic
 	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
 
+	// Add MASQUERADE rule so containers can reach workload IPs on the mesh network.
+	// When a container (e.g., cloudflared at 172.17.0.x) sends traffic to a workload IP (10.100.x.x),
+	// the source IP needs to be translated to the host's WARP IP so responses can route back.
+	// Without this, containers timeout when trying to reach other workloads.
+	exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-d", a.serviceCIDR, "-j", "MASQUERADE").Run() // Remove if exists
+	if err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-d", a.serviceCIDR, "-j", "MASQUERADE").Run(); err != nil {
+		log.Printf("Warning: failed to add MASQUERADE for container-to-mesh traffic: %v", err)
+	}
+
 	// Check which tunnel mode is available for cross-node routing
 	// Try IPIP first (most efficient), then GRE as fallback
 	a.tunnelMode = a.detectTunnelMode()
