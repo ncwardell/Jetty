@@ -665,6 +665,13 @@ func (a *Agent) initUserspaceTunnel() error {
 		return fmt.Errorf("bring up TUN device: %w", err)
 	}
 
+	// Set MTU to account for WebSocket/TLS encapsulation overhead.
+	// Without this, large packets get fragmented/dropped and TCP connections hang
+	// after the handshake completes (small packets work, large responses don't).
+	if err := exec.Command("ip", "link", "set", "dev", "jetty_tun", "mtu", "1280").Run(); err != nil {
+		log.Printf("Warning: failed to set TUN MTU: %v", err)
+	}
+
 	// Start packet forwarding goroutine (reads from TUN, sends over WebSocket)
 	go a.tunReadLoop()
 
