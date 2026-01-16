@@ -1071,6 +1071,22 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 	if isSYN && !isACK {
 		log.Printf("WS tunnel proxy TCP SYN: %s", flowKey)
 
+		// Create pending proxy connection BEFORE establishing backend connection
+		// This prevents race conditions with ACK packets arriving early
+		proxyConn := &tcpProxyConn{
+			conn:      nil, // Will be set when connection is established
+			wsConn:    tc,
+			srcIP:     srcIP,
+			srcPort:   srcPort,
+			dstIP:     dstIP,
+			dstPort:   dstPort,
+			localSeq:  uint32(time.Now().UnixNano() & 0xFFFFFFFF),
+			remoteSeq: seqNum + 1,
+			ready:     make(chan struct{}),
+			failed:    false,
+		}
+		a.tunTCPConns.Store(flowKey, proxyConn)
+
 		// Look up workload to translate virtual IP to container IP
 		targetAddr := fmt.Sprintf("%s:%d", dstIP, dstPort)
 
@@ -1091,27 +1107,27 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 		tcpConn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
 		if err != nil {
 			log.Printf("WS tunnel proxy: TCP connect to %s failed: %v", targetAddr, err)
+			proxyConn.mu.Lock()
+			proxyConn.failed = true
+			proxyConn.mu.Unlock()
+			close(proxyConn.ready)
+			a.tunTCPConns.Delete(flowKey)
 			// Send RST back
 			a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, 0, seqNum+1, 0x14, nil) // RST+ACK
 			return
 		}
 
-		// Create proxy connection
-		proxyConn := &tcpProxyConn{
-			conn:      tcpConn,
-			wsConn:    tc,
-			srcIP:     srcIP,
-			srcPort:   srcPort,
-			dstIP:     dstIP,
-			dstPort:   dstPort,
-			localSeq:  uint32(time.Now().UnixNano() & 0xFFFFFFFF),
-			remoteSeq: seqNum + 1,
-		}
-		a.tunTCPConns.Store(flowKey, proxyConn)
+		// Connection established - update proxyConn and signal ready
+		proxyConn.mu.Lock()
+		proxyConn.conn = tcpConn
+		proxyConn.mu.Unlock()
+		close(proxyConn.ready)
 
 		// Send SYN-ACK
 		a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x12, nil) // SYN+ACK
+		proxyConn.mu.Lock()
 		proxyConn.localSeq++
+		proxyConn.mu.Unlock()
 
 		// Start goroutine to read from TCP and send back via WebSocket
 		go a.tcpProxyReadLoop(flowKey, proxyConn)
@@ -1128,6 +1144,22 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 		return
 	}
 	proxyConn := connVal.(*tcpProxyConn)
+
+	// Wait for connection to be established if it's still pending
+	if proxyConn.ready != nil {
+		<-proxyConn.ready
+	}
+
+	// Check if connection establishment failed
+	proxyConn.mu.Lock()
+	if proxyConn.failed || proxyConn.conn == nil {
+		proxyConn.mu.Unlock()
+		if !isRST {
+			a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, 0, seqNum+1, 0x14, nil) // RST+ACK
+		}
+		return
+	}
+	proxyConn.mu.Unlock()
 
 	// Handle FIN
 	if isFIN {

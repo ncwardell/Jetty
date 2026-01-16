@@ -136,7 +136,7 @@ func (tc *tunnelConn) WriteMessage(messageType int, data []byte) error {
 
 // tcpProxyConn represents an active TCP proxy connection through the tunnel.
 type tcpProxyConn struct {
-	conn      net.Conn    // TCP connection to the workload
+	conn      net.Conn    // TCP connection to the workload (nil while pending)
 	wsConn    *tunnelConn // WebSocket connection back to the tunnel peer (with write mutex)
 	srcIP     net.IP          // Original source IP
 	srcPort   uint16          // Original source port
@@ -144,7 +144,9 @@ type tcpProxyConn struct {
 	dstPort   uint16          // Destination port
 	localSeq  uint32          // Our sequence number for responses
 	remoteSeq uint32          // Remote sequence number (from client)
-	mu        sync.Mutex      // Protects sequence numbers
+	mu        sync.Mutex      // Protects sequence numbers and conn
+	ready     chan struct{}   // Closed when connection is established (nil = already ready)
+	failed    bool            // True if connection establishment failed
 }
 
 // =============================================================================
