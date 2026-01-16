@@ -1207,6 +1207,13 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 			proxyConn.remoteSeq = seqNum + uint32(len(payload))
 			proxyConn.mu.Unlock()
 
+			// DEBUG: Log what we're writing to nginx
+			if len(payload) < 1000 {
+				log.Printf("WS tunnel proxy TCP DATA (%d bytes): %s", len(payload), string(payload))
+			} else {
+				log.Printf("WS tunnel proxy TCP DATA (%d bytes): [truncated]", len(payload))
+			}
+
 			// Write data to TCP connection
 			if _, err := proxyConn.conn.Write(payload); err != nil {
 				log.Printf("WS tunnel proxy: TCP write failed: %v", err)
