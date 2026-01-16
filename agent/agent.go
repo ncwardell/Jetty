@@ -963,12 +963,14 @@ func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 			icmpDstIP := net.IP(icmpPacket[16:20])
 			go a.proxyICMP(tc, icmpPacket, icmpSrcIP, icmpDstIP, ihl)
 		case 6: // TCP - proxy connections
-			// Copy packet data since goroutine may outlive this iteration
+			// Process TCP packets synchronously to maintain ordering.
+			// Using goroutines here causes race conditions where packets are
+			// processed out of order (e.g., body before headers).
 			tcpPacket := make([]byte, len(packet))
 			copy(tcpPacket, packet)
 			tcpSrcIP := net.IP(tcpPacket[12:16])
 			tcpDstIP := net.IP(tcpPacket[16:20])
-			go a.proxyTCP(tc, tcpPacket, tcpSrcIP, tcpDstIP, ihl)
+			a.proxyTCP(tc, tcpPacket, tcpSrcIP, tcpDstIP, ihl)
 		case 17: // UDP - proxy datagrams
 			// Copy packet data since goroutine may outlive this iteration
 			udpPacket := make([]byte, len(packet))
@@ -1206,13 +1208,6 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 			proxyConn.mu.Lock()
 			proxyConn.remoteSeq = seqNum + uint32(len(payload))
 			proxyConn.mu.Unlock()
-
-			// DEBUG: Log what we're writing to nginx
-			if len(payload) < 1000 {
-				log.Printf("WS tunnel proxy TCP DATA (%d bytes): %s", len(payload), string(payload))
-			} else {
-				log.Printf("WS tunnel proxy TCP DATA (%d bytes): [truncated]", len(payload))
-			}
 
 			// Write data to TCP connection
 			if _, err := proxyConn.conn.Write(payload); err != nil {
