@@ -1,7 +1,7 @@
 # Build stage - use BUILDPLATFORM for native compilation speed
 # Default to linux/amd64 for legacy docker build compatibility
 ARG BUILDPLATFORM=linux/amd64
-FROM --platform=${BUILDPLATFORM} golang:1.24-bookworm AS builder
+FROM --platform=${BUILDPLATFORM} golang:1.25-bookworm AS builder
 ARG VERSION=dev
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
@@ -66,9 +66,12 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 RUN mkdir -p /data
 ENV JETTY_DATA_DIR=/data
 
-# Expose ports
-EXPOSE 8080
-EXPOSE 51820/udp
+# Expose ports (informational only - container runs with --net host)
+# 6880: HTTP API and dashboard
+# 6881: memberlist gossip (TCP+UDP)
+EXPOSE 6880
+EXPOSE 6881
+EXPOSE 6881/udp
 
 VOLUME ["/data"]
 

@@ -1,0 +1,407 @@
+package agent
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+)
+
+// =============================================================================
+// HTTP Handlers - cluster status & internal sync endpoints
+// =============================================================================
+//
+// Public:
+//   GET  /api/status          aggregate cluster status (peers + workloads + tunnel)
+//   GET  /api/sync            full state dump for peer pull
+//
+// Internal (allowlisted in apiKeyMiddleware - validated in-band):
+//   POST /api/peer-announce   peer says "here is my current address/state"
+//   POST /api/heartbeat       tunnel-mode liveness ping
+//   POST /api/tunnel/sync     bootstrap tunnel token broadcast (CFToken init)
+//
+// broadcastTunnelToken is a helper that fan-outs CFToken changes to peers.
+
+// apiStatus godoc
+// @Summary Get cluster status
+// @Description Returns full cluster status including node info, peers, workloads, and connectivity status
+// @Tags cluster
+// @Produce json
+// @Success 200 {object} StatusResponse
+// @Router /status [get]
+func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
+	a.stateMu.RLock()
+	peers := make([]*Peer, 0, len(a.state.Peers))
+	for _, p := range a.state.Peers {
+		peers = append(peers, p)
+	}
+
+	// Build peer info maps for enrichment
+	peerIDToInfo := make(map[string]map[string]string)
+	peersByID := make(map[string]*Peer)
+	for _, p := range a.state.Peers {
+		peerIDToInfo[p.ID] = map[string]string{
+			"id":   p.ID,
+			"name": p.Name,
+			"ip":   p.IP,
+		}
+		peersByID[p.ID] = p
+	}
+	// Add local node to owner info map
+	peerIDToInfo[a.hwid] = map[string]string{
+		"id":   a.hwid,
+		"name": a.hostname,
+		"ip":   a.ip,
+	}
+
+	// Build enriched workloads with owner info and status
+	type EnrichedWorkload struct {
+		Name         string            `json:"name"`
+		IP           string            `json:"ip"`
+		Compose      string            `json:"compose"`
+		Revive       bool              `json:"revive"`
+		Autostart    bool              `json:"autostart"`
+		AllowedNodes []string          `json:"allowed_nodes,omitempty"`
+		Owner        map[string]string `json:"owner"`
+		Version      int64             `json:"version"`
+		Status       string            `json:"status"`
+	}
+
+	// Collect workload data - we'll fetch remote statuses after releasing the lock
+	type workloadData struct {
+		wl        *Workload
+		ownerInfo map[string]string
+		ownerPeer *Peer
+		isLocal   bool
+	}
+	workloadInfos := make([]workloadData, 0, len(a.state.Workloads))
+	for _, wl := range a.state.Workloads {
+		ownerInfo := peerIDToInfo[wl.Owner]
+		if ownerInfo == nil {
+			ownerInfo = map[string]string{"id": wl.Owner, "name": "unknown", "ip": "unknown"}
+		}
+		isLocal := wl.Owner == a.hwid
+		var ownerPeer *Peer
+		if !isLocal {
+			ownerPeer = peersByID[wl.Owner]
+		}
+		workloadInfos = append(workloadInfos, workloadData{
+			wl:        wl,
+			ownerInfo: ownerInfo,
+			ownerPeer: ownerPeer,
+			isLocal:   isLocal,
+		})
+	}
+
+	hasTunnel := a.state.CFToken != ""
+	a.stateMu.RUnlock()
+
+	// Fetch remote workload statuses in parallel with 2 second timeout
+	statusClient := &http.Client{Timeout: 2 * time.Second}
+	statuses := make(map[string]string)
+	var statusMu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, info := range workloadInfos {
+		if info.isLocal {
+			// Rich status: running/unhealthy/starting/restarting/stopped/unknown.
+			// See computeWorkloadStatus in handlers_workloads.go.
+			statuses[info.wl.Name] = a.computeWorkloadStatus(info.wl.Name)
+		} else if info.ownerPeer != nil && info.ownerPeer.Healthy {
+			wg.Add(1)
+			go func(wl *Workload, peer *Peer) {
+				defer wg.Done()
+				status := "remote" // Default fallback
+
+				url := a.getPeerAPIURL(peer, "/api/workloads/"+wl.Name)
+				if url != "" {
+					req, err := a.peerRequest("GET", url, nil)
+					if err == nil {
+						resp, err := statusClient.Do(req)
+						if err == nil {
+							defer resp.Body.Close()
+							if resp.StatusCode == 200 {
+								var data map[string]interface{}
+								if json.NewDecoder(resp.Body).Decode(&data) == nil {
+									// Check containers array for running status
+									if containers, ok := data["containers"].([]interface{}); ok && len(containers) > 0 {
+										hasRunning := false
+										for _, c := range containers {
+											if cm, ok := c.(map[string]interface{}); ok {
+												if running, ok := cm["running"].(bool); ok && running {
+													hasRunning = true
+													break
+												}
+											}
+										}
+										if hasRunning {
+											status = "running"
+										} else {
+											status = "stopped"
+										}
+									} else {
+										status = "stopped"
+									}
+								}
+							}
+						}
+					}
+				}
+
+				statusMu.Lock()
+				statuses[wl.Name] = status
+				statusMu.Unlock()
+			}(info.wl, info.ownerPeer)
+		} else {
+			statuses[info.wl.Name] = "remote"
+		}
+	}
+	wg.Wait()
+
+	// Build final workloads list
+	workloads := make([]EnrichedWorkload, 0, len(workloadInfos))
+	for _, info := range workloadInfos {
+		workloads = append(workloads, EnrichedWorkload{
+			Name:         info.wl.Name,
+			IP:           info.wl.IP,
+			Compose:      info.wl.Compose,
+			Revive:       info.wl.Revive,
+			Autostart:    info.wl.Autostart,
+			AllowedNodes: info.wl.AllowedNodes,
+			Owner:        info.ownerInfo,
+			Version:      info.wl.Version,
+			Status:       statuses[info.wl.Name],
+		})
+	}
+
+	resp := map[string]interface{}{
+		"node": map[string]interface{}{
+			"id":        a.hwid,
+			"name":      a.hostname,
+			"ip":        a.ip,
+			"arch":      runtime.GOARCH,
+			"healthy":   true, // Self is always healthy if we're responding
+			"last_seen": time.Now(),
+			"is_self":   true,
+		},
+		"peers":        peers,
+		"workloads":    workloads,
+		"service_cidr": a.serviceCIDR,
+		"tunnel": map[string]interface{}{
+			"configured": hasTunnel,
+			"running":    a.isTunnelRunning(),
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
+	// Return all workloads, deleted workloads (tombstones), and env data for sync
+	// This allows other nodes to get a complete view of cluster state including deletions
+	a.stateMu.RLock()
+	workloads := make([]*Workload, 0, len(a.state.Workloads))
+	for _, wl := range a.state.Workloads {
+		workloads = append(workloads, wl)
+	}
+	deletedWorkloads := make([]*DeletedWorkload, 0, len(a.state.DeletedWorkloads))
+	for _, dw := range a.state.DeletedWorkloads {
+		deletedWorkloads = append(deletedWorkloads, dw)
+	}
+	envData := make(map[string]string)
+	for k, v := range a.state.EnvData {
+		envData[k] = v
+	}
+	deletedEnvKeys := make([]*DeletedEnvKey, 0, len(a.state.DeletedEnvKeys))
+	for _, dek := range a.state.DeletedEnvKeys {
+		deletedEnvKeys = append(deletedEnvKeys, dek)
+	}
+	a.stateMu.RUnlock()
+
+	// Return sync response with workloads, tombstones, and env data
+	resp := map[string]interface{}{
+		"workloads": workloads,
+	}
+	if len(deletedWorkloads) > 0 {
+		resp["deleted_workloads"] = deletedWorkloads
+	}
+	if len(envData) > 0 {
+		resp["env_data"] = envData
+	}
+	if len(deletedEnvKeys) > 0 {
+		resp["deleted_env_keys"] = deletedEnvKeys
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Secret string `json:"secret"`
+		Peer   Peer   `json:"peer"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	// Validate cluster secret
+	if a.clusterSecret != "" && req.Secret != a.clusterSecret {
+		http.Error(w, "invalid cluster secret", 401)
+		return
+	}
+
+	// Don't add ourselves as a peer
+	if req.Peer.ID == a.hwid {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ignored", "reason": "self"})
+		return
+	}
+
+	req.Peer.Healthy = true
+	req.Peer.LastSeen = time.Now()
+
+	// Check if peer IP changed
+	a.stateMu.Lock()
+	oldPeer := a.state.Peers[req.Peer.ID]
+	oldIP := ""
+	if oldPeer != nil {
+		oldIP = oldPeer.IP
+	}
+	ipChanged := oldIP != "" && oldIP != req.Peer.IP
+	a.state.Peers[req.Peer.ID] = &req.Peer
+	a.stateMu.Unlock()
+
+	a.updateHosts()
+	a.saveState()
+
+	// Always ensure we have an IPIP tunnel to this peer (for receiving their traffic)
+	// IPIP requires both sides to have matching tunnels
+	if req.Peer.IP != "" {
+		if err := a.ensurePeerTunnel(req.Peer.ID, req.Peer.IP); err != nil {
+			log.Printf("Warning: failed to create tunnel to %s: %v", req.Peer.Name, err)
+		}
+	}
+
+	// If peer IP changed, also update workload routes
+	if ipChanged {
+		log.Printf("Peer %s IP changed: %s -> %s", req.Peer.Name, oldIP, req.Peer.IP)
+		a.stateMu.Lock()
+		a.updateWorkloadRoutes()
+		a.stateMu.Unlock()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+	log.Printf("Peer announced: %s (%s)", req.Peer.Name, req.Peer.IP)
+}
+// apiHeartbeat receives heartbeats from peers in tunnel-only mode.
+// This allows peers to track each other's health through the Cloudflare tunnel.
+func (a *Agent) apiHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Secret string `json:"secret"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	// Validate cluster secret
+	if a.clusterSecret != "" && req.Secret != a.clusterSecret {
+		http.Error(w, "invalid cluster secret", 401)
+		return
+	}
+
+	// Ignore our own heartbeat (can happen when tunnel routes back to us)
+	if req.ID == a.hwid {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "self"})
+		return
+	}
+
+	// Update peer's LastSeen
+	a.stateMu.Lock()
+	if peer, ok := a.state.Peers[req.ID]; ok {
+		peer.LastSeen = time.Now()
+		peer.Healthy = true
+	}
+	a.stateMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "received_by": a.hostname})
+}
+// broadcastTunnelToken sends the CF token to all peers so they can start their tunnels.
+func (a *Agent) broadcastTunnelToken(token string) {
+	data, _ := json.Marshal(map[string]string{"token": token})
+
+	// In tunnel-only mode, broadcast to tunnel (one node receives, gossip propagates)
+	if a.tunnelDomain != "" {
+		url := a.getTunnelAPIURL("/api/tunnel/sync")
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to broadcast tunnel token: %v", err)
+		} else {
+			resp.Body.Close()
+		}
+		return
+	}
+
+	// Direct mode: send to each peer
+	a.stateMu.RLock()
+	peers := make([]*Peer, 0)
+	for _, p := range a.state.Peers {
+		if p.Healthy {
+			peers = append(peers, p)
+		}
+	}
+	a.stateMu.RUnlock()
+
+	for _, peer := range peers {
+		url := fmt.Sprintf("http://%s:%d/api/tunnel/sync", peer.IP, a.apiPort)
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to broadcast tunnel token to %s: %v", peer.Name, err)
+			continue
+		}
+		resp.Body.Close()
+	}
+}
+func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	a.stateMu.Lock()
+	oldToken := a.state.CFToken
+	a.state.CFToken = req.Token
+	a.stateMu.Unlock()
+
+	// Only restart if token changed
+	if oldToken != req.Token {
+		a.saveState()
+		if req.Token == "" {
+			a.stopCloudflared()
+			log.Printf("Cloudflare tunnel removed via sync")
+		} else {
+			if err := a.restartCloudflared(); err != nil {
+				log.Printf("Failed to start tunnel after sync: %v", err)
+			} else {
+				log.Printf("Cloudflare tunnel started via sync")
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}

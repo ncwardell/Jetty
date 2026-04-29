@@ -2,9 +2,11 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // =============================================================================
@@ -22,7 +24,9 @@ func (a *Agent) saveState() {
 	statePath := filepath.Join(a.dataDir, "state.json")
 	tempPath := statePath + ".tmp"
 
-	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+	// 0600: state.json contains plaintext cluster tokens (WARP/CF) and
+	// encrypted-but-still-sensitive env data. Must not be world-readable.
+	if err := os.WriteFile(tempPath, data, 0600); err != nil {
 		log.Printf("Failed to write state: %v", err)
 		return
 	}
@@ -35,8 +39,11 @@ func (a *Agent) saveState() {
 
 // loadState loads the state from disk.
 // Preserves environment variable tokens over saved state.
+// On corrupt JSON, the bad file is preserved as state.json.corrupt-<timestamp>
+// and the agent boots with empty state rather than overwriting it.
 func (a *Agent) loadState() {
-	data, err := os.ReadFile(filepath.Join(a.dataDir, "state.json"))
+	statePath := filepath.Join(a.dataDir, "state.json")
+	data, err := os.ReadFile(statePath)
 	if err != nil {
 		return
 	}
@@ -47,7 +54,16 @@ func (a *Agent) loadState() {
 	// Preserve env var CF token if set
 	envCFToken := a.state.CFToken
 
-	json.Unmarshal(data, a.state)
+	if err := json.Unmarshal(data, a.state); err != nil {
+		backup := fmt.Sprintf("%s.corrupt-%d", statePath, time.Now().Unix())
+		if renameErr := os.Rename(statePath, backup); renameErr != nil {
+			log.Printf("CRITICAL: state.json is corrupt (%v) and could not be moved aside (%v) - refusing to overwrite. Inspect %s manually.", err, renameErr, statePath)
+		} else {
+			log.Printf("CRITICAL: state.json was corrupt (%v) - moved to %s, booting with empty state", err, backup)
+		}
+		// Reset to a fresh state so we don't keep partially-decoded fields.
+		a.state = NewState()
+	}
 
 	// Env var takes precedence over saved state
 	if envCFToken != "" && a.state.CFToken == "" {

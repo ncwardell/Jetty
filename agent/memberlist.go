@@ -159,7 +159,7 @@ func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
 		return
 	}
 
-	log.Printf("Memberlist: node %s (%s) joined at %s", meta.Name, meta.ID[:12], meta.IP)
+	log.Printf("Memberlist: node %s (%s) joined at %s", meta.Name, shortID(meta.ID, 12), meta.IP)
 
 	e.agent.stateMu.Lock()
 	peer := e.agent.state.Peers[meta.ID]
@@ -186,7 +186,9 @@ func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
 	e.agent.saveState()
 }
 
-// NotifyLeave is called when a node leaves the cluster
+// NotifyLeave is called when a node leaves the cluster. We don't wait
+// for the periodic failover scan - kick checkFailover immediately so
+// orphaned workloads start moving sub-second after node loss.
 func (e *jettyEventDelegate) NotifyLeave(node *memberlist.Node) {
 	if node.Name == e.agent.hwid {
 		return // Ignore self
@@ -200,7 +202,7 @@ func (e *jettyEventDelegate) NotifyLeave(node *memberlist.Node) {
 		nodeName = meta.Name
 	}
 
-	log.Printf("Memberlist: node %s (%s) left", nodeName, nodeID[:12])
+	log.Printf("Memberlist: node %s (%s) left", nodeName, shortID(nodeID, 12))
 
 	e.agent.stateMu.Lock()
 	if peer := e.agent.state.Peers[nodeID]; peer != nil {
@@ -208,6 +210,12 @@ func (e *jettyEventDelegate) NotifyLeave(node *memberlist.Node) {
 		peer.LastSeen = time.Now()
 	}
 	e.agent.stateMu.Unlock()
+
+	// React immediately rather than waiting for the next failover tick.
+	// Cheap: checkFailover is a no-op if no orphans need claiming, and
+	// shouldClaim's deterministic election prevents thundering-herd
+	// across the surviving nodes.
+	go e.agent.checkFailover()
 }
 
 // NotifyUpdate is called when a node's metadata is updated
@@ -336,7 +344,7 @@ func (a *Agent) handleWorkloadUpdate(wl *Workload) {
 	if existing == nil || wl.Version > existing.Version {
 		// Check if we lost ownership
 		if existing != nil && existing.Owner == a.hwid && wl.Owner != a.hwid {
-			log.Printf("Broadcast: lost ownership of %s to %s", existing.Name, wl.Owner[:12])
+			log.Printf("Broadcast: lost ownership of %s to %s", existing.Name, shortID(wl.Owner, 12))
 			go a.removeWorkload(existing)
 		}
 		a.state.Workloads[wl.IP] = wl

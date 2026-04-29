@@ -1449,7 +1449,68 @@
             display: flex;
             gap: 4px;
         }
+
+        /* Terminal modal */
+        .terminal-modal {
+            background: #0d1117;
+            display: flex;
+            flex-direction: column;
+            width: 80vw;
+            max-width: 1100px;
+            height: 75vh;
+            min-height: 360px;
+        }
+        .terminal-header {
+            background: #161b22;
+            color: #c9d1d9;
+            padding: 8px 14px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #30363d;
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            font-size: 12px;
+        }
+        .terminal-header .term-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .terminal-header .term-status {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent-yellow);
+        }
+        .terminal-header .term-status.connected { background: var(--accent-green); }
+        .terminal-header .term-status.error     { background: var(--accent-red); }
+        .terminal-body {
+            flex: 1;
+            min-height: 0;
+            padding: 6px 0 6px 6px;
+            background: #0d1117;
+        }
+        .terminal-body .xterm { height: 100%; }
+        .terminal-footer {
+            background: #161b22;
+            color: #8b949e;
+            padding: 6px 14px;
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            font-size: 11px;
+            border-top: 1px solid #30363d;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
     </style>
+
+    <!-- xterm.js: terminal renderer for the web shell. Loaded from CDN
+         to keep the agent binary slim. If the cluster runs offline, vendor
+         these into web-ui/ and rewrite the URLs. -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 </head>
 <body>
     <!-- Header -->
@@ -1542,6 +1603,16 @@
                         <line x1="12" y1="22.08" x2="12" y2="12"/>
                     </svg>
                     Workloads
+                </div>
+                <div class="sidebar-item" data-page="containers" onclick="showPage('containers')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="2" y="6" width="20" height="12" rx="2"/>
+                        <line x1="6" y1="10" x2="6" y2="14"/>
+                        <line x1="10" y1="10" x2="10" y2="14"/>
+                        <line x1="14" y1="10" x2="14" y2="14"/>
+                        <line x1="18" y1="10" x2="18" y2="14"/>
+                    </svg>
+                    Containers
                 </div>
             </div>
             <div class="sidebar-section">
@@ -1895,6 +1966,71 @@
                 </div>
             </div>
 
+            <!-- Containers Page: every Docker container on a node, including non-Jetty -->
+            <div class="page" id="page-containers">
+                <div class="page-header">
+                    <h1 class="page-title">Containers</h1>
+                    <div style="display: flex; gap: 12px;">
+                        <button class="btn" onclick="refreshContainers()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="23 4 23 10 17 10"/>
+                                <polyline points="1 20 1 14 7 14"/>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                            </svg>
+                            Refresh
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Search/filter/scope bar -->
+                <div class="card" style="margin-bottom: 16px;">
+                    <div class="card-body" style="padding: 12px 16px;">
+                        <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+                            <div class="search-input-wrapper" style="flex: 1; min-width: 200px; max-width: 300px;">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="11" cy="11" r="8"/>
+                                    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                                </svg>
+                                <input type="text" class="search-input" id="containerSearch" placeholder="Search containers..." oninput="renderContainers()">
+                            </div>
+                            <div class="filter-pills" id="containerFilters">
+                                <button class="filter-pill active" data-filter="all" onclick="setContainerFilter('all')">All</button>
+                                <button class="filter-pill" data-filter="jetty" onclick="setContainerFilter('jetty')">Jetty-managed</button>
+                                <button class="filter-pill" data-filter="other" onclick="setContainerFilter('other')">Other</button>
+                                <button class="filter-pill" data-filter="running" onclick="setContainerFilter('running')">Running</button>
+                            </div>
+                            <div class="quick-stats" id="containerQuickStats">
+                                <div class="quick-stat">
+                                    <span class="quick-stat-dot" style="background: var(--accent-green);"></span>
+                                    <span id="cqs-running">0</span> running
+                                </div>
+                                <div class="quick-stat">
+                                    <span class="quick-stat-dot" style="background: var(--accent-yellow);"></span>
+                                    <span id="cqs-stopped">0</span> stopped
+                                </div>
+                                <div class="quick-stat">
+                                    <span class="quick-stat-dot" style="background: var(--accent-blue);"></span>
+                                    <span id="cqs-jetty">0</span> Jetty
+                                </div>
+                            </div>
+                        </div>
+                        <div style="margin-top: 10px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                            <label for="containerNode" style="font-size: 12px; color: var(--text-muted);">Node:</label>
+                            <select id="containerNode" class="search-input" style="max-width: 280px; padding: 6px 10px;" onchange="refreshContainers()">
+                                <option value="local">This node (local)</option>
+                            </select>
+                            <span style="font-size: 11px; color: var(--text-muted);">Per-node Docker view, includes containers Jetty did not deploy.</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="containerProjects">
+                    <div class="empty-state" style="padding: 40px;">
+                        <p>Loading containers…</p>
+                    </div>
+                </div>
+            </div>
+
             <!-- Orchestrate Page (Drag & Drop) -->
             <div class="page" id="page-orchestrate">
                 <div class="page-header">
@@ -2021,6 +2157,27 @@
             <div class="modal-footer">
                 <button class="btn" onclick="closeConnectModal()">Cancel</button>
                 <button class="btn btn-primary" onclick="connect()">Connect</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Terminal Modal: opened via openWorkloadTerminal(name) or openHostTerminal() -->
+    <div class="modal-overlay hidden" id="terminalModal">
+        <div class="modal terminal-modal">
+            <div class="terminal-header">
+                <div class="term-title">
+                    <span class="term-status" id="termStatus"></span>
+                    <span id="termTitle">Terminal</span>
+                </div>
+                <div style="display: flex; gap: 8px; align-items: center;">
+                    <span id="termSubtitle" style="color: #6e7681;"></span>
+                    <button class="btn btn-sm" onclick="closeTerminal()">Close</button>
+                </div>
+            </div>
+            <div class="terminal-body" id="terminalBody"></div>
+            <div class="terminal-footer">
+                <span id="termFooter">Connecting…</span>
+                <span style="color: #6e7681;">Ctrl-D or 'exit' to disconnect</span>
             </div>
         </div>
     </div>
@@ -3092,6 +3249,15 @@
             updateConnectionStatus();
             filterWorkloads();
             filterNodes();
+            updateContainerNodeSelector();
+
+            // If the Containers page is currently visible, soft-refresh its
+            // data on the periodic tick so it stays current without manual
+            // intervention.
+            const containersPage = document.getElementById('page-containers');
+            if (containersPage && containersPage.classList.contains('active') && state.connected) {
+                refreshContainers();
+            }
         }
 
         // Fetch cluster health data from API
@@ -3595,7 +3761,381 @@
             if (pageName === 'secrets' && state.connected) {
                 refreshSecrets();
             }
+            if (pageName === 'containers' && state.connected) {
+                refreshContainers();
+            }
         }
+
+        // ---- Web terminal -------------------------------------------------
+        // Backed by WS endpoints:
+        //   /api/workloads/{name}/exec    - docker exec into a workload container
+        //   /api/host/shell               - shell on the host (gated by JETTY_HOST_SHELL)
+        // Frame protocol (binary in both directions):
+        //   [0x00, payload...]                      - terminal data
+        //   [0x01, cols(u16BE), rows(u16BE)]        - resize event, client -> server
+
+        const termFrame = { DATA: 0x00, RESIZE: 0x01 };
+        const term = {
+            xterm: null,
+            fitAddon: null,
+            ws: null,
+            disposeResize: null,
+        };
+
+        function openWorkloadTerminal(name, owner) {
+            // owner is the {name,id,ip} struct from /api/status. If the workload
+            // isn't on this node, the agent will refuse the upgrade and tell us
+            // to retry against the owner. We could try to redirect automatically
+            // but the dashboard URL is whatever the user opened, so just give
+            // them a clear toast.
+            const localID = (state.node && state.node.id) || '';
+            if (owner && owner.id && owner.id !== localID) {
+                showToast(`This workload runs on ${owner.name} (${owner.ip}). Open the dashboard on that node to exec into it.`, 'error');
+                return;
+            }
+            launchTerminal({
+                title: `${name}`,
+                subtitle: `docker exec /bin/sh`,
+                wsPath: `/api/workloads/${encodeURIComponent(name)}/exec`,
+                wsQuery: 'shell=/bin/sh',
+            });
+        }
+
+        function openHostTerminal(nodeName) {
+            launchTerminal({
+                title: `host: ${nodeName || (state.node && state.node.name) || 'this node'}`,
+                subtitle: `/bin/bash`,
+                wsPath: `/api/host/shell`,
+                wsQuery: 'shell=/bin/bash',
+            });
+        }
+
+        function launchTerminal(opts) {
+            if (!state.connected) {
+                showToast('Connect to a cluster first', 'error');
+                return;
+            }
+            if (typeof Terminal === 'undefined') {
+                showToast('xterm.js failed to load (offline?)', 'error');
+                return;
+            }
+            closeTerminal(); // ensure we don't stack multiple terminals
+
+            document.getElementById('terminalModal').classList.remove('hidden');
+            document.getElementById('termTitle').textContent = opts.title;
+            document.getElementById('termSubtitle').textContent = opts.subtitle;
+            document.getElementById('termStatus').className = 'term-status';
+            document.getElementById('termFooter').textContent = 'Connecting…';
+
+            term.xterm = new Terminal({
+                fontFamily: 'ui-monospace, SFMono-Regular, "Menlo", "Consolas", monospace',
+                fontSize: 13,
+                cursorBlink: true,
+                theme: {
+                    background: '#0d1117',
+                    foreground: '#c9d1d9',
+                    cursor: '#58a6ff',
+                    selectionBackground: '#264f78',
+                },
+            });
+            term.fitAddon = new FitAddon.FitAddon();
+            term.xterm.loadAddon(term.fitAddon);
+            term.xterm.open(document.getElementById('terminalBody'));
+            term.fitAddon.fit();
+
+            // Build the WS URL based on where this dashboard came from.
+            // The dashboard's apiUrl (e.g. https://node1.cluster) tells us
+            // both the host and the scheme; flip http(s)://...  to ws(s)://.
+            const apiURL = new URL(state.apiUrl);
+            const wsScheme = apiURL.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsURL = `${wsScheme}//${apiURL.host}${opts.wsPath}?api_key=${encodeURIComponent(state.secretKey)}${opts.wsQuery ? '&' + opts.wsQuery : ''}`;
+
+            term.ws = new WebSocket(wsURL);
+            term.ws.binaryType = 'arraybuffer';
+
+            term.ws.onopen = () => {
+                document.getElementById('termStatus').className = 'term-status connected';
+                document.getElementById('termFooter').textContent = 'Connected';
+                // Send the actual terminal size right away so the running
+                // program's $COLUMNS/$LINES match what xterm.js is rendering.
+                sendResize();
+                term.xterm.focus();
+            };
+
+            term.ws.onmessage = (ev) => {
+                if (!(ev.data instanceof ArrayBuffer)) return;
+                const buf = new Uint8Array(ev.data);
+                if (buf.length < 1) return;
+                if (buf[0] === termFrame.DATA) {
+                    // The Terminal API accepts Uint8Array directly.
+                    term.xterm.write(buf.subarray(1));
+                }
+                // Server doesn't send 0x01 (resize is one-way client->server).
+            };
+
+            term.ws.onclose = () => {
+                document.getElementById('termStatus').className = 'term-status error';
+                document.getElementById('termFooter').textContent = 'Disconnected';
+                if (term.xterm) {
+                    term.xterm.write('\r\n\x1b[33m[disconnected]\x1b[0m\r\n');
+                }
+            };
+
+            term.ws.onerror = () => {
+                document.getElementById('termStatus').className = 'term-status error';
+                document.getElementById('termFooter').textContent = 'Connection error';
+            };
+
+            // Plumb keystrokes to the server.
+            term.xterm.onData((data) => {
+                if (term.ws && term.ws.readyState === WebSocket.OPEN) {
+                    const bytes = new TextEncoder().encode(data);
+                    const frame = new Uint8Array(bytes.length + 1);
+                    frame[0] = termFrame.DATA;
+                    frame.set(bytes, 1);
+                    term.ws.send(frame);
+                }
+            });
+
+            // Resize tracking. xterm.js fires onResize when the visible cell
+            // grid changes; we also re-fit on window resize.
+            term.xterm.onResize(() => sendResize());
+            const winResize = () => {
+                if (term.fitAddon) {
+                    try { term.fitAddon.fit(); } catch (_) {}
+                }
+            };
+            window.addEventListener('resize', winResize);
+            term.disposeResize = () => window.removeEventListener('resize', winResize);
+        }
+
+        function sendResize() {
+            if (!term.xterm || !term.ws || term.ws.readyState !== WebSocket.OPEN) return;
+            const cols = term.xterm.cols;
+            const rows = term.xterm.rows;
+            const buf = new ArrayBuffer(5);
+            const view = new DataView(buf);
+            view.setUint8(0, termFrame.RESIZE);
+            view.setUint16(1, cols, false /* big-endian */);
+            view.setUint16(3, rows, false);
+            term.ws.send(buf);
+        }
+
+        function closeTerminal() {
+            document.getElementById('terminalModal').classList.add('hidden');
+            if (term.ws) {
+                try { term.ws.close(); } catch (_) {}
+                term.ws = null;
+            }
+            if (term.disposeResize) {
+                term.disposeResize();
+                term.disposeResize = null;
+            }
+            if (term.xterm) {
+                try { term.xterm.dispose(); } catch (_) {}
+                term.xterm = null;
+            }
+            term.fitAddon = null;
+        }
+
+        // ---- Containers page ----------------------------------------------
+        // Surfaces every Docker container on a node, not just Jetty workloads.
+        // Backed by GET /api/host/compose (already grouped by project) and a
+        // node selector that fans out via /api/proxy/{ip}/api/host/compose.
+
+        // In-memory state for the current containers view. Re-rendered on
+        // search/filter/refresh without re-fetching unless the node changes.
+        const containerState = {
+            projects: [],   // [{name, managed_by_jetty, workload_name, containers: [...]}]
+            filter: 'all',  // 'all' | 'jetty' | 'other' | 'running'
+        };
+
+        function setContainerFilter(filter) {
+            containerState.filter = filter;
+            document.querySelectorAll('#containerFilters .filter-pill').forEach(p => {
+                p.classList.toggle('active', p.dataset.filter === filter);
+            });
+            renderContainers();
+        }
+
+        // Build the node selector options whenever the peer list changes.
+        // Updated from updateUI()/refreshStatus.
+        function updateContainerNodeSelector() {
+            const sel = document.getElementById('containerNode');
+            if (!sel) return;
+            const prev = sel.value;
+            sel.innerHTML = '';
+
+            const localOpt = document.createElement('option');
+            localOpt.value = 'local';
+            const selfName = (state.node && state.node.name) || 'this node';
+            localOpt.textContent = `${selfName} (local)`;
+            sel.appendChild(localOpt);
+
+            (state.peers || []).forEach(p => {
+                if (!p.ip) return;
+                const opt = document.createElement('option');
+                // We proxy by IP because /api/host/* is per-node and the
+                // proxy endpoint speaks IPs.
+                opt.value = `proxy:${p.ip}`;
+                opt.textContent = `${p.name} (${p.ip})`;
+                sel.appendChild(opt);
+            });
+
+            // Preserve selection across refreshes when possible.
+            if (prev && [...sel.options].some(o => o.value === prev)) {
+                sel.value = prev;
+            }
+        }
+
+        async function refreshContainers() {
+            if (!state.connected) return;
+            const sel = document.getElementById('containerNode');
+            const nodeChoice = sel ? sel.value : 'local';
+
+            const root = document.getElementById('containerProjects');
+            root.innerHTML = `<div class="empty-state" style="padding: 40px;"><p>Loading containers…</p></div>`;
+
+            try {
+                let projects;
+                if (nodeChoice === 'local' || !nodeChoice) {
+                    projects = await apiCall('/host/compose');
+                } else if (nodeChoice.startsWith('proxy:')) {
+                    const ip = nodeChoice.slice('proxy:'.length);
+                    // /api/proxy/{ip}{rest} is the existing fan-out endpoint.
+                    projects = await apiCall(`/proxy/${ip}/api/host/compose`);
+                } else {
+                    projects = await apiCall('/host/compose');
+                }
+                containerState.projects = Array.isArray(projects) ? projects : [];
+                renderContainers();
+            } catch (err) {
+                root.innerHTML = `<div class="empty-state" style="padding: 40px;">
+                    <p style="color: var(--accent-red);">Failed to load containers: ${escapeHtml(err.message)}</p>
+                </div>`;
+            }
+        }
+
+        function renderContainers() {
+            const root = document.getElementById('containerProjects');
+            const search = (document.getElementById('containerSearch')?.value || '').toLowerCase();
+            const filter = containerState.filter;
+
+            // Apply filter+search to each project's container list. Drop
+            // projects whose container list is empty after filtering.
+            const visible = [];
+            let totalRunning = 0, totalStopped = 0, totalJetty = 0;
+
+            for (const proj of containerState.projects) {
+                const containers = (proj.containers || []).filter(c => {
+                    if (filter === 'jetty' && !c.managed_by_jetty) return false;
+                    if (filter === 'other' && c.managed_by_jetty) return false;
+                    if (filter === 'running' && c.state !== 'running') return false;
+                    if (search && !(c.name.toLowerCase().includes(search)
+                            || (c.image || '').toLowerCase().includes(search)
+                            || (c.compose_project || '').toLowerCase().includes(search))) {
+                        return false;
+                    }
+                    return true;
+                });
+                // Track totals across the unfiltered set too.
+                for (const c of (proj.containers || [])) {
+                    if (c.state === 'running') totalRunning++;
+                    else totalStopped++;
+                    if (c.managed_by_jetty) totalJetty++;
+                }
+                if (containers.length > 0) {
+                    visible.push({ ...proj, containers });
+                }
+            }
+
+            document.getElementById('cqs-running').textContent = totalRunning;
+            document.getElementById('cqs-stopped').textContent = totalStopped;
+            document.getElementById('cqs-jetty').textContent = totalJetty;
+
+            if (visible.length === 0) {
+                root.innerHTML = `<div class="empty-state" style="padding: 40px;">
+                    <p>No containers match the current filters.</p>
+                </div>`;
+                return;
+            }
+
+            // Render each project as a card with its containers as a sub-table.
+            root.innerHTML = visible.map(proj => renderProjectCard(proj)).join('');
+        }
+
+        function renderProjectCard(proj) {
+            const isJetty = !!proj.managed_by_jetty;
+            const projectLabel = proj.name === ''
+                ? 'Standalone containers'
+                : (isJetty
+                    ? `Workload: ${escapeHtml(proj.workload_name || proj.name.replace(/^jetty_/, ''))}`
+                    : escapeHtml(proj.name));
+            const projectSubtitle = proj.name === ''
+                ? 'No compose project'
+                : (isJetty ? `compose project: ${escapeHtml(proj.name)}` : 'compose project');
+
+            const badge = isJetty
+                ? `<span class="status-badge running" style="margin-left: 8px;">Jetty</span>`
+                : (proj.name === ''
+                    ? ''
+                    : `<span class="status-badge unknown" style="margin-left: 8px;">External</span>`);
+
+            const rows = (proj.containers || []).map(renderContainerRow).join('');
+
+            return `
+                <div class="card" style="margin-bottom: 16px;">
+                    <div class="card-body" style="padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border);">
+                        <div>
+                            <div style="font-weight: 600;">${projectLabel}${badge}</div>
+                            <div style="font-size: 11px; color: var(--text-muted);">${projectSubtitle}</div>
+                        </div>
+                        <div style="font-size: 12px; color: var(--text-muted);">
+                            ${proj.containers.length} container${proj.containers.length === 1 ? '' : 's'}
+                        </div>
+                    </div>
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>State</th>
+                                    <th>Image</th>
+                                    <th>Service</th>
+                                    <th>Ports</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>${rows}</tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderContainerRow(c) {
+            const stateClass = c.state === 'running' ? 'running'
+                : c.state === 'exited' ? 'stopped'
+                : c.state === 'paused' ? 'unknown'
+                : c.state === 'dead' ? 'error'
+                : 'unknown';
+            const ports = (c.ports || []).map(escapeHtml).join('<br>');
+            return `
+                <tr>
+                    <td>
+                        <div style="font-weight: 500;">${escapeHtml(c.name)}</div>
+                        <div style="font-size: 11px; color: var(--text-muted); font-family: monospace;">${escapeHtml(c.id)}</div>
+                    </td>
+                    <td><span class="status-badge ${stateClass}">${escapeHtml(c.state)}</span></td>
+                    <td style="font-family: monospace; font-size: 12px;">${escapeHtml(c.image)}</td>
+                    <td>${c.compose_service ? escapeHtml(c.compose_service) : '<span style="color: var(--text-muted);">—</span>'}</td>
+                    <td style="font-size: 12px;">${ports || '<span style="color: var(--text-muted);">—</span>'}</td>
+                    <td style="font-size: 12px; color: var(--text-muted);">${escapeHtml(c.status || '')}</td>
+                </tr>
+            `;
+        }
+
+        // (escapeHtml is defined later in this file, in the utility section)
 
         // Workload Actions
         function openDeployModal() {
@@ -3971,6 +4511,7 @@
                         ` : `
                             <button class="btn btn-success" onclick="startWorkload('${name}')">Start</button>
                         `) : ''}
+                        ${isLocal && isRunning ? `<button class="btn" onclick='openWorkloadTerminal(${JSON.stringify(name)}, ${JSON.stringify(workload.owner || {})})'>Terminal</button>` : ''}
                         ${isLocal ? `<button class="btn" onclick="viewLogs('${name}')">View Logs</button>` : ''}
                         <button class="btn" onclick="openMoveModal('${name}')">Move</button>
                         <button class="btn btn-danger" onclick="deleteWorkload('${name}'); closeDetailPanel();">Delete</button>
@@ -4135,6 +4676,9 @@
                             </svg>
                             Update Node
                         </button>
+                        ${isCurrentNode ? `
+                        <button class="btn" onclick='openHostTerminal(${JSON.stringify(nodeName)})' title="Requires JETTY_HOST_SHELL=true on the agent">Host Shell</button>
+                        ` : ''}
                         ${!isCurrentNode ? `
                         <button class="btn btn-danger" onclick="deleteNode('${nodeId}'); closeNodeDetailPanel();">Remove Node</button>
                         ` : ''}
