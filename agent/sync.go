@@ -54,7 +54,7 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 		if existing == nil || w.Version > existing.Version {
 			// Check if we lost ownership (IP collision resolution)
 			if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
-				log.Printf("Lost ownership of %s (IP %s) to %s - newer version wins", existing.Name, w.IP, w.Owner[:12])
+				log.Printf("Lost ownership of %s (IP %s) to %s - newer version wins", existing.Name, w.IP, shortID(w.Owner, 12))
 				result.LostOwnership = append(result.LostOwnership, existing)
 			}
 			a.state.Workloads[w.IP] = w
@@ -118,7 +118,7 @@ func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) {
 		existing := a.state.Workloads[w.IP]
 		if existing == nil || w.Version > existing.Version {
 			if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
-				log.Printf("Workload %s was revived by %s while we were down", w.Name, w.Owner[:12])
+				log.Printf("Workload %s was revived by %s while we were down", w.Name, shortID(w.Owner, 12))
 			}
 			a.state.Workloads[w.IP] = w
 			if tombstone != nil {

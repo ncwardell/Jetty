@@ -197,6 +197,17 @@ func genID() string {
 	return hex.EncodeToString(b)
 }
 
+// shortID returns id truncated to n chars, safe for short or empty ids.
+// Used in log lines that previously did id[:12] / id[:8] - those panicked
+// when given an unexpectedly short id (which can happen in tests or if a
+// peer sends a malformed identifier on the wire).
+func shortID(id string, n int) string {
+	if len(id) <= n {
+		return id
+	}
+	return id[:n]
+}
+
 // =============================================================================
 // URL Helpers
 // =============================================================================

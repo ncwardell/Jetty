@@ -1,0 +1,243 @@
+package agent
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+)
+
+// =============================================================================
+// Gossip
+// =============================================================================
+
+func (a *Agent) gossipLoop() {
+	tick := time.NewTicker(10 * time.Second)
+	defer tick.Stop()
+
+	// Run tombstone GC every 10 minutes (every 60th tick)
+	gcCounter := 0
+
+	for {
+		select {
+		case <-a.stopCh:
+			return
+		case <-tick.C:
+			a.checkPeers()
+			a.syncWorkloads()
+
+			// Garbage collect old tombstones periodically
+			gcCounter++
+			if gcCounter >= 60 { // Every 10 minutes (60 * 10 seconds)
+				a.gcTombstones()
+				gcCounter = 0
+			}
+		}
+	}
+}
+
+// gcTombstones removes tombstones older than 1 hour.
+// This prevents unbounded growth of the tombstone map while ensuring
+// deletions have enough time to propagate across all nodes.
+func (a *Agent) gcTombstones() {
+	cutoff := time.Now().UnixNano() - int64(time.Hour) // 1 hour ago
+
+	a.stateMu.Lock()
+	removedWorkloads := 0
+	for ip, dw := range a.state.DeletedWorkloads {
+		if dw.Version < cutoff {
+			delete(a.state.DeletedWorkloads, ip)
+			removedWorkloads++
+		}
+	}
+	removedEnvKeys := 0
+	for key, dek := range a.state.DeletedEnvKeys {
+		if dek.Version < cutoff {
+			delete(a.state.DeletedEnvKeys, key)
+			removedEnvKeys++
+		}
+	}
+	a.stateMu.Unlock()
+
+	if removedWorkloads > 0 || removedEnvKeys > 0 {
+		log.Printf("GC: removed %d workload tombstones, %d env key tombstones", removedWorkloads, removedEnvKeys)
+		a.saveState()
+	}
+}
+
+func (a *Agent) checkPeers() {
+	// In tunnel-only mode, send heartbeat through tunnel and check peer staleness
+	if a.tunnelDomain != "" {
+		a.tunnelModeHealthCheck()
+		return
+	}
+
+	// Direct mode: check each peer individually via mesh IP
+	// Copy peer info outside the lock to avoid holding mutex during network calls
+	type peerCheck struct {
+		id string
+		ip string
+	}
+	a.stateMu.RLock()
+	peers := make([]peerCheck, 0, len(a.state.Peers))
+	for _, p := range a.state.Peers {
+		peers = append(peers, peerCheck{id: p.ID, ip: p.IP})
+	}
+	a.stateMu.RUnlock()
+
+	// Check each peer without holding the mutex
+	type peerResult struct {
+		id      string
+		healthy bool
+	}
+	results := make([]peerResult, 0, len(peers))
+
+	for _, peer := range peers {
+		// Use ?node=local to get only the peer's local health, avoiding recursive peer queries
+		url := fmt.Sprintf("http://%s:%d/api/health?node=local", peer.ip, a.apiPort)
+		resp, err := httpClient.Get(url)
+
+		result := peerResult{id: peer.id, healthy: false}
+		if err == nil {
+			result.healthy = resp.StatusCode == 200
+			resp.Body.Close()
+		}
+		results = append(results, result)
+	}
+
+	// Update peer status under the lock
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+
+	now := time.Now()
+	for _, result := range results {
+		if peer, ok := a.state.Peers[result.id]; ok {
+			peer.Healthy = result.healthy
+			if result.healthy {
+				peer.LastSeen = now
+			}
+		}
+	}
+}
+
+// tunnelModeHealthCheck handles peer health in tunnel-only mode.
+// Since we can't directly reach peers, we:
+// 1. Send our heartbeat through the tunnel (any node receiving it updates our LastSeen)
+// 2. Check peer staleness based on LastSeen
+func (a *Agent) tunnelModeHealthCheck() {
+	// Send our heartbeat through the tunnel
+	heartbeat := map[string]interface{}{
+		"id":     a.hwid,
+		"name":   a.hostname,
+		"secret": a.clusterSecret,
+	}
+	data, _ := json.Marshal(heartbeat)
+
+	url := a.getTunnelAPIURL("/api/heartbeat")
+	resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+	if err != nil {
+		// Only log heartbeat failures once per minute to avoid log spam
+		if time.Since(a.lastHeartbeatErrLog) > time.Minute {
+			log.Printf("Heartbeat failed: %v (suppressing further errors for 1 min)", err)
+			a.lastHeartbeatErrLog = time.Now()
+		}
+	} else {
+		resp.Body.Close()
+	}
+
+	// Check peer health based on LastSeen staleness
+	a.stateMu.Lock()
+
+	staleThreshold := HealthTimeout // Backstop for HTTP-gossip mode
+	now := time.Now()
+	healthChanged := false
+
+	for _, peer := range a.state.Peers {
+		wasHealthy := peer.Healthy
+		if now.Sub(peer.LastSeen) > staleThreshold {
+			if peer.Healthy {
+				log.Printf("Peer %s marked unhealthy (no heartbeat for %v)", peer.Name, now.Sub(peer.LastSeen))
+			}
+			peer.Healthy = false
+		} else {
+			peer.Healthy = true
+		}
+		if wasHealthy != peer.Healthy {
+			healthChanged = true
+		}
+	}
+
+	// Update routes if any peer health status changed
+	// This ensures routes to unhealthy peers are removed immediately
+	if healthChanged {
+		a.updateWorkloadRoutes()
+	}
+	a.stateMu.Unlock()
+}
+
+func (a *Agent) announcePeer(newPeer *Peer) {
+	// Include secret in announcement
+	announcement := struct {
+		Secret string `json:"secret"`
+		Peer   *Peer  `json:"peer"`
+	}{
+		Secret: a.clusterSecret,
+		Peer:   newPeer,
+	}
+	data, _ := json.Marshal(announcement)
+
+	// Track if any direct announcements succeeded
+	directSuccess := 0
+
+	// Try direct peer IPs first (if we have peers with IPs)
+	a.stateMu.RLock()
+	peers := make([]*Peer, 0)
+	for _, p := range a.state.Peers {
+		if p.ID != newPeer.ID && p.IP != "" {
+			peers = append(peers, p)
+		}
+	}
+	a.stateMu.RUnlock()
+
+	for _, peer := range peers {
+		url := fmt.Sprintf("http://%s:%d/api/peer-announce", peer.IP, a.apiPort)
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to announce peer to %s via direct IP: %v", peer.Name, err)
+			continue
+		}
+		resp.Body.Close()
+		directSuccess++
+	}
+
+	// Use tunnel as fallback if direct failed or no peers had IPs
+	if directSuccess == 0 && a.tunnelDomain != "" {
+		url := a.getTunnelAPIURL("/api/peer-announce")
+		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to announce peer via tunnel: %v", err)
+		} else {
+			resp.Body.Close()
+		}
+	}
+}
+
+// announceOurIP sends our current IP to all known peers.
+// Called after WARP connects so peers can update our address.
+func (a *Agent) announceOurIP() {
+	if a.ip == "" {
+		return
+	}
+
+	self := &Peer{
+		ID:       a.hwid,
+		Name:     a.hostname,
+		IP:       a.ip,
+		Healthy:  true,
+		LastSeen: time.Now(),
+	}
+
+	log.Printf("Announcing our IP (%s) to cluster...", a.ip)
+	a.announcePeer(self)
+}
