@@ -15,59 +15,78 @@ import (
 // Cluster Join (client side and server side)
 // =============================================================================
 //
-// A new node joins the cluster by POSTing JETTY_SECRET + identity to an
-// existing node's /api/join endpoint. The existing node validates the
-// secret, allocates an entry in its peer table, and returns:
+// A new node joins the cluster by POSTing a one-time JoinToken (minted
+// by an admin via POST /api/tokens) plus its own identity + a freshly
+// generated SelfAPIKey to an existing node's /api/join endpoint. The
+// existing node validates and burns the token, registers the joining
+// peer's APIKey in its peer table, and returns:
 //
-//   - The full peer list (so the joiner discovers everyone else).
+//   - The full peer list with each peer's APIKey (so the joiner can
+//     authenticate inbound requests from any peer).
 //   - The full workload list (so the joiner can install routes).
 //   - The cluster service CIDR (so the joiner agrees on the mesh range).
 //   - The CF Tunnel and WARP connector tokens (so the joiner can bring up
 //     the same Cloudflare assets).
-//   - The cluster encryption salt (so the joiner can derive the same AES
-//     key under Argon2id and decrypt env_data).
+//   - The cluster AdminKey (so the dashboard works on the joining node
+//     without needing JETTY_SECRET in the joining node's env).
+//   - The cluster EncryptionKey (so the joiner can decrypt env_data).
 //   - The encrypted env_data map.
 //
 // The joiner then either uses an already-connected WARP (bootstrap-style)
 // or runs configureWarpRuntime with the received connector token.
 //
-// Security note: the cluster secret travels in the request body. We refuse
-// http:// joins to non-loopback hosts to keep the secret off plaintext
-// links. Production clusters should join through a Cloudflare tunnel
-// domain (https://) which terminates TLS at Cloudflare's edge.
+// Security note: the JoinToken travels in the request body. Production
+// clusters should join through a Cloudflare tunnel domain (https://)
+// which terminates TLS at Cloudflare's edge. We refuse plaintext
+// http:// joins to non-loopback hosts to keep the token off untrusted
+// links.
 
 // joinCluster is the client-side join called from Start() when JETTY_JOIN
-// is set and we have no existing cluster state. Returns nil on success;
-// non-nil errors abort startup.
+// is set and we have no existing cluster state. Requires JETTY_JOIN_TOKEN.
+// Returns nil on success; non-nil errors abort startup.
 func (a *Agent) joinCluster() error {
+	if a.joinToken == "" {
+		return fmt.Errorf("JETTY_JOIN_TOKEN is required to join (mint one with POST /api/tokens on an existing cluster node)")
+	}
+
 	// Normalize join URL - allow both base URL and full /api/join URL
 	joinEndpoint := a.joinURL
 	if !strings.HasSuffix(joinEndpoint, "/api/join") {
 		joinEndpoint = strings.TrimSuffix(joinEndpoint, "/") + "/api/join"
 	}
-	// The cluster secret is sent in the request body. Refuse plaintext joins
-	// unless the destination is loopback - shipping the secret over an
-	// untrusted http:// link would let any on-path observer read it.
 	if strings.HasPrefix(joinEndpoint, "http://") {
 		host := joinEndpoint[len("http://"):]
 		if i := strings.IndexAny(host, "/:"); i >= 0 {
 			host = host[:i]
 		}
 		if host != "localhost" && host != "127.0.0.1" && host != "::1" {
-			return fmt.Errorf("refusing to join over plaintext http://: cluster secret would be sent in cleartext to %s. Use https:// (e.g. via your Cloudflare tunnel domain).", host)
+			return fmt.Errorf("refusing to join over plaintext http://: the join token would be sent in cleartext to %s. Use https:// (e.g. via your Cloudflare tunnel domain).", host)
 		}
 	}
 	log.Printf("Joining cluster via %s", joinEndpoint)
 
-	// Join request - IP may be empty if WARP not yet configured
-	// (will be set after we receive WARP token and connect)
+	// Generate our own SelfAPIKey before contacting the cluster. The
+	// joiner picks this; the cluster registers it as our Peer.APIKey.
+	a.stateMu.Lock()
+	if a.state.SelfAPIKey == "" {
+		key, err := generateAPIKey()
+		if err != nil {
+			a.stateMu.Unlock()
+			return fmt.Errorf("generate self api key: %w", err)
+		}
+		a.state.SelfAPIKey = key
+	}
+	selfKey := a.state.SelfAPIKey
+	a.stateMu.Unlock()
+
 	req := map[string]string{
-		"secret":  a.clusterSecret, // Cluster secret for authentication
-		"id":      a.hwid,
-		"name":    a.hostname,
-		"ip":      a.ip, // WARP IP (may be empty, set after WARP connect)
-		"version": Version,
-		"arch":    runtime.GOARCH,
+		"join_token": a.joinToken,
+		"id":         a.hwid,
+		"name":       a.hostname,
+		"ip":         a.ip,
+		"version":    Version,
+		"arch":       runtime.GOARCH,
+		"api_key":    selfKey,
 	}
 
 	data, _ := json.Marshal(req)
@@ -79,19 +98,19 @@ func (a *Agent) joinCluster() error {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return fmt.Errorf("join failed: %s", body)
+		return fmt.Errorf("join failed (%d): %s", resp.StatusCode, body)
 	}
 
-	// Success - process response
 	var result struct {
-		Peers          []*Peer           `json:"peers"`
-		Workloads      []*Workload       `json:"workloads"`
-		CFToken        string            `json:"cf_token,omitempty"`
-		WarpToken      string            `json:"warp_token,omitempty"`
-		ServiceCIDR    string            `json:"service_cidr,omitempty"`
-		TunnelDomain   string            `json:"tunnel_domain,omitempty"`
-		EnvData        map[string]string `json:"env_data,omitempty"`        // Encrypted env vars
-		EncryptionSalt []byte            `json:"encryption_salt,omitempty"` // Cluster KDF salt
+		Peers         []peerWire        `json:"peers"`
+		Workloads     []*Workload       `json:"workloads"`
+		CFToken       string            `json:"cf_token,omitempty"`
+		WarpToken     string            `json:"warp_token,omitempty"`
+		ServiceCIDR   string            `json:"service_cidr,omitempty"`
+		TunnelDomain  string            `json:"tunnel_domain,omitempty"`
+		EnvData       map[string]string `json:"env_data,omitempty"`
+		AdminKey      string            `json:"admin_key,omitempty"`
+		EncryptionKey []byte            `json:"encryption_key,omitempty"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		resp.Body.Close()
@@ -99,38 +118,41 @@ func (a *Agent) joinCluster() error {
 	}
 	resp.Body.Close()
 
-	// Update service CIDR if received (for workload IPs)
 	if result.ServiceCIDR != "" && result.ServiceCIDR != a.serviceCIDR {
 		log.Printf("Adopting cluster service CIDR: %s", result.ServiceCIDR)
 		a.serviceCIDR = result.ServiceCIDR
 	}
-
-	// Update tunnel domain if received and not set locally
 	if result.TunnelDomain != "" && a.tunnelDomain == "" {
 		a.tunnelDomain = result.TunnelDomain
 		log.Printf("Adopting cluster tunnel domain: %s", a.tunnelDomain)
 	}
 
 	a.stateMu.Lock()
-	for _, p := range result.Peers {
+	for _, w := range result.Peers {
+		p := w.toPeer()
+		if !validIngestedPeer(p) {
+			continue
+		}
 		a.state.Peers[p.ID] = p
 	}
 	for _, w := range result.Workloads {
+		if !validIngestedWorkload(w) {
+			continue
+		}
 		a.state.Workloads[w.IP] = w
 	}
-	// Store tokens received from the cluster
 	if result.CFToken != "" {
 		a.state.CFToken = result.CFToken
 	}
 	if result.WarpToken != "" {
 		a.state.WarpToken = result.WarpToken
 	}
-	// Adopt the cluster's encryption salt before importing env data, since
-	// the env data was encrypted under the cluster's key.
-	if len(result.EncryptionSalt) > 0 {
-		a.state.EncryptionSalt = result.EncryptionSalt
+	if result.AdminKey != "" {
+		a.state.AdminKey = result.AdminKey
 	}
-	// Store encrypted env data received from the cluster
+	if len(result.EncryptionKey) == encryptionKeySize {
+		a.state.EncryptionKey = result.EncryptionKey
+	}
 	if len(result.EnvData) > 0 {
 		for k, v := range result.EnvData {
 			a.state.EnvData[k] = v
@@ -175,27 +197,42 @@ func (a *Agent) joinCluster() error {
 // @Router /join [post]
 func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Secret  string `json:"secret"` // Cluster secret for authentication
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		IP      string `json:"ip"`
-		Version string `json:"version"`
-		Arch    string `json:"arch"` // CPU architecture (amd64, arm64, etc.)
+		JoinToken string `json:"join_token"`
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		IP        string `json:"ip"`
+		Version   string `json:"version"`
+		Arch      string `json:"arch"`
+		APIKey    string `json:"api_key"` // Joiner-generated; stored as Peer.APIKey
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), 400)
 		return
 	}
 
-	// Validate cluster secret
-	if a.clusterSecret == "" {
-		http.Error(w, "cluster has no secret configured", 500)
+	// Validate joiner identity before consuming the token. Cheap and
+	// avoids burning a token on a malformed request.
+	if !validNamePattern.MatchString(req.ID) {
+		http.Error(w, "invalid id", 400)
 		return
 	}
-	if req.Secret != a.clusterSecret {
-		http.Error(w, "invalid secret", 401)
+	if req.Name == "" || !validPeerNamePattern.MatchString(req.Name) {
+		http.Error(w, "invalid name", 400)
 		return
 	}
+	if req.APIKey == "" || len(req.APIKey) < 16 {
+		http.Error(w, "invalid api_key (must be present and >=16 chars)", 400)
+		return
+	}
+
+	// Consume the one-time token. consumeJoinToken takes stateMu so we
+	// can't hold an RLock around it.
+	tok, err := a.consumeJoinToken(req.JoinToken, req.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	log.Printf("token: consumed %s for joiner %s (note=%q)", redactTokenID(tok.ID), shortID(req.ID, 12), tok.Note)
 
 	// Check for mesh IP collision before creating peer
 	a.stateMu.RLock()
@@ -221,7 +258,8 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	a.stateMu.RUnlock()
 
-	// Create peer
+	// Create peer. Store the joiner-supplied APIKey so future inbound
+	// requests from this peer authenticate via apiKeyMiddleware.
 	peer := &Peer{
 		ID:       req.ID,
 		Name:     req.Name,
@@ -230,23 +268,30 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		LastSeen: time.Now(),
 		Version:  req.Version,
 		Arch:     req.Arch,
+		APIKey:   req.APIKey,
 	}
 
 	a.stateMu.Lock()
 	a.state.Peers[peer.ID] = peer
 
-	// Build response with all peers (including self)
-	allPeers := []*Peer{{
+	// Build response with all peers (including self). Self carries
+	// SelfAPIKey so the joiner can call us back with auth that matches
+	// in our middleware (it'll match against state.SelfAPIKey).
+	// We use peerWire (not Peer) so APIKey is explicitly serialized -
+	// Peer's json:"-" tag suppresses APIKey on all the other handlers
+	// that return Peer objects.
+	allPeers := []peerWire{{
 		ID:      a.hwid,
 		Name:    a.hostname,
 		IP:      a.ip,
 		Healthy: true,
 		Version: Version,
 		Arch:    runtime.GOARCH,
+		APIKey:  a.state.SelfAPIKey,
 	}}
 	for _, p := range a.state.Peers {
 		if p.ID != req.ID {
-			allPeers = append(allPeers, p)
+			allPeers = append(allPeers, peerToWire(p))
 		}
 	}
 
@@ -256,13 +301,14 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	cfToken := a.state.CFToken
 	warpToken := a.state.WarpToken
-	// Copy env data (already encrypted, safe to share)
+	// Copy env data (already encrypted, safe to share with the joiner -
+	// they receive the matching EncryptionKey below).
 	envData := make(map[string]string)
 	for k, v := range a.state.EnvData {
 		envData[k] = v
 	}
-	// Copy the cluster encryption salt so the joining node can decrypt envData.
-	encryptionSalt := append([]byte(nil), a.state.EncryptionSalt...)
+	adminKey := a.state.AdminKey
+	encryptionKey := append([]byte(nil), a.state.EncryptionKey...)
 	a.stateMu.Unlock()
 
 	a.updateHosts()
@@ -304,10 +350,15 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		resp["env_data"] = envData
 	}
 
-	// Include the cluster encryption salt so the joining node derives the
-	// same AES key. Without this, env_data is undecryptable on the joiner.
-	if len(encryptionSalt) > 0 {
-		resp["encryption_salt"] = encryptionSalt
+	// Hand the joiner the cluster's AdminKey + EncryptionKey so it can
+	// (a) accept dashboard auth without needing JETTY_SECRET set in its
+	// env and (b) decrypt env_data. Both travel over TLS via the
+	// Cloudflare tunnel; they never appear on a plaintext wire.
+	if adminKey != "" {
+		resp["admin_key"] = adminKey
+	}
+	if len(encryptionKey) == encryptionKeySize {
+		resp["encryption_key"] = encryptionKey
 	}
 
 	w.Header().Set("Content-Type", "application/json")

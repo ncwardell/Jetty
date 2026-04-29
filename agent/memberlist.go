@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"runtime"
 	"sync"
 	"time"
@@ -18,7 +19,10 @@ import (
 // MemberlistPort is the port used for memberlist gossip (UDP and TCP)
 const MemberlistPort = 6881
 
-// NodeMeta contains metadata about a node that is broadcast via memberlist
+// NodeMeta contains metadata about a node that is broadcast via memberlist.
+// Carried over the gossip channel, which binds to WARP IP and is therefore
+// only readable by other authenticated WARP peers - the APIKey field below
+// inherits that trust boundary.
 type NodeMeta struct {
 	ID      string `json:"id"`      // HWID
 	Name    string `json:"name"`    // Hostname
@@ -26,6 +30,11 @@ type NodeMeta struct {
 	Version string `json:"version"` // Agent version
 	Arch    string `json:"arch"`    // CPU architecture
 	APIPort int    `json:"api_port"`
+	// APIKey is this node's SelfAPIKey, propagated so other peers can
+	// authenticate inbound requests from us via apiKeyMiddleware.
+	// Without this, only the apiJoin-receiving node knows a new peer's
+	// APIKey and the rest of the cluster rejects calls from it.
+	APIKey string `json:"api_key,omitempty"`
 }
 
 // BroadcastMessage represents a message broadcast to all nodes
@@ -158,6 +167,9 @@ func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
 		log.Printf("Memberlist: node %s joined but has invalid metadata", node.Name)
 		return
 	}
+	if !validIngestedNodeMeta(meta) {
+		return
+	}
 
 	log.Printf("Memberlist: node %s (%s) joined at %s", meta.Name, shortID(meta.ID, 12), meta.IP)
 
@@ -175,6 +187,12 @@ func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
 	peer.Arch = meta.Arch
 	peer.Healthy = true
 	peer.LastSeen = time.Now()
+	// Adopt APIKey from gossip if we don't already know one for this
+	// peer. Don't overwrite a known APIKey - the join-receiving node
+	// recorded the canonical value first; gossip just propagates it.
+	if peer.APIKey == "" && meta.APIKey != "" {
+		peer.APIKey = meta.APIKey
+	}
 	e.agent.stateMu.Unlock()
 
 	// Update userspace tunnel peer address
@@ -228,6 +246,9 @@ func (e *jettyEventDelegate) NotifyUpdate(node *memberlist.Node) {
 	if meta == nil {
 		return
 	}
+	if !validIngestedNodeMeta(meta) {
+		return
+	}
 
 	e.agent.stateMu.Lock()
 	if peer := e.agent.state.Peers[meta.ID]; peer != nil {
@@ -237,6 +258,9 @@ func (e *jettyEventDelegate) NotifyUpdate(node *memberlist.Node) {
 		peer.Arch = meta.Arch
 		peer.Healthy = true
 		peer.LastSeen = time.Now()
+		if peer.APIKey == "" && meta.APIKey != "" {
+			peer.APIKey = meta.APIKey
+		}
 
 		// If IP changed, update tunnel
 		if oldIP != meta.IP {
@@ -264,8 +288,38 @@ func parseNodeMeta(data []byte) *NodeMeta {
 	return &meta
 }
 
-// updateNodeMeta updates this node's metadata (called when IP changes)
+// validIngestedNodeMeta is the memberlist-side analog of
+// validIngestedPeer. NodeMeta.ID and NodeMeta.Name flow into /etc/hosts
+// via routes.go::updateHosts; embedded newlines/tabs would let any
+// gossip-channel participant inject arbitrary host->IP mappings on
+// every node (and therefore every workload, since they share host
+// /etc/hosts via --net host).
+func validIngestedNodeMeta(meta *NodeMeta) bool {
+	if meta == nil {
+		return false
+	}
+	if !validNamePattern.MatchString(meta.ID) {
+		log.Printf("Memberlist: rejecting node with invalid ID %q", meta.ID)
+		return false
+	}
+	if !validPeerNamePattern.MatchString(meta.Name) {
+		log.Printf("Memberlist: rejecting node %q with invalid name %q", meta.ID, meta.Name)
+		return false
+	}
+	if meta.IP != "" && net.ParseIP(meta.IP) == nil {
+		log.Printf("Memberlist: rejecting node %q with invalid IP %q", meta.ID, meta.IP)
+		return false
+	}
+	return true
+}
+
+// updateNodeMeta updates this node's metadata (called when IP changes
+// and when SelfAPIKey is first set during bootstrap).
 func (d *jettyDelegate) updateNodeMeta(ip string) {
+	d.agent.stateMu.RLock()
+	apiKey := d.agent.state.SelfAPIKey
+	d.agent.stateMu.RUnlock()
+
 	meta := NodeMeta{
 		ID:      d.agent.hwid,
 		Name:    d.agent.hostname,
@@ -273,6 +327,7 @@ func (d *jettyDelegate) updateNodeMeta(ip string) {
 		Version: Version,
 		Arch:    getArch(),
 		APIPort: d.agent.apiPort,
+		APIKey:  apiKey,
 	}
 
 	data, err := json.Marshal(meta)
@@ -330,24 +385,34 @@ func (a *Agent) handleBroadcast(msg *BroadcastMessage) {
 	}
 }
 
-// handleWorkloadUpdate processes a workload update broadcast
+// handleWorkloadUpdate processes a workload update broadcast.
+//
+// We never call saveState/updateHosts under stateMu - both take a
+// read lock internally and would deadlock against the write lock we
+// hold here (Go's RWMutex is not reentrant).
 func (a *Agent) handleWorkloadUpdate(wl *Workload) {
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
-
-	// Check tombstone
-	if tombstone := a.state.DeletedWorkloads[wl.IP]; tombstone != nil && tombstone.Version > wl.Version {
-		return // Tombstone supersedes
+	if !validIngestedWorkload(wl) {
+		return
 	}
 
+	a.stateMu.Lock()
+	changed := false
+	if tombstone := a.state.DeletedWorkloads[wl.IP]; tombstone != nil && tombstone.Version > wl.Version {
+		a.stateMu.Unlock()
+		return
+	}
 	existing := a.state.Workloads[wl.IP]
 	if existing == nil || wl.Version > existing.Version {
-		// Check if we lost ownership
 		if existing != nil && existing.Owner == a.hwid && wl.Owner != a.hwid {
 			log.Printf("Broadcast: lost ownership of %s to %s", existing.Name, shortID(wl.Owner, 12))
 			go a.removeWorkload(existing)
 		}
 		a.state.Workloads[wl.IP] = wl
+		changed = true
+	}
+	a.stateMu.Unlock()
+
+	if changed {
 		a.saveState()
 		a.updateHosts()
 	}
@@ -355,22 +420,28 @@ func (a *Agent) handleWorkloadUpdate(wl *Workload) {
 
 // handleWorkloadDelete processes a workload delete broadcast
 func (a *Agent) handleWorkloadDelete(dw *DeletedWorkload) {
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
+	if !validIngestedTombstone(dw) {
+		return
+	}
 
-	// Update tombstone
+	a.stateMu.Lock()
+	changed := false
 	existingTombstone := a.state.DeletedWorkloads[dw.IP]
 	if existingTombstone == nil || dw.Version > existingTombstone.Version {
 		a.state.DeletedWorkloads[dw.IP] = dw
+		changed = true
 	}
-
-	// Remove workload if tombstone is newer
 	if existing := a.state.Workloads[dw.IP]; existing != nil && dw.Version > existing.Version {
 		log.Printf("Broadcast: removing workload %s (deleted)", existing.Name)
 		if existing.Owner == a.hwid {
 			go a.removeWorkload(existing)
 		}
 		delete(a.state.Workloads, dw.IP)
+		changed = true
+	}
+	a.stateMu.Unlock()
+
+	if changed {
 		a.saveState()
 		a.updateHosts()
 	}
@@ -378,32 +449,47 @@ func (a *Agent) handleWorkloadDelete(dw *DeletedWorkload) {
 
 // handleEnvUpdate processes an env update broadcast
 func (a *Agent) handleEnvUpdate(key, value string) {
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
-
-	// Check tombstone
-	if tombstone := a.state.DeletedEnvKeys[key]; tombstone != nil {
-		return // Key was deleted
+	if !ValidateEnvKey(key) {
+		return
 	}
 
+	a.stateMu.Lock()
+	changed := false
+	if tombstone := a.state.DeletedEnvKeys[key]; tombstone != nil {
+		a.stateMu.Unlock()
+		return
+	}
 	if a.state.EnvData[key] != value {
 		a.state.EnvData[key] = value
+		changed = true
+	}
+	a.stateMu.Unlock()
+
+	if changed {
 		a.saveState()
 	}
 }
 
 // handleEnvDelete processes an env delete broadcast
 func (a *Agent) handleEnvDelete(dek *DeletedEnvKey) {
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
+	if dek == nil || !ValidateEnvKey(dek.Key) {
+		return
+	}
 
+	a.stateMu.Lock()
+	changed := false
 	existingTombstone := a.state.DeletedEnvKeys[dek.Key]
 	if existingTombstone == nil || dek.Version > existingTombstone.Version {
 		a.state.DeletedEnvKeys[dek.Key] = dek
+		changed = true
 	}
-
 	if _, exists := a.state.EnvData[dek.Key]; exists {
 		delete(a.state.EnvData, dek.Key)
+		changed = true
+	}
+	a.stateMu.Unlock()
+
+	if changed {
 		a.saveState()
 	}
 }
@@ -639,8 +725,9 @@ func (a *Agent) memberlistSyncLoop() {
 			a.memberlistPeriodicSync()
 
 		case <-gcTicker.C:
-			// Garbage collect old tombstones
+			// Garbage collect old tombstones and expired/burned join tokens.
 			a.gcTombstones()
+			a.gcExpiredTokens()
 		}
 	}
 }
@@ -675,7 +762,11 @@ func (a *Agent) memberlistPeriodicSync() {
 	// Request sync via API (memberlist LocalState/MergeRemoteState handles full sync on join,
 	// but this catches incremental updates that might have been missed)
 	url := fmt.Sprintf("http://%s:%d/api/sync", meta.IP, meta.APIPort)
-	resp, err := peerClient.Get(url)
+	req, err := a.peerRequest("GET", url, nil)
+	if err != nil {
+		return
+	}
+	resp, err := peerClient.Do(req)
 	if err != nil {
 		return
 	}

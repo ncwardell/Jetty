@@ -62,51 +62,61 @@ func (a *Agent) corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// apiKeyMiddleware enforces JETTY_SECRET on protected endpoints.
+// apiKeyMiddleware enforces an X-API-Key check on protected endpoints.
 //
-// publicPaths is an allowlist of routes that don't require the API key:
-//   - /api/health   - monitoring probes
-//   - /api/join     - new-node bootstrap (validates the secret in the body)
-//   - /api/sync, /api/peer-announce, /api/heartbeat, /api/tunnel/sync -
-//     internal cluster machinery; these endpoints expect requests from
-//     other cluster members and validate identity in the request body
-//     where applicable
-//   - /swagger/     - API docs UI
-//   - /             - dashboard root
+// publicPaths is a small allowlist of routes that don't require auth:
+//   - /api/health        - monitoring probes
+//   - /api/join          - new-node bootstrap (validates a JoinToken in the body)
+//   - /swagger/          - API docs UI
+//   - /                  - dashboard root
 //
-// All other routes require X-API-Key matching JETTY_SECRET. The comparison
-// uses subtle.ConstantTimeCompare to avoid timing-leak attacks on the
-// secret.
+// All other routes require X-API-Key (or ?api_key=) matching one of:
+//   - state.AdminKey      (operator/dashboard)
+//   - state.SelfAPIKey    (this node calling itself)
+//   - state.Peers[*].APIKey (any other peer calling us)
 //
-// If JETTY_SECRET is unset, every route is unauthenticated. Start() prints
-// a loud warning when this is the case; production deployments must set it.
+// All comparisons use subtle.ConstantTimeCompare. The peer table is
+// iterated linearly - O(#peers) is fine for cluster sizes that fit in
+// a homelab.
+//
+// If state.AdminKey is unset AND there are no peer keys yet (i.e. we
+// haven't bootstrapped) every route is unauthenticated. Start() prints
+// a loud warning when this is the case; production deployments must
+// set JETTY_SECRET so AdminKey gets bootstrapped.
 func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip authentication if no secret is configured
-		if a.clusterSecret == "" {
+		// Skip authentication if neither AdminKey nor any peer key is
+		// configured. Mirrors the original behavior on first-ever-node
+		// startup before bootstrap completes.
+		a.stateMu.RLock()
+		adminKey := a.state.AdminKey
+		selfKey := a.state.SelfAPIKey
+		hasAnyPeerKey := false
+		for _, p := range a.state.Peers {
+			if p.APIKey != "" {
+				hasAnyPeerKey = true
+				break
+			}
+		}
+		a.stateMu.RUnlock()
+
+		if adminKey == "" && selfKey == "" && !hasAnyPeerKey {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Public endpoints that don't require API key
+		// Public endpoints that don't require API key.
 		publicPaths := []string{
-			"/api/health",        // Monitoring
-			"/api/join",          // Node joining (uses secret in body)
-			"/api/sync",          // Internal cluster sync
-			"/api/peer-announce", // Internal peer announcement
-			"/api/heartbeat",     // Internal heartbeat
-			"/api/tunnel/sync",   // Internal tunnel sync
-			"/swagger/",          // API documentation
+			"/api/health",
+			"/api/join",
+			"/swagger/",
 		}
 
 		path := r.URL.Path
-
-		// Dashboard root is public (exact match)
 		if path == "/" {
 			next.ServeHTTP(w, r)
 			return
 		}
-
 		for _, p := range publicPaths {
 			if strings.HasPrefix(path, p) {
 				next.ServeHTTP(w, r)
@@ -114,19 +124,65 @@ func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		// Check API key from header or query param
 		apiKey := r.Header.Get("X-API-Key")
 		if apiKey == "" {
 			apiKey = r.URL.Query().Get("api_key")
 		}
-
-		if subtle.ConstantTimeCompare([]byte(apiKey), []byte(a.clusterSecret)) != 1 {
-			http.Error(w, "unauthorized: invalid or missing API key", http.StatusUnauthorized)
+		if apiKey == "" {
+			http.Error(w, "unauthorized: missing API key", http.StatusUnauthorized)
 			return
 		}
-
-		next.ServeHTTP(w, r)
+		if a.authorizeAPIKey(apiKey) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "unauthorized: invalid API key", http.StatusUnauthorized)
 	})
+}
+
+// authorizeAPIKey returns true if apiKey matches AdminKey, SelfAPIKey,
+// or any registered peer's APIKey. Constant-time per comparison.
+func (a *Agent) authorizeAPIKey(apiKey string) bool {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	if a.state.AdminKey != "" &&
+		subtle.ConstantTimeCompare([]byte(apiKey), []byte(a.state.AdminKey)) == 1 {
+		return true
+	}
+	if a.state.SelfAPIKey != "" &&
+		subtle.ConstantTimeCompare([]byte(apiKey), []byte(a.state.SelfAPIKey)) == 1 {
+		return true
+	}
+	for _, p := range a.state.Peers {
+		if p.APIKey == "" {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(apiKey), []byte(p.APIKey)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// adminAuthorize returns true ONLY if apiKey matches state.AdminKey.
+// Used by token-management endpoints that should be operator-only,
+// not peer-callable.
+func (a *Agent) adminAuthorize(r *http.Request) bool {
+	apiKey := r.Header.Get("X-API-Key")
+	if apiKey == "" {
+		apiKey = r.URL.Query().Get("api_key")
+	}
+	if apiKey == "" {
+		return false
+	}
+	a.stateMu.RLock()
+	admin := a.state.AdminKey
+	a.stateMu.RUnlock()
+	if admin == "" {
+		// Nothing to compare against - admin endpoints disabled.
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(apiKey), []byte(admin)) == 1
 }
 
 // waitForAPI polls /api/health until the server starts accepting requests
@@ -223,6 +279,14 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/backup", a.apiBackup).Methods("GET")
 	r.HandleFunc("/api/restore", a.apiRestore).Methods("POST")
 
+	// --- One-time join tokens (handlers_tokens.go) -------------------
+	// Admin-only: apiCreateToken/apiListTokens/apiDeleteToken each
+	// run their own adminAuthorize() check on top of apiKeyMiddleware
+	// so peer keys can't mint joining credentials.
+	r.HandleFunc("/api/tokens", a.apiCreateToken).Methods("POST")
+	r.HandleFunc("/api/tokens", a.apiListTokens).Methods("GET")
+	r.HandleFunc("/api/tokens/{id}", a.apiDeleteToken).Methods("DELETE")
+
 	// --- HTTP proxy to a workload by mesh IP (handlers_workloads.go) -
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)
 
@@ -239,7 +303,10 @@ func (a *Agent) runAPI() {
 	handler := a.corsMiddleware(a.apiKeyMiddleware(r))
 
 	addr := fmt.Sprintf(":%d", a.apiPort)
-	log.Printf("API on %s (auth=%v)", addr, a.clusterSecret != "")
+	a.stateMu.RLock()
+	hasAdmin := a.state.AdminKey != ""
+	a.stateMu.RUnlock()
+	log.Printf("API on %s (auth=%v)", addr, hasAdmin)
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("API server failed: %v", err)
 	}

@@ -23,6 +23,12 @@ import (
 // Valid workload name pattern (alphanumeric, dash, underscore only)
 var validNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// Valid peer hostname pattern. Slightly more permissive than workload
+// names because operators set hostnames via /etc/hostname and FQDNs
+// contain dots. The point is to reject anything that could break out of
+// a single /etc/hosts line (newlines, tabs, spaces, comment chars).
+var validPeerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
 // Valid environment variable key pattern
 var envKeyPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
@@ -235,13 +241,18 @@ func (a *Agent) getTunnelAPIURL(path string) string {
 }
 
 // peerRequest creates an HTTP request to a peer with auth headers set.
+// Uses this node's SelfAPIKey - the receiver's apiKeyMiddleware will
+// match it against any registered Peer.APIKey.
 func (a *Agent) peerRequest(method, url string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
 		return nil, err
 	}
-	if a.clusterSecret != "" {
-		req.Header.Set("X-API-Key", a.clusterSecret)
+	a.stateMu.RLock()
+	apiKey := a.state.SelfAPIKey
+	a.stateMu.RUnlock()
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
 	}
 	if method == "POST" || method == "PUT" || method == "PATCH" {
 		req.Header.Set("Content-Type", "application/json")

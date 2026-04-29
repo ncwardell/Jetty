@@ -57,19 +57,27 @@ var termWSUpgrader = websocket.Upgrader{
 // writes a 401 if the request is not authenticated. Returns true on
 // success.
 //
-// We DELIBERATELY require a configured cluster secret here, even though
-// the rest of the API can run without one. Terminal endpoints are too
+// Terminal endpoints are admin-only: a peer's API key (used for
+// peer-to-peer sync, tunnel, etc.) must NOT be enough to open a shell
+// on another node. The dashboard authenticates with state.AdminKey, so
+// an operator clicking "open terminal" still works.
+//
+// We DELIBERATELY require a configured AdminKey here, even though the
+// rest of the API can run without one. Terminal endpoints are too
 // dangerous to expose unauthenticated under any circumstances.
 func (a *Agent) authorizeTerminalRequest(w http.ResponseWriter, r *http.Request) bool {
-	if a.clusterSecret == "" {
-		http.Error(w, "terminal disabled: cluster secret not configured", http.StatusUnauthorized)
+	a.stateMu.RLock()
+	admin := a.state.AdminKey
+	a.stateMu.RUnlock()
+	if admin == "" {
+		http.Error(w, "terminal disabled: admin key not configured", http.StatusUnauthorized)
 		return false
 	}
 	apiKey := r.Header.Get("X-API-Key")
 	if apiKey == "" {
 		apiKey = r.URL.Query().Get("api_key")
 	}
-	if subtle.ConstantTimeCompare([]byte(apiKey), []byte(a.clusterSecret)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(apiKey), []byte(admin)) != 1 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}

@@ -13,8 +13,8 @@ import (
 )
 
 // newAgentWithDataDir builds a test agent with a real temp data dir so
-// backup/restore can actually write files. Caller is responsible for
-// the temp dir's lifecycle.
+// backup/restore can actually write files. AdminKey is set so the
+// admin-gated handlers admit testAdminKey via X-API-Key.
 func newAgentWithDataDir(t *testing.T) *Agent {
 	t.Helper()
 	dir := t.TempDir()
@@ -23,7 +23,17 @@ func newAgentWithDataDir(t *testing.T) *Agent {
 	a := newTestAgent("s")
 	a.dataDir = dir
 	a.composeDir = composeDir
+	a.state.AdminKey = testAdminKey
 	return a
+}
+
+const testAdminKey = "test-admin-key"
+
+// withAdminAuth attaches the admin X-API-Key header used by the
+// admin-gated handlers in tests.
+func withAdminAuth(req *http.Request) *http.Request {
+	req.Header.Set("X-API-Key", testAdminKey)
+	return req
 }
 
 func TestBackupRestoreRoundTrip(t *testing.T) {
@@ -43,7 +53,7 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 
 	// Backup -> bytes.
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/api/backup", nil)
+	req := withAdminAuth(httptest.NewRequest("GET", "/api/backup", nil))
 	a.apiBackup(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("backup status: got %d, body=%s", rec.Code, rec.Body.String())
@@ -86,7 +96,7 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	// Restore into a fresh agent.
 	a2 := newAgentWithDataDir(t)
 	rec2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest("POST", "/api/restore", bytes.NewReader(archive))
+	req2 := withAdminAuth(httptest.NewRequest("POST", "/api/restore", bytes.NewReader(archive)))
 	a2.apiRestore(rec2, req2)
 	if rec2.Code != 200 {
 		t.Fatalf("restore status: got %d, body=%s", rec2.Code, rec2.Body.String())
@@ -125,7 +135,7 @@ func TestRestoreRejectsPathTraversal(t *testing.T) {
 	gz.Close()
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/restore", bytes.NewReader(gzBuf.Bytes()))
+	req := withAdminAuth(httptest.NewRequest("POST", "/api/restore", bytes.NewReader(gzBuf.Bytes())))
 	a.apiRestore(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("restore should reject path traversal, got status %d", rec.Code)
@@ -145,7 +155,7 @@ func TestRestoreRejectsArchiveWithoutStateJSON(t *testing.T) {
 	gz.Close()
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/restore", bytes.NewReader(gzBuf.Bytes()))
+	req := withAdminAuth(httptest.NewRequest("POST", "/api/restore", bytes.NewReader(gzBuf.Bytes())))
 	a.apiRestore(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 without state.json, got %d", rec.Code)
@@ -165,7 +175,7 @@ func TestRestoreRejectsBadStateJSON(t *testing.T) {
 	gz.Close()
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/restore", bytes.NewReader(gzBuf.Bytes()))
+	req := withAdminAuth(httptest.NewRequest("POST", "/api/restore", bytes.NewReader(gzBuf.Bytes())))
 	a.apiRestore(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for bad state.json, got %d", rec.Code)
@@ -175,9 +185,35 @@ func TestRestoreRejectsBadStateJSON(t *testing.T) {
 func TestRestoreRejectsBadGzip(t *testing.T) {
 	a := newAgentWithDataDir(t)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/restore", strings.NewReader("not a gzip stream"))
+	req := withAdminAuth(httptest.NewRequest("POST", "/api/restore", strings.NewReader("not a gzip stream")))
 	a.apiRestore(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for non-gzip body, got %d", rec.Code)
+	}
+}
+
+// Regression: peer-API-key must NOT be enough to download the backup
+// (which contains AdminKey + EncryptionKey + every peer's APIKey).
+func TestBackupRejectsPeerKey(t *testing.T) {
+	a := newAgentWithDataDir(t)
+	a.state.Peers["p1"] = &Peer{ID: "p1", APIKey: "peer1-secret"}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/backup", nil)
+	req.Header.Set("X-API-Key", "peer1-secret")
+	a.apiBackup(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("peer key should be rejected, got %d", rec.Code)
+	}
+}
+
+func TestRestoreRejectsPeerKey(t *testing.T) {
+	a := newAgentWithDataDir(t)
+	a.state.Peers["p1"] = &Peer{ID: "p1", APIKey: "peer1-secret"}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/restore", strings.NewReader("doesntmatter"))
+	req.Header.Set("X-API-Key", "peer1-secret")
+	a.apiRestore(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("peer key should be rejected, got %d", rec.Code)
 	}
 }

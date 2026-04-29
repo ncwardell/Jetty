@@ -126,24 +126,26 @@ func (a *Agent) checkPeers() {
 // 1. Send our heartbeat through the tunnel (any node receiving it updates our LastSeen)
 // 2. Check peer staleness based on LastSeen
 func (a *Agent) tunnelModeHealthCheck() {
-	// Send our heartbeat through the tunnel
+	// Send our heartbeat through the tunnel. Auth via X-API-Key
+	// (peerRequest sets it from SelfAPIKey).
 	heartbeat := map[string]interface{}{
-		"id":     a.hwid,
-		"name":   a.hostname,
-		"secret": a.clusterSecret,
+		"id":   a.hwid,
+		"name": a.hostname,
 	}
 	data, _ := json.Marshal(heartbeat)
 
 	url := a.getTunnelAPIURL("/api/heartbeat")
-	resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
-	if err != nil {
-		// Only log heartbeat failures once per minute to avoid log spam
-		if time.Since(a.lastHeartbeatErrLog) > time.Minute {
-			log.Printf("Heartbeat failed: %v (suppressing further errors for 1 min)", err)
-			a.lastHeartbeatErrLog = time.Now()
+	req, err := a.peerRequest("POST", url, strings.NewReader(string(data)))
+	if err == nil {
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			if time.Since(a.lastHeartbeatErrLog) > time.Minute {
+				log.Printf("Heartbeat failed: %v (suppressing further errors for 1 min)", err)
+				a.lastHeartbeatErrLog = time.Now()
+			}
+		} else {
+			resp.Body.Close()
 		}
-	} else {
-		resp.Body.Close()
 	}
 
 	// Check peer health based on LastSeen staleness
@@ -177,14 +179,11 @@ func (a *Agent) tunnelModeHealthCheck() {
 }
 
 func (a *Agent) announcePeer(newPeer *Peer) {
-	// Include secret in announcement
+	// Body now carries only the peer record - auth flows via the
+	// X-API-Key header (peerRequest sets it from SelfAPIKey).
 	announcement := struct {
-		Secret string `json:"secret"`
-		Peer   *Peer  `json:"peer"`
-	}{
-		Secret: a.clusterSecret,
-		Peer:   newPeer,
-	}
+		Peer *Peer `json:"peer"`
+	}{Peer: newPeer}
 	data, _ := json.Marshal(announcement)
 
 	// Track if any direct announcements succeeded
@@ -202,7 +201,12 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/peer-announce", peer.IP, a.apiPort)
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		req, err := a.peerRequest("POST", url, strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to build announce request to %s: %v", peer.Name, err)
+			continue
+		}
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			log.Printf("Failed to announce peer to %s via direct IP: %v", peer.Name, err)
 			continue
@@ -214,7 +218,12 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 	// Use tunnel as fallback if direct failed or no peers had IPs
 	if directSuccess == 0 && a.tunnelDomain != "" {
 		url := a.getTunnelAPIURL("/api/peer-announce")
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		req, err := a.peerRequest("POST", url, strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to build announce request via tunnel: %v", err)
+			return
+		}
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			log.Printf("Failed to announce peer via tunnel: %v", err)
 		} else {

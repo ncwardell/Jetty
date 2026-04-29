@@ -94,4 +94,7 @@ func (a *Agent) ensureStateMapsInitialized() {
 	if a.state.DeletedEnvKeys == nil {
 		a.state.DeletedEnvKeys = make(map[string]*DeletedEnvKey)
 	}
+	if a.state.JoinTokens == nil {
+		a.state.JoinTokens = make(map[string]*JoinToken)
+	}
 }

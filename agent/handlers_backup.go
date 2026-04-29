@@ -38,6 +38,15 @@ import (
 // @Success 200 {file} file "tar.gz archive"
 // @Router /backup [get]
 func (a *Agent) apiBackup(w http.ResponseWriter, r *http.Request) {
+	// Backup contains state.json which now carries AdminKey,
+	// EncryptionKey, SelfAPIKey, and every peer's APIKey. Hand-out to
+	// a peer key would let that peer recover admin credentials. Admin
+	// only.
+	if !a.adminAuthorize(r) {
+		http.Error(w, "unauthorized: admin key required for backup", http.StatusUnauthorized)
+		return
+	}
+
 	// Persist any pending state before we read it back from disk.
 	a.saveState()
 
@@ -89,6 +98,12 @@ func (a *Agent) apiBackup(w http.ResponseWriter, r *http.Request) {
 // @Failure 400 {object} ErrorResponse "invalid archive"
 // @Router /restore [post]
 func (a *Agent) apiRestore(w http.ResponseWriter, r *http.Request) {
+	// Restore overwrites every credential on this node. Admin only.
+	if !a.adminAuthorize(r) {
+		http.Error(w, "unauthorized: admin key required for restore", http.StatusUnauthorized)
+		return
+	}
+
 	defer r.Body.Close()
 
 	// Stage to a buffer first so a partial/broken upload doesn't half-write
