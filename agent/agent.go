@@ -35,6 +35,7 @@ func New() (*Agent, error) {
 		apiPort:         getEnvInt("JETTY_API_PORT", 6880),
 		serviceCIDR:     getEnv("JETTY_SERVICE_CIDR", "10.100.0.0/16"), // CIDR for workload IPs
 		joinURL:         getEnv("JETTY_JOIN", ""),
+		joinToken:       getEnv("JETTY_JOIN_TOKEN", ""),
 		clusterSecret:   getEnv("JETTY_SECRET", ""),
 		tunnelDomain:    getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - Cloudflare tunnel for API access
 		tunnelHost:      getEnv("JETTY_TUNNEL_HOST", ""),   // e.g., "node1.cluster.example.com" - this node's specific subdomain
@@ -178,13 +179,21 @@ func (a *Agent) Start() error {
 	// Record start time for uptime tracking
 	a.startTime = time.Now()
 
-	if a.clusterSecret == "" {
-		log.Printf("!!! WARNING: JETTY_SECRET is not set - the API and tunnel WebSocket are UNAUTHENTICATED. !!!")
-		log.Printf("!!! Set JETTY_SECRET to a strong random value before exposing this node to a network.   !!!")
+	// Warn if the node has no admin key configured AND no peers (i.e.
+	// fresh first-ever node and JETTY_SECRET wasn't set). On a joiner
+	// the admin key arrives in the join response, so JETTY_SECRET on
+	// the joining node is optional.
+	a.stateMu.RLock()
+	hasAdmin := a.state.AdminKey != ""
+	hasPeers := len(a.state.Peers) > 0
+	a.stateMu.RUnlock()
+	if !hasAdmin && !hasPeers && a.joinURL == "" && a.clusterSecret == "" {
+		log.Printf("!!! WARNING: JETTY_SECRET is not set and no cluster state exists - the API will be UNAUTHENTICATED. !!!")
+		log.Printf("!!! Set JETTY_SECRET to a strong random value before exposing this node to a network.              !!!")
 	}
 
 	if a.hostShellEnabled {
-		log.Printf("!!! Host shell endpoint /api/host/shell is ENABLED - anyone with JETTY_SECRET can run shell commands on this host. !!!")
+		log.Printf("!!! Host shell endpoint /api/host/shell is ENABLED - anyone with the cluster admin key can run shell commands on this host. !!!")
 	}
 
 	// Record whether WARP was already running before we touched anything.
@@ -205,6 +214,17 @@ func (a *Agent) Start() error {
 
 	// Load saved state
 	a.loadState()
+
+	// One-shot upgrade from old (Argon2id-salt-derived) to new (raw
+	// EncryptionKey) env-data encryption. No-op on fresh state and on
+	// already-migrated state.
+	a.migrateLegacyEnvData()
+
+	// Bootstrap the keys this node owns. ensureSelfAPIKey + ensureEncryptionKey
+	// are no-ops on a state that already has them (e.g. after a join). The
+	// AdminKey is bootstrapped from JETTY_SECRET on the first node only;
+	// joiners get it from the /api/join response.
+	a.bootstrapKeys()
 
 	// Check if we need to join a cluster first (before WARP is configured)
 	a.stateMu.RLock()
@@ -465,7 +485,7 @@ func (a *Agent) loadOrCreateHWID() string {
 	// Try machine-id
 	if data, err := os.ReadFile("/etc/machine-id"); err == nil {
 		hwid := strings.TrimSpace(string(data))
-		os.WriteFile(hwidFile, []byte(hwid), 0644)
+		os.WriteFile(hwidFile, []byte(hwid), 0600)
 		return hwid
 	}
 
@@ -473,7 +493,7 @@ func (a *Agent) loadOrCreateHWID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	hwid := hex.EncodeToString(b)
-	os.WriteFile(hwidFile, []byte(hwid), 0644)
+	os.WriteFile(hwidFile, []byte(hwid), 0600)
 	return hwid
 }
 

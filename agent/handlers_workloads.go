@@ -1500,10 +1500,16 @@ func (a *Agent) apiWorkloadProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var targetURL string
+	// localTarget == true means we're about to send the request *into* a
+	// workload container. Workload code is untrusted relative to the
+	// cluster control plane, so we must strip the operator's API key /
+	// dashboard cookies before handing the request over.
+	localTarget := false
 
 	if workload.Owner == a.hwid {
 		// Local workload - forward to mesh IP directly (DNAT handles it)
 		targetURL = fmt.Sprintf("http://%s%s", meshIP, targetPath)
+		localTarget = true
 	} else if owner != nil {
 		// Remote workload - forward to owner node
 		if a.tunnelDomain != "" {
@@ -1530,6 +1536,16 @@ func (a *Agent) apiWorkloadProxy(w http.ResponseWriter, r *http.Request) {
 		// Skip hop-by-hop headers
 		if k == "Connection" || k == "Keep-Alive" || k == "Proxy-Connection" {
 			continue
+		}
+		// Don't forward our auth credentials into workload containers -
+		// those run untrusted code and would be able to steal the cluster
+		// secret. Peers (remote-target) still need them to satisfy the
+		// next hop's apiKeyMiddleware.
+		if localTarget {
+			lk := strings.ToLower(k)
+			if lk == "x-api-key" || lk == "authorization" || lk == "cookie" {
+				continue
+			}
 		}
 		proxyReq.Header[k] = v
 	}

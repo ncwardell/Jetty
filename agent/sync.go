@@ -4,7 +4,70 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 )
+
+// validIngestedWorkload checks that a workload received from a peer has a
+// safe name and a parseable IP. Returning false here means we drop the
+// entry entirely - a peer who has the cluster secret should not be able to
+// inject a name like "../../etc/cron.d/x" (which would land outside the
+// composeDir when deployWorkload writes the compose file) or one with
+// embedded newlines (which inject extra lines into /etc/hosts).
+func validIngestedWorkload(w *Workload) bool {
+	if w == nil {
+		return false
+	}
+	if !ValidateWorkloadName(w.Name) {
+		log.Printf("Sync: rejecting workload with invalid name %q", w.Name)
+		return false
+	}
+	if net.ParseIP(w.IP) == nil {
+		log.Printf("Sync: rejecting workload %q with invalid IP %q", w.Name, w.IP)
+		return false
+	}
+	return true
+}
+
+// validIngestedTombstone gates DeletedWorkload entries. Tombstones are
+// keyed on IP, so we only need to ensure the IP parses (a malformed IP
+// could still poison /etc/hosts via routes.go::updateHosts).
+func validIngestedTombstone(dw *DeletedWorkload) bool {
+	if dw == nil {
+		return false
+	}
+	if net.ParseIP(dw.IP) == nil {
+		log.Printf("Sync: rejecting tombstone with invalid IP %q", dw.IP)
+		return false
+	}
+	return true
+}
+
+// validIngestedPeer checks that a Peer received from the network has
+// safe identity fields. Peer.Name and Peer.IP both flow into /etc/hosts
+// via routes.go::updateHosts; if either contains a newline or tab, the
+// generated block can be hijacked to inject arbitrary host -> IP
+// mappings (which workloads inherit because they run --net host).
+func validIngestedPeer(p *Peer) bool {
+	if p == nil {
+		return false
+	}
+	if !ValidateWorkloadName(p.ID) {
+		log.Printf("Sync: rejecting peer with invalid ID %q", p.ID)
+		return false
+	}
+	// Peer.Name is operator-supplied (hostname); allow alphanumerics,
+	// dash, underscore, and dot for FQDN-style hostnames.
+	if !validPeerNamePattern.MatchString(p.Name) {
+		log.Printf("Sync: rejecting peer %q with invalid name %q", p.ID, p.Name)
+		return false
+	}
+	// Peer.IP may be empty briefly during bootstrap before WARP attaches.
+	if p.IP != "" && net.ParseIP(p.IP) == nil {
+		log.Printf("Sync: rejecting peer %q with invalid IP %q", p.ID, p.IP)
+		return false
+	}
+	return true
+}
 
 // =============================================================================
 // State Synchronization
@@ -25,6 +88,9 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 
 	// Process deleted workloads (tombstones) first
 	for _, dw := range syncResp.DeletedWorkloads {
+		if !validIngestedTombstone(dw) {
+			continue
+		}
 		// Merge tombstone if we don't have it or peer's is newer
 		existingTombstone := a.state.DeletedWorkloads[dw.IP]
 		if existingTombstone == nil || dw.Version > existingTombstone.Version {
@@ -44,6 +110,9 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 
 	// Process workloads - only add/update if not tombstoned with a newer version
 	for _, w := range syncResp.Workloads {
+		if !validIngestedWorkload(w) {
+			continue
+		}
 		// Check if there's a tombstone that supersedes this workload
 		tombstone := a.state.DeletedWorkloads[w.IP]
 		if tombstone != nil && tombstone.Version > w.Version {
@@ -67,6 +136,9 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 
 	// Process deleted env keys (tombstones) first
 	for _, dek := range syncResp.DeletedEnvKeys {
+		if dek == nil || !ValidateEnvKey(dek.Key) {
+			continue
+		}
 		existingTombstone := a.state.DeletedEnvKeys[dek.Key]
 		if existingTombstone == nil || dek.Version > existingTombstone.Version {
 			a.state.DeletedEnvKeys[dek.Key] = dek
@@ -80,6 +152,10 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 
 	// Merge env data from peer (only if not tombstoned)
 	for k, v := range syncResp.EnvData {
+		if !ValidateEnvKey(k) {
+			log.Printf("Sync: rejecting env key with invalid name %q", k)
+			continue
+		}
 		tombstone := a.state.DeletedEnvKeys[k]
 		if tombstone != nil {
 			continue
@@ -98,6 +174,9 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) {
 	// Process deleted workloads (tombstones) first
 	for _, dw := range syncResp.DeletedWorkloads {
+		if !validIngestedTombstone(dw) {
+			continue
+		}
 		existingTombstone := a.state.DeletedWorkloads[dw.IP]
 		if existingTombstone == nil || dw.Version > existingTombstone.Version {
 			a.state.DeletedWorkloads[dw.IP] = dw
@@ -111,6 +190,9 @@ func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) {
 
 	// Process workloads
 	for _, w := range syncResp.Workloads {
+		if !validIngestedWorkload(w) {
+			continue
+		}
 		tombstone := a.state.DeletedWorkloads[w.IP]
 		if tombstone != nil && tombstone.Version > w.Version {
 			continue
@@ -129,6 +211,9 @@ func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) {
 
 	// Process deleted env keys (tombstones) first
 	for _, dek := range syncResp.DeletedEnvKeys {
+		if dek == nil || !ValidateEnvKey(dek.Key) {
+			continue
+		}
 		existingTombstone := a.state.DeletedEnvKeys[dek.Key]
 		if existingTombstone == nil || dek.Version > existingTombstone.Version {
 			a.state.DeletedEnvKeys[dek.Key] = dek
@@ -141,6 +226,10 @@ func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) {
 
 	// Merge env data from peer (only if not tombstoned)
 	for k, v := range syncResp.EnvData {
+		if !ValidateEnvKey(k) {
+			log.Printf("Startup sync: rejecting env key with invalid name %q", k)
+			continue
+		}
 		tombstone := a.state.DeletedEnvKeys[k]
 		if tombstone != nil {
 			continue
@@ -169,25 +258,32 @@ func (a *Agent) syncStateOnStartup() {
 	// Try tunnel first (works even if WARP IPs have changed)
 	if a.tunnelDomain != "" {
 		url := a.getTunnelAPIURL("/api/sync")
-		resp, err := httpClient.Get(url)
+		req, err := a.peerRequest("GET", url, nil)
 		if err == nil {
-			func() {
-				defer resp.Body.Close()
-				var syncResp SyncResponse
-				if err := json.NewDecoder(resp.Body).Decode(&syncResp); err == nil {
-					a.stateMu.Lock()
-					a.mergeStartupSyncData(&syncResp)
-					a.stateMu.Unlock()
-					synced = true
-				}
-			}()
+			resp, err := httpClient.Do(req)
+			if err == nil {
+				func() {
+					defer resp.Body.Close()
+					var syncResp SyncResponse
+					if err := json.NewDecoder(resp.Body).Decode(&syncResp); err == nil {
+						a.stateMu.Lock()
+						a.mergeStartupSyncData(&syncResp)
+						a.stateMu.Unlock()
+						synced = true
+					}
+				}()
+			}
 		}
 	}
 
 	// Try direct peer connections
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/sync", peer.IP, a.apiPort)
-		resp, err := httpClient.Get(url)
+		req, err := a.peerRequest("GET", url, nil)
+		if err != nil {
+			continue
+		}
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			continue
 		}
@@ -235,7 +331,11 @@ func (a *Agent) syncWorkloads() {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/sync", peer.IP, a.apiPort)
-		resp, err := httpClient.Get(url)
+		req, err := a.peerRequest("GET", url, nil)
+		if err != nil {
+			continue
+		}
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			continue
 		}
@@ -275,7 +375,11 @@ func (a *Agent) syncWorkloads() {
 // In tunnel-only mode, we hit the tunnel and get workloads from whichever node responds.
 func (a *Agent) tunnelModeSyncWorkloads() {
 	url := a.getTunnelAPIURL("/api/sync")
-	resp, err := httpClient.Get(url)
+	req, err := a.peerRequest("GET", url, nil)
+	if err != nil {
+		return
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return
 	}
@@ -308,9 +412,10 @@ func (a *Agent) broadcastState() {
 	// In tunnel-only mode, just trigger a sync through the tunnel
 	if a.tunnelDomain != "" {
 		url := a.getTunnelAPIURL("/api/sync")
-		resp, err := httpClient.Get(url)
-		if err == nil {
-			resp.Body.Close()
+		if req, err := a.peerRequest("GET", url, nil); err == nil {
+			if resp, err := httpClient.Do(req); err == nil {
+				resp.Body.Close()
+			}
 		}
 		return
 	}
@@ -325,7 +430,11 @@ func (a *Agent) broadcastState() {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/sync", peer.IP, a.apiPort)
-		httpClient.Get(url) // Trigger sync
+		if req, err := a.peerRequest("GET", url, nil); err == nil {
+			if resp, err := httpClient.Do(req); err == nil {
+				resp.Body.Close()
+			}
+		}
 	}
 }
 

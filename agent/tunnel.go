@@ -2,7 +2,6 @@ package agent
 
 import (
 	cryptorand "crypto/rand"
-	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -157,10 +156,15 @@ func (a *Agent) getTunPeerConn(peerID, peerIP string) (*websocket.Conn, error) {
 		HandshakeTimeout: 10 * time.Second,
 	}
 
-	// Add cluster secret header if configured
+	// Authenticate with this node's SelfAPIKey - the receiver's
+	// apiKeyMiddleware/authorizeAPIKey will match it against the
+	// peer entry it has for us.
 	headers := http.Header{}
-	if a.clusterSecret != "" {
-		headers.Set("X-API-Key", a.clusterSecret)
+	a.stateMu.RLock()
+	selfKey := a.state.SelfAPIKey
+	a.stateMu.RUnlock()
+	if selfKey != "" {
+		headers.Set("X-API-Key", selfKey)
 	}
 
 	conn, _, err := dialer.Dial(url, headers)
@@ -257,8 +261,9 @@ var wsUpgrader = websocket.Upgrader{
 
 // apiTunnelWs handles incoming WebSocket connections for packet tunneling.
 // Peers connect here to send/receive encapsulated IP packets.
-// SECURITY: This endpoint is protected by apiKeyMiddleware (requires JETTY_SECRET).
-// Only authenticated cluster peers can establish tunnel connections.
+// SECURITY: This endpoint requires X-API-Key matching either AdminKey or any
+// registered peer's APIKey (or this node's SelfAPIKey for loopback). Only
+// authenticated cluster peers can establish tunnel connections.
 //
 // This uses a PROXY model: packets are forwarded to workloads via raw sockets,
 // and responses are captured and sent back through the same WebSocket connection.
@@ -266,13 +271,27 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 	// The tunnel endpoint accepts arbitrary IPv4 packets and proxies them to local
 	// services. With --net host that is anything reachable from the host, so this
 	// endpoint MUST require authentication regardless of cluster secret config.
-	if a.clusterSecret == "" {
-		log.Printf("WS tunnel: refusing connection from %s - JETTY_SECRET not configured", r.RemoteAddr)
-		http.Error(w, "tunnel disabled: cluster secret not configured", http.StatusUnauthorized)
+	a.stateMu.RLock()
+	hasAnyKey := a.state.AdminKey != "" || a.state.SelfAPIKey != ""
+	if !hasAnyKey {
+		for _, p := range a.state.Peers {
+			if p.APIKey != "" {
+				hasAnyKey = true
+				break
+			}
+		}
+	}
+	a.stateMu.RUnlock()
+	if !hasAnyKey {
+		log.Printf("WS tunnel: refusing connection from %s - cluster has no auth keys configured", r.RemoteAddr)
+		http.Error(w, "tunnel disabled: cluster has not bootstrapped auth", http.StatusUnauthorized)
 		return
 	}
 	apiKey := r.Header.Get("X-API-Key")
-	if subtle.ConstantTimeCompare([]byte(apiKey), []byte(a.clusterSecret)) != 1 {
+	if apiKey == "" {
+		apiKey = r.URL.Query().Get("api_key")
+	}
+	if !a.authorizeAPIKey(apiKey) {
 		log.Printf("WS tunnel: rejected unauthenticated connection from %s", r.RemoteAddr)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return

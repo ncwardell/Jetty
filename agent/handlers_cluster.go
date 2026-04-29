@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"runtime"
 	"strings"
@@ -241,19 +242,15 @@ func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 }
 func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Secret string `json:"secret"`
-		Peer   Peer   `json:"peer"`
+		Peer Peer `json:"peer"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
 
-	// Validate cluster secret
-	if a.clusterSecret != "" && req.Secret != a.clusterSecret {
-		http.Error(w, "invalid cluster secret", 401)
-		return
-	}
+	// Auth is enforced by apiKeyMiddleware; the caller's X-API-Key
+	// already matched AdminKey, SelfAPIKey, or a registered peer key.
 
 	// Don't add ourselves as a peer
 	if req.Peer.ID == a.hwid {
@@ -262,16 +259,46 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject malformed peer fields. Peer.Name and Peer.IP both flow into
+	// /etc/hosts; an unvalidated newline/tab would let a (compromised)
+	// peer inject arbitrary host -> IP mappings on every node.
+	if !validIngestedPeer(&req.Peer) {
+		http.Error(w, "invalid peer fields", 400)
+		return
+	}
+
 	req.Peer.Healthy = true
 	req.Peer.LastSeen = time.Now()
 
-	// Check if peer IP changed
+	// SECURITY: never let apiPeerAnnounce mutate APIKey. The APIKey is
+	// established once during /api/join (under a one-time token) and
+	// any later "announcement" carrying an APIKey would let any peer
+	// rewrite another peer's credential, or let a stale self-announce
+	// from announceOurIP wipe the stored value. Force-clear it from
+	// the request body and merge from the existing entry below.
+	req.Peer.APIKey = ""
+
+	// Refuse to repoint an existing peer's IP via this endpoint.
 	a.stateMu.Lock()
 	oldPeer := a.state.Peers[req.Peer.ID]
 	oldIP := ""
+	oldAPIKey := ""
 	if oldPeer != nil {
 		oldIP = oldPeer.IP
+		oldAPIKey = oldPeer.APIKey
 	}
+	if oldPeer != nil && oldIP != "" && req.Peer.IP != "" && oldIP != req.Peer.IP {
+		remoteHost, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if remoteHost != req.Peer.IP {
+			a.stateMu.Unlock()
+			log.Printf("Refusing peer-announce IP change for %s: %s -> %s (RemoteAddr=%s does not match new IP)",
+				req.Peer.ID, oldIP, req.Peer.IP, remoteHost)
+			http.Error(w, "peer IP change must come from the new IP", 403)
+			return
+		}
+	}
+	// Preserve the existing APIKey so the merge doesn't blank it out.
+	req.Peer.APIKey = oldAPIKey
 	ipChanged := oldIP != "" && oldIP != req.Peer.IP
 	a.state.Peers[req.Peer.ID] = &req.Peer
 	a.stateMu.Unlock()
@@ -304,20 +331,15 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 // This allows peers to track each other's health through the Cloudflare tunnel.
 func (a *Agent) apiHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID     string `json:"id"`
-		Name   string `json:"name"`
-		Secret string `json:"secret"`
+		ID   string `json:"id"`
+		Name string `json:"name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
 
-	// Validate cluster secret
-	if a.clusterSecret != "" && req.Secret != a.clusterSecret {
-		http.Error(w, "invalid cluster secret", 401)
-		return
-	}
+	// Auth is enforced by apiKeyMiddleware.
 
 	// Ignore our own heartbeat (can happen when tunnel routes back to us)
 	if req.ID == a.hwid {
@@ -338,13 +360,19 @@ func (a *Agent) apiHeartbeat(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "received_by": a.hostname})
 }
 // broadcastTunnelToken sends the CF token to all peers so they can start their tunnels.
+// Sends X-API-Key via peerRequest so the receiver's apiKeyMiddleware admits it.
 func (a *Agent) broadcastTunnelToken(token string) {
 	data, _ := json.Marshal(map[string]string{"token": token})
 
 	// In tunnel-only mode, broadcast to tunnel (one node receives, gossip propagates)
 	if a.tunnelDomain != "" {
 		url := a.getTunnelAPIURL("/api/tunnel/sync")
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		req, err := a.peerRequest("POST", url, strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to build tunnel-token broadcast: %v", err)
+			return
+		}
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			log.Printf("Failed to broadcast tunnel token: %v", err)
 		} else {
@@ -365,7 +393,12 @@ func (a *Agent) broadcastTunnelToken(token string) {
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/tunnel/sync", peer.IP, a.apiPort)
-		resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(data)))
+		req, err := a.peerRequest("POST", url, strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to build tunnel-token broadcast to %s: %v", peer.Name, err)
+			continue
+		}
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			log.Printf("Failed to broadcast tunnel token to %s: %v", peer.Name, err)
 			continue

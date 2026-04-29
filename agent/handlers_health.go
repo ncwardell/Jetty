@@ -32,6 +32,25 @@ import (
 // @Success 200 {object} HealthResponse
 // @Router /health [get]
 func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
+	// /api/health is in publicPaths so unauthenticated probes work for
+	// monitoring (load balancers, kuma, etc.). The rich payload below
+	// (peer list, workload IPs, public IPs, system metrics) shouldn't
+	// be exposed to anonymous callers - leak topology to anyone who
+	// can reach the API. Authenticate the caller first; if no valid
+	// key, return a minimal status only.
+	apiKey := r.Header.Get("X-API-Key")
+	if apiKey == "" {
+		apiKey = r.URL.Query().Get("api_key")
+	}
+	if !a.authorizeAPIKey(apiKey) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"version": Version,
+		})
+		return
+	}
+
 	nodeFilter := r.URL.Query().Get("node")
 
 	// Get list of peers

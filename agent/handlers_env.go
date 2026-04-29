@@ -80,17 +80,23 @@ func (a *Agent) apiSetEnv(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Encrypt and store values
-	a.stateMu.Lock()
-	added := make([]string, 0)
-	updated := make([]string, 0)
+	// Encrypt OUTSIDE the state lock - encryptValue takes stateMu
+	// itself (to ensureEncryptionKey, then to read it back), so doing
+	// the encryption inside our own Lock would deadlock.
+	encryptedMap := make(map[string]string, len(req.Env))
 	for key, value := range req.Env {
 		encrypted, err := a.encryptValue(value)
 		if err != nil {
-			a.stateMu.Unlock()
 			http.Error(w, fmt.Sprintf("encrypt %s: %v", key, err), 500)
 			return
 		}
+		encryptedMap[key] = encrypted
+	}
+
+	a.stateMu.Lock()
+	added := make([]string, 0)
+	updated := make([]string, 0)
+	for key, encrypted := range encryptedMap {
 		if _, exists := a.state.EnvData[key]; exists {
 			updated = append(updated, key)
 		} else {

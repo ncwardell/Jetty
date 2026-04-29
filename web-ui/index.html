@@ -1638,6 +1638,12 @@
                     </svg>
                     Secrets
                 </div>
+                <div class="sidebar-item" data-page="tokens" onclick="showPage('tokens')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
+                    </svg>
+                    Join Tokens
+                </div>
             </div>
         </aside>
 
@@ -2121,7 +2127,114 @@
                     </div>
                 </div>
             </div>
+
+            <!-- Join Tokens Page -->
+            <div class="page" id="page-tokens">
+                <div class="page-header">
+                    <h1 class="page-title">Join Tokens</h1>
+                    <div style="display: flex; gap: 12px;">
+                        <button class="btn" onclick="refreshTokens()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="23 4 23 10 17 10"/>
+                                <polyline points="1 20 1 14 7 14"/>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                            </svg>
+                            Refresh
+                        </button>
+                        <button class="btn btn-primary" onclick="openCreateTokenModal()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="12" y1="5" x2="12" y2="19"/>
+                                <line x1="5" y1="12" x2="19" y2="12"/>
+                            </svg>
+                            Generate Token
+                        </button>
+                    </div>
+                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 24px;">
+                    One-time tokens for adding new nodes. Generate one, paste it into the new node's <code>JETTY_JOIN_TOKEN</code> env var, and it'll be consumed exactly once on join. Expired and used tokens are auto-cleaned.
+                </p>
+
+                <div class="card">
+                    <div class="table-container">
+                        <table class="data-table" id="tokensTable">
+                            <thead>
+                                <tr>
+                                    <th>Token</th>
+                                    <th>Note</th>
+                                    <th>Created</th>
+                                    <th>Expires</th>
+                                    <th>Status</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tokensTableBody">
+                                <tr>
+                                    <td colspan="6" class="empty-state" style="padding: 40px;">
+                                        <p>No tokens. Generate one to add a new node.</p>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
         </main>
+    </div>
+
+    <!-- Generate Token Modal -->
+    <div class="modal-overlay hidden" id="createTokenModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title">Generate Join Token</h2>
+                <button class="modal-close" onclick="closeCreateTokenModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">Note (optional)</label>
+                    <input type="text" class="form-input" id="createTokenNote" placeholder="for arnold's laptop">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">TTL</label>
+                    <select class="form-input" id="createTokenTTL">
+                        <option value="900">15 minutes</option>
+                        <option value="3600" selected>1 hour</option>
+                        <option value="86400">1 day</option>
+                        <option value="604800">7 days</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeCreateTokenModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="submitCreateToken()">Generate</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Token Result Modal: shows token ONCE after generation -->
+    <div class="modal-overlay hidden" id="tokenResultModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title">Join Token Generated</h2>
+                <button class="modal-close" onclick="closeTokenResultModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="color: var(--text-secondary); margin-bottom: 12px;">
+                    Copy this token now &mdash; it will not be shown again. Use it as <code>JETTY_JOIN_TOKEN</code> on the joining node.
+                </p>
+                <div style="background: var(--bg-primary); padding: 12px; border-radius: 6px; font-family: monospace; word-break: break-all; user-select: all;" id="tokenResultValue"></div>
+                <p style="color: var(--text-secondary); margin-top: 16px; font-size: 12px;">
+                    Expires <span id="tokenResultExpires"></span>
+                </p>
+                <div class="form-group" style="margin-top: 16px;">
+                    <label class="form-label">Example docker run</label>
+                    <pre style="background: var(--bg-primary); padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; color: var(--text-primary);" id="tokenResultDockerRun"></pre>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" onclick="copyTokenToClipboard()">Copy Token</button>
+                <button class="btn" onclick="closeTokenResultModal()">Close</button>
+            </div>
+        </div>
     </div>
 
     <!-- Connect Modal -->
@@ -3764,6 +3877,9 @@
             if (pageName === 'containers' && state.connected) {
                 refreshContainers();
             }
+            if (pageName === 'tokens' && state.connected) {
+                refreshTokens();
+            }
         }
 
         // ---- Web terminal -------------------------------------------------
@@ -5045,6 +5161,125 @@
                 await refreshSecrets();
             } catch (error) {
                 showToast(`Failed to delete secret: ${error.message}`, 'error');
+            }
+        }
+
+        // ---- Join tokens -----------------------------------------------------
+        // POST /api/tokens   - mint a one-time token
+        // GET  /api/tokens   - list pending and recent tokens (token IDs are
+        //                       redacted unless the token has been used; the
+        //                       full value is only shown ONCE in the result
+        //                       modal at generation time)
+        // DELETE /api/tokens/{id} - revoke
+
+        let lastGeneratedToken = null;
+
+        async function refreshTokens() {
+            try {
+                const data = await apiCall('/tokens');
+                renderTokens(data.tokens || []);
+            } catch (error) {
+                showToast(`Failed to load tokens: ${error.message}`, 'error');
+            }
+        }
+
+        function renderTokens(tokens) {
+            const tbody = document.getElementById('tokensTableBody');
+            if (!tokens || tokens.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="6" class="empty-state" style="padding: 40px;"><p>No tokens. Generate one to add a new node.</p></td></tr>`;
+                return;
+            }
+            const now = Date.now();
+            tbody.innerHTML = tokens.map(t => {
+                const expiresAt = new Date(t.expires_at);
+                const expired = !t.used && expiresAt.getTime() < now;
+                let status, statusColor;
+                if (t.used) { status = `Used by ${escapeHtml(shortId(t.used_by))}`; statusColor = 'var(--text-secondary)'; }
+                else if (expired) { status = 'Expired'; statusColor = 'var(--accent-red, #e84c4c)'; }
+                else { status = 'Pending'; statusColor = 'var(--accent-green, #22c55e)'; }
+                return `
+                    <tr>
+                        <td><code>${escapeHtml(t.id)}</code></td>
+                        <td>${escapeHtml(t.note || '')}</td>
+                        <td>${formatRelative(t.created_at)}</td>
+                        <td>${formatRelative(t.expires_at)}</td>
+                        <td><span style="color: ${statusColor};">${status}</span></td>
+                        <td><button class="btn btn-icon" onclick="revokeToken('${encodeURIComponent(t.id)}')" title="Revoke">&times;</button></td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function shortId(s) {
+            if (!s) return '';
+            return s.length > 12 ? s.slice(0, 12) + '...' : s;
+        }
+
+        function formatRelative(iso) {
+            if (!iso) return '';
+            try {
+                const d = new Date(iso);
+                return d.toLocaleString();
+            } catch (_e) {
+                return iso;
+            }
+        }
+
+        function escapeHtml(s) {
+            return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+
+        function openCreateTokenModal() {
+            document.getElementById('createTokenNote').value = '';
+            document.getElementById('createTokenTTL').value = '3600';
+            document.getElementById('createTokenModal').classList.remove('hidden');
+        }
+
+        function closeCreateTokenModal() {
+            document.getElementById('createTokenModal').classList.add('hidden');
+        }
+
+        async function submitCreateToken() {
+            const note = document.getElementById('createTokenNote').value.trim();
+            const ttl = parseInt(document.getElementById('createTokenTTL').value, 10) || 3600;
+            try {
+                const result = await apiCall('/tokens', 'POST', { ttl_seconds: ttl, note });
+                closeCreateTokenModal();
+                lastGeneratedToken = result.token;
+                document.getElementById('tokenResultValue').textContent = result.token;
+                document.getElementById('tokenResultExpires').textContent = formatRelative(result.expires_at);
+                const joinURL = state.connection && state.connection.url ? state.connection.url : 'https://your-cluster';
+                document.getElementById('tokenResultDockerRun').textContent =
+                    `docker run -d \\\n  --name jetty --privileged --net host \\\n  -v /var/run/docker.sock:/var/run/docker.sock \\\n  -v /lib/modules:/lib/modules:ro \\\n  -v jetty-data:/data \\\n  -e JETTY_JOIN='${joinURL}' \\\n  -e JETTY_JOIN_TOKEN='${result.token}' \\\n  ghcr.io/ncwardell/jetty:latest`;
+                document.getElementById('tokenResultModal').classList.remove('hidden');
+                refreshTokens();
+            } catch (error) {
+                showToast(`Failed to generate token: ${error.message}`, 'error');
+            }
+        }
+
+        function closeTokenResultModal() {
+            lastGeneratedToken = null;
+            document.getElementById('tokenResultModal').classList.add('hidden');
+        }
+
+        function copyTokenToClipboard() {
+            if (!lastGeneratedToken) return;
+            navigator.clipboard.writeText(lastGeneratedToken).then(
+                () => showToast('Token copied to clipboard', 'success'),
+                () => showToast('Could not copy - select the token manually', 'error')
+            );
+        }
+
+        async function revokeToken(idEncoded) {
+            const id = decodeURIComponent(idEncoded);
+            if (!confirm(`Revoke token ${shortId(id)}?`)) return;
+            try {
+                await apiCall(`/tokens/${idEncoded}`, 'DELETE');
+                showToast('Token revoked', 'success');
+                refreshTokens();
+            } catch (error) {
+                showToast(`Failed to revoke: ${error.message}`, 'error');
             }
         }
 

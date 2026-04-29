@@ -28,6 +28,26 @@ import (
 //
 // See docs/networking.md for the bigger picture.
 
+// hostsField sanitizes a value before it lands in /etc/hosts. The
+// upstream ingest paths (sync.go::validIngestedWorkload,
+// validIngestedPeer, memberlist::validIngestedNodeMeta) already reject
+// control characters, but this is the last line of defense: a single
+// stray newline here would let an attacker inject arbitrary host->IP
+// mappings on every node and every container (--net host).
+func hostsField(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		// Drop anything that could break out of the line: whitespace
+		// other than nothing, comment chars, NULs.
+		if c == '\n' || c == '\r' || c == '\t' || c == ' ' || c == '#' || c == 0 {
+			continue
+		}
+		out = append(out, c)
+	}
+	return string(out)
+}
+
 // updateHosts rewrites the JETTY-managed block of /etc/hosts.
 //
 // The block is delimited by "# JETTY START" and "# JETTY END" comments;
@@ -83,7 +103,7 @@ func (a *Agent) updateHosts() {
 	}
 
 	// Add self
-	jettyLines = append(jettyLines, fmt.Sprintf("%s\t%s\t# this node", a.ip, a.hostname))
+	jettyLines = append(jettyLines, fmt.Sprintf("%s\t%s\t# this node", hostsField(a.ip), hostsField(a.hostname)))
 
 	// Add peers
 	for _, p := range a.state.Peers {
@@ -91,7 +111,7 @@ func (a *Agent) updateHosts() {
 		if !p.Healthy {
 			status = "unhealthy"
 		}
-		jettyLines = append(jettyLines, fmt.Sprintf("%s\t%s\t# peer (%s)", p.IP, p.Name, status))
+		jettyLines = append(jettyLines, fmt.Sprintf("%s\t%s\t# peer (%s)", hostsField(p.IP), hostsField(p.Name), status))
 	}
 
 	// Add workloads
@@ -101,7 +121,7 @@ func (a *Agent) updateHosts() {
 			if w.Owner != a.hwid {
 				location = "remote"
 			}
-			jettyLines = append(jettyLines, fmt.Sprintf("%s\t%s\t# workload (%s)", w.IP, w.Name, location))
+			jettyLines = append(jettyLines, fmt.Sprintf("%s\t%s\t# workload (%s)", hostsField(w.IP), hostsField(w.Name), location))
 		}
 	}
 

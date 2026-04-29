@@ -152,6 +152,17 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 // @Failure 500 {object} ErrorResponse "Update failed"
 // @Router /nodes/{id}/update [post]
 func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
+	// Self-update pulls and runs an arbitrary docker image with the
+	// agent's binds, capabilities, and --privileged. That's full root
+	// RCE on every node in the cluster. Restrict to AdminKey - peer
+	// keys must never be enough to do this. apiKeyMiddleware admits
+	// peer keys for everything else, so the explicit gate here is what
+	// prevents a compromised peer from owning the cluster.
+	if !a.adminAuthorize(r) {
+		http.Error(w, "unauthorized: admin key required for node update", http.StatusUnauthorized)
+		return
+	}
+
 	vars := mux.Vars(r)
 	nodeID := vars["id"]
 
@@ -189,13 +200,15 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Proxy request to target node
+		// Proxy request to target node. peerRequest sets X-API-Key
+		// from this node's SelfAPIKey so the receiver authenticates us
+		// as a known peer.
 		proxyURL := fmt.Sprintf("http://%s:%d/api/nodes/self/update", targetPeer.IP, a.apiPort)
 		reqBody, _ := json.Marshal(req)
-		proxyReq, _ := http.NewRequest("POST", proxyURL, strings.NewReader(string(reqBody)))
-		proxyReq.Header.Set("Content-Type", "application/json")
-		if a.clusterSecret != "" {
-			proxyReq.Header.Set("X-API-Key", a.clusterSecret)
+		proxyReq, err := a.peerRequest("POST", proxyURL, strings.NewReader(string(reqBody)))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("build proxy request: %v", err), 500)
+			return
 		}
 
 		resp, err := peerClient.Do(proxyReq)
@@ -301,10 +314,19 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		args = append(args, "--cap-add", cap)
 	}
 
-	// Pass the cluster secret key to the new container
-	// Other secrets (WARP token, etc.) are persisted in /data and read by entrypoint
-	if a.clusterSecret != "" {
-		args = append(args, "-e", "JETTY_SECRET="+a.clusterSecret)
+	// Pass the cluster admin key to the new container so JETTY_SECRET
+	// is non-empty after restart. Use the persisted state value (not
+	// a.clusterSecret env), because joiners receive AdminKey via
+	// /api/join and don't have JETTY_SECRET in their env. State is
+	// also mounted via the data volume, so on a normal upgrade the
+	// new container would read AdminKey from state.json anyway - this
+	// just keeps the env consistent with what the operator originally
+	// set, useful if state is ever wiped/restored separately.
+	a.stateMu.RLock()
+	adminKey := a.state.AdminKey
+	a.stateMu.RUnlock()
+	if adminKey != "" {
+		args = append(args, "-e", "JETTY_SECRET="+adminKey)
 	}
 
 	// Add restart policy
