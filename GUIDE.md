@@ -730,6 +730,44 @@ services:
 
 ---
 
+## Web Terminals
+
+Two WebSocket endpoints provide interactive shells from the dashboard. Both are admin-only and use a small framing protocol over the WebSocket: each frame is a single byte tag (`0x00` = data, `0x01` = resize) followed by a payload. The renderer is xterm.js loaded from a CDN.
+
+### Workload container shell
+
+`WS /api/workloads/{name}/exec`
+
+Runs `docker exec -it` into the first container belonging to the named workload (filtered by `label=com.docker.compose.project=jetty_<name>`). Lets you inspect logs, run migrations, debug crashes, etc. Always available — no env-var opt-in needed.
+
+```javascript
+// dashboard pseudocode
+const ws = new WebSocket(`wss://cluster.example.com/api/workloads/whoami/exec?api_key=${adminKey}`);
+ws.onmessage = (e) => terminal.write(decodeFrame(e.data));
+```
+
+### Host shell
+
+`WS /api/host/shell` — gated by `JETTY_HOST_SHELL=true` on the node.
+
+Spawns an interactive shell *on the host* (the agent runs `--privileged --net host` as root, so this is effectively root on the machine). Useful for emergency debugging without SSH; **dangerous** because anyone who recovers the AdminKey through any path (dashboard left open on a coworker's laptop, admin key pasted into a shell history file, etc.) can use it.
+
+The Generate-Token modal has a checkbox that injects `JETTY_HOST_SHELL=true` into the joining node's `docker run`. Leave it off unless you specifically want host-shell access on that node — it can be enabled later by restarting the container with the env var set.
+
+When the endpoint is reached but `JETTY_HOST_SHELL` is unset:
+```
+HTTP/1.1 403 Forbidden
+host shell disabled - set JETTY_HOST_SHELL=true on the agent to enable
+```
+
+### Auth on the WebSocket upgrade
+
+Both endpoints check `X-API-Key` (header) or `?api_key=` (query) against `state.AdminKey` with a constant-time compare *before* the WebSocket upgrade. Peer keys are explicitly rejected — a compromised peer cannot open shells on other nodes.
+
+The shell is whitelisted to a small set (`/bin/bash`, `/bin/sh`, `/bin/ash`); arbitrary `?shell=` query parameters are validated against that list. Workload exec passes the container ID via argv (no shell expansion).
+
+---
+
 ## Security
 
 ### Authentication model
