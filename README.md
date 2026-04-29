@@ -157,6 +157,8 @@ This ensures WARP only routes traffic for the mesh network (`100.96.x.x` IPs) an
 
 ### Bootstrap First Node
 
+`JETTY_SECRET` is the **admin / dashboard key** — set it on the first node, it gets baked into the cluster. Joining nodes don't need it.
+
 ```bash
 docker run -d \
   --name jetty \
@@ -165,11 +167,28 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /lib/modules:/lib/modules:ro \
   -v jetty-data:/data \
-  -e JETTY_SECRET=your-super-secret-password \
+  -e JETTY_SECRET=your-super-secret-admin-key \
   -e JETTY_WARP_CONNECTOR_TOKEN=your-warp-connector-token \
   -e JETTY_CF_TOKEN=your-cloudflare-tunnel-token \
   ghcr.io/ncwardell/jetty:latest
 ```
+
+### Generate a Join Token
+
+Every additional node joins with a **single-use token** minted by an authenticated admin. Tokens are time-bounded and burned on first use.
+
+```bash
+# Mint a token (default TTL: 1 hour, max: 7 days)
+curl -X POST https://your-cluster.example.com/api/tokens \
+  -H "X-API-Key: your-super-secret-admin-key" \
+  -H "Content-Type: application/json" \
+  -d '{"ttl_seconds": 3600, "note": "for arnold's laptop"}'
+
+# Response:
+# { "token": "8h2y...64-bytes...kf9", "expires_at": "...", "note": "for arnold's laptop" }
+```
+
+You can also do this from the dashboard: **Join Tokens → Generate Token**. The full token is shown once and only once — copy it immediately.
 
 ### Join More Nodes
 
@@ -181,12 +200,12 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /lib/modules:/lib/modules:ro \
   -v jetty-data:/data \
-  -e JETTY_SECRET=your-super-secret-password \
   -e JETTY_JOIN=https://your-tunnel-domain.com \
+  -e JETTY_JOIN_TOKEN=8h2y...the-token-from-above...kf9 \
   ghcr.io/ncwardell/jetty:latest
 ```
 
-> **That's it.** Joining nodes get the WARP token and tunnel config automatically from the cluster. No manual token copying.
+> **That's it.** Joining nodes get the WARP token, tunnel config, admin key, and per-node API key automatically. No manual token copying after the join. The join token is consumed and can never be reused.
 
 ### Verify
 
@@ -280,30 +299,49 @@ GET    /api/workloads/{name}/logs        # Container logs
 
 ### Cluster & Nodes
 ```bash
-POST   /api/join             # Join cluster
-GET    /api/nodes            # List nodes
-DELETE /api/nodes/{id}       # Remove node
-POST   /api/nodes/{id}/update # Update node (pull new image, restart)
+POST   /api/join              # Join cluster (requires {join_token, id, name, ip, api_key})
+GET    /api/nodes             # List nodes
+DELETE /api/nodes/{id}        # Remove node
+POST   /api/nodes/{id}/update # Update node (pull new image, restart)  [admin only]
+```
+
+### Join Tokens (admin only)
+```bash
+POST   /api/tokens            # Mint a one-time join token  {ttl_seconds?, note?}
+GET    /api/tokens            # List pending + recent tokens
+DELETE /api/tokens/{id}       # Revoke a token
 ```
 
 ### Environment Variables
 ```bash
-GET    /api/env              # List all env variable keys
-POST   /api/env              # Set env variables (batch)
-GET    /api/env/{key}        # Get decrypted value
-DELETE /api/env/{key}        # Delete env variable
+GET    /api/env               # List all env variable keys
+POST   /api/env               # Set env variables (batch)
+GET    /api/env/{key}         # Get decrypted value
+DELETE /api/env/{key}         # Delete env variable
 ```
 
 ### Cloudflare Tunnel
 ```bash
-GET    /api/tunnel           # Get tunnel status
-POST   /api/tunnel           # Configure tunnel with token
-DELETE /api/tunnel           # Remove tunnel
+GET    /api/tunnel            # Get tunnel status
+POST   /api/tunnel            # Configure tunnel with token
+DELETE /api/tunnel            # Remove tunnel
+```
+
+### Backup / Restore (admin only)
+```bash
+GET    /api/backup            # tar.gz of state.json + compose dir + warp dir
+POST   /api/restore           # Atomically replace state from a backup tar.gz
+```
+
+### Web Terminals (admin only)
+```bash
+WS  /api/workloads/{name}/exec  # Interactive shell in a workload container
+WS  /api/host/shell             # Host shell (gated by JETTY_HOST_SHELL=true)
 ```
 
 ### Proxy
 ```bash
-ANY    /api/proxy/{ip}/{path}  # Proxy request to workload by mesh IP
+ANY    /api/proxy/{ip}/{path} # Proxy request to workload by mesh IP
 ```
 
 ---
@@ -417,10 +455,12 @@ volumes:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `JETTY_SECRET` | Cluster password. Required. | - |
-| `JETTY_WARP_CONNECTOR_TOKEN` | WARP connector token. Bootstrap node only. | - |
-| `JETTY_CF_TOKEN` | Cloudflare Tunnel token. Bootstrap node only. | - |
-| `JETTY_JOIN` | URL to join existing cluster. | - |
+| `JETTY_SECRET` | **Admin / dashboard key.** Required on the first (bootstrap) node — gets persisted to state and propagated to joiners. Optional on joiners (they receive it via `/api/join`). | - |
+| `JETTY_JOIN` | URL to join an existing cluster. | - |
+| `JETTY_JOIN_TOKEN` | **Required when joining.** Single-use token minted by `POST /api/tokens` on an existing node. Burned on first successful join. | - |
+| `JETTY_WARP_CONNECTOR_TOKEN` | WARP connector token. Bootstrap node only — joiners get it from the join response. | - |
+| `JETTY_CF_TOKEN` | Cloudflare Tunnel token. Bootstrap node only — joiners get it from the join response. | - |
+| `JETTY_HOST_SHELL` | Set to `true` to enable the `/api/host/shell` web terminal endpoint (admin-only, dangerous). | `false` |
 | `JETTY_DATA_DIR` | Where state lives. | `/data` |
 | `JETTY_API_PORT` | API port. | `6880` |
 | `JETTY_SERVICE_CIDR` | Mesh network CIDR for workload IPs. | `10.100.0.0/16` |
@@ -444,23 +484,39 @@ volumes:
 State syncs via gossip. Every node has a copy. Higher `version` wins conflicts.
 
 The `state.json` file contains:
-- **Peers**: List of all known nodes in the cluster
+- **Peers**: All known nodes (id, name, mesh IP, per-peer APIKey)
 - **Workloads**: All workload configurations and ownership
-- **EnvData**: Encrypted environment variables (AES-256-GCM)
+- **EnvData**: Encrypted environment variables (AES-256-GCM under `EncryptionKey`)
+- **AdminKey**: Operator/dashboard credential, bootstrapped from `JETTY_SECRET`
+- **EncryptionKey**: 32-byte AES key for env_data
+- **SelfAPIKey**: This node's outbound peer credential
+- **JoinTokens**: Pending and recently-burned one-time join tokens
+
+> Permission is `0600`. Treat it like a private key — the file contains every credential the cluster uses.
 
 ---
 
-## 🔐 Encrypted Environment Variables
+## 🔐 Security Model
 
-Store sensitive configuration (API keys, passwords, connection strings) encrypted at rest and sync them across your cluster.
+Jetty separates **three** different credentials so a compromise of one doesn't blow up the cluster:
 
-### Setting Variables
+| Credential | Where it lives | Purpose | Rotation |
+|---|---|---|---|
+| **AdminKey** | `state.AdminKey` (every node, persisted) | Dashboard / operator API. Required for destructive actions (node update, backup, restore, terminals, token mint). | Bootstrapped from `JETTY_SECRET` on the first node, propagated to joiners. |
+| **JoinToken** | `state.JoinTokens` | Single-use bootstrap credential for adding a new node. Time-bounded, burned on first use. | Mint per join via `POST /api/tokens`. |
+| **Peer.APIKey** | each peer's record on every node | Per-node credential for inter-peer calls (sync, peer-announce, heartbeat). Each node has its own `SelfAPIKey`. | Generated locally by each node at first bootstrap. |
+
+The HTTP API enforces this with `apiKeyMiddleware`: requests must present an `X-API-Key` header (or `?api_key=` query) matching the AdminKey, this node's SelfAPIKey, or any registered peer's APIKey. All comparisons are constant-time. Admin-only endpoints (anything destructive) layer an additional admin-only check on top.
+
+### Encrypted environment variables
+
+Sensitive config (API keys, passwords, connection strings) are encrypted at rest with **AES-256-GCM** under a 32-byte cluster `EncryptionKey` (separate from any user credential — generated on bootstrap, propagated to joiners via the join response). Ciphertext lives in `state.json` and gossips across the cluster.
 
 ```bash
-# Set multiple variables at once
+# Set multiple variables at once (admin or peer key works)
 curl -X POST http://localhost:6880/api/env \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-secret" \
+  -H "X-API-Key: your-admin-key" \
   -d '{
     "env": {
       "DATABASE_URL": "postgres://user:pass@postgres:5432/db",
@@ -468,43 +524,20 @@ curl -X POST http://localhost:6880/api/env \
       "API_KEY": "sk-12345"
     }
   }'
+
+# Use them in a compose file
+# environment:
+#   - DATABASE_URL=${DATABASE_URL}
 ```
-
-### Using Variables in Workloads
-
-Environment variables are automatically injected when deploying workloads:
-
-```yaml
-# docker-compose.yml
-services:
-  app:
-    image: myapp:latest
-    environment:
-      - DATABASE_URL=${DATABASE_URL}
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
-```
-
-### How It Works
-
-1. Variables are encrypted with **AES-256-GCM** using a key derived from `JETTY_SECRET`
-2. Encrypted values are stored in `state.json` and synced to all nodes
-3. When a workload deploys, variables are decrypted and injected as environment variables
-4. Values are never logged or exposed in plain text (except via explicit `GET /api/env/{key}`)
-
-### Managing Variables
 
 ```bash
-# List all variable keys (values not shown)
-curl http://localhost:6880/api/env -H "X-API-Key: your-secret"
-
-# Get a specific variable's decrypted value
-curl http://localhost:6880/api/env/DATABASE_URL -H "X-API-Key: your-secret"
-
-# Delete a variable
-curl -X DELETE http://localhost:6880/api/env/OLD_KEY -H "X-API-Key: your-secret"
+# List, fetch, delete:
+curl http://localhost:6880/api/env -H "X-API-Key: your-admin-key"
+curl http://localhost:6880/api/env/DATABASE_URL -H "X-API-Key: your-admin-key"
+curl -X DELETE http://localhost:6880/api/env/OLD_KEY -H "X-API-Key: your-admin-key"
 ```
 
-> **Security Note:** All nodes in the cluster must use the same `JETTY_SECRET` to decrypt values. Changing the secret will make existing encrypted values unreadable.
+> **Migration note:** Older clusters derived the AES key from `JETTY_SECRET` via Argon2id. On first start under the new code, env_data is read with the legacy key and rewritten under a freshly generated `EncryptionKey` — one-shot, idempotent. After that, `JETTY_SECRET` only matters as the AdminKey.
 
 ---
 

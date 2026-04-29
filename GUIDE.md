@@ -135,15 +135,17 @@ sudo JETTY_SECRET=my-cluster-password ./jetty
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JETTY_SECRET` | (none) | **Required.** Shared password all nodes must have. |
-| `JETTY_CF_TOKEN` | (none) | Cloudflare tunnel token. |
+| `JETTY_SECRET` | (none) | **Admin / dashboard key.** Required on the bootstrap node — gets persisted as `state.AdminKey` and propagated to joiners. Optional on joiners (they receive it via `/api/join`). |
+| `JETTY_JOIN` | (none) | URL of an existing cluster node (e.g., `https://cluster.example.com`). |
+| `JETTY_JOIN_TOKEN` | (none) | **Required when joining.** Single-use token minted by `POST /api/tokens` on an existing node. Burned on first successful join. |
+| `JETTY_CF_TOKEN` | (none) | Cloudflare tunnel token. Bootstrap-only — joiners receive it. |
 | `JETTY_TUNNEL_DOMAIN` | (none) | Your Cloudflare tunnel domain (e.g., `cluster.example.com`). |
-| `JETTY_WARP_CONNECTOR_TOKEN` | (none) | WARP Connector token for Zero Trust networking. |
+| `JETTY_WARP_CONNECTOR_TOKEN` | (none) | WARP Connector token for Zero Trust networking. Bootstrap-only — joiners receive it. |
+| `JETTY_HOST_SHELL` | `false` | Set to `true` to enable `/api/host/shell`. Admin-only endpoint that gives an interactive root shell on the host. |
 | `JETTY_PUBLIC_IP` | (auto) | Override public IP detection (useful in containers). |
 | `JETTY_DATA_DIR` | `/data` | Directory for state and compose files. |
 | `JETTY_API_PORT` | `6880` | REST API port. |
 | `JETTY_SERVICE_CIDR` | `10.100.0.0/16` | Mesh network CIDR for workload IPs. |
-| `JETTY_JOIN` | (none) | URL of existing node to join (e.g., `http://node1:6880`). |
 
 ---
 
@@ -152,18 +154,35 @@ sudo JETTY_SECRET=my-cluster-password ./jetty
 ### Bootstrap a New Cluster
 
 ```bash
-# Start first node
+# Start first node. JETTY_SECRET seeds the cluster admin key.
 JETTY_SECRET=mypassword JETTY_CF_TOKEN=eyJ... ./jetty
 ```
+
+The first node generates its own `SelfAPIKey` and the cluster `EncryptionKey`. `JETTY_SECRET` is copied into `state.AdminKey` once and persisted; subsequent restarts ignore the env var (the persisted state wins).
 
 ### Join an Existing Cluster
 
 ```bash
-# On new node - just needs the secret and join URL
-JETTY_SECRET=mypassword \
-JETTY_JOIN=http://first-node:6880 \
+# 1. On any existing node, mint a one-time join token.
+curl -X POST https://cluster.example.com/api/tokens \
+  -H "X-API-Key: mypassword" \
+  -H "Content-Type: application/json" \
+  -d '{"ttl_seconds": 3600, "note": "node3"}'
+# {"token":"8h2y...","expires_at":"...","note":"node3"}
+
+# 2. Bring up the new node with that token.
+JETTY_JOIN=https://cluster.example.com \
+JETTY_JOIN_TOKEN=8h2y...the-token... \
 ./jetty
 ```
+
+The joiner generates its own `SelfAPIKey`, sends it in the join request, and receives:
+- The cluster `AdminKey` (so its dashboard works without `JETTY_SECRET` set)
+- The cluster `EncryptionKey` (so it can decrypt env_data)
+- The full peer list with each peer's `APIKey` (so it can call any peer)
+- WARP and tunnel tokens (so it can bring up Cloudflare connectivity)
+
+The token is burned on first successful join. Replays return 401.
 
 ### Check Cluster Status
 
@@ -446,14 +465,33 @@ curl http://localhost:6880/api/status | jq '.warp'
 
 ## API Reference
 
+Every endpoint requires `X-API-Key` (or `?api_key=`) matching one of: AdminKey, this node's SelfAPIKey, or any registered peer's APIKey. The exceptions are listed under "Public" below. Endpoints marked **admin-only** require the AdminKey specifically.
+
+### Public
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `GET /api/health` | GET | Health probe. Returns rich payload to authenticated callers, minimal `{status, version}` otherwise. |
+| `POST /api/join` | POST | Join cluster (validates `JoinToken` in body). |
+| `GET /swagger/...` | GET | API docs UI. |
+
 ### Cluster
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `GET /api/status` | GET | Full cluster status |
-| `GET /api/health` | GET | Health check (cluster-wide or ?node=local for single) |
-| `POST /api/join` | POST | Join cluster with secret |
-| `GET /api/sync` | GET | Get local workloads (for gossip) |
+| `GET /api/status` | GET | Full cluster status (peers, workloads, tunnel) |
+| `GET /api/sync` | GET | Full state dump for peer pull |
+| `POST /api/peer-announce` | POST | Peer announcement |
+| `POST /api/heartbeat` | POST | Tunnel-mode liveness ping |
+| `POST /api/tunnel/sync` | POST | Cloudflare tunnel token broadcast |
+
+### Join Tokens (admin-only)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `POST /api/tokens` | POST | Mint a one-time join token. Body: `{"ttl_seconds": 3600, "note": "..."}` (both optional). |
+| `GET /api/tokens` | GET | List pending and recently-burned tokens. Pending token IDs are redacted. |
+| `DELETE /api/tokens/{id}` | DELETE | Revoke a token (works on burned tokens too — expunges the audit record). |
 
 ### Workloads
 
@@ -467,7 +505,25 @@ curl http://localhost:6880/api/status | jq '.warp'
 | `POST /api/workloads/{name}/move` | POST | Move to another node |
 | `POST /api/workloads/{name}/start` | POST | Start workload |
 | `POST /api/workloads/{name}/stop` | POST | Stop workload |
+| `POST /api/workloads/{name}/restart` | POST | Restart workload |
 | `GET /api/workloads/{name}/logs` | GET | Get container logs |
+
+### Nodes
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `GET /api/nodes` | GET | List nodes |
+| `DELETE /api/nodes/{id}` | DELETE | Remove node from cluster |
+| `POST /api/nodes/{id}/update` | POST | **Admin-only.** Pull a new image and restart the agent on the target node. |
+
+### Environment Variables
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `GET /api/env` | GET | List env keys (values not shown) |
+| `POST /api/env` | POST | Set/update env vars (batch) |
+| `GET /api/env/{key}` | GET | Get decrypted value |
+| `DELETE /api/env/{key}` | DELETE | Delete env var |
 
 ### Tunnel
 
@@ -477,18 +533,32 @@ curl http://localhost:6880/api/status | jq '.warp'
 | `POST /api/tunnel` | POST | Set tunnel token |
 | `DELETE /api/tunnel` | DELETE | Remove tunnel |
 
+### Backup / Restore (admin-only)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `GET /api/backup` | GET | Download a tar.gz of `state.json` + compose dir + warp dir. |
+| `POST /api/restore` | POST | Atomically replace state from a backup tar.gz. Path-traversal protected. |
+
+### Web Terminals (admin-only)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `WS /api/workloads/{name}/exec` | WS | Interactive shell into a workload container via `docker exec`. |
+| `WS /api/host/shell` | WS | Interactive shell on the host. Gated by `JETTY_HOST_SHELL=true`. |
+
+### Host Introspection
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `GET /api/host/containers` | GET | All Docker containers on this node (managed and external). |
+| `GET /api/host/compose` | GET | Compose projects detected on the host. |
+
 ### Proxy
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/proxy/{ip}/{path}` | ANY | Proxy request to workload by mesh IP |
-
-### Internal (Peer-to-Peer)
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `POST /api/peer-announce` | POST | Announce new peer |
-| `POST /api/tunnel/sync` | POST | Sync tunnel token |
+| `/api/proxy/{ip}/{path}` | ANY | Proxy request to workload by mesh IP. Auth headers are stripped before forwarding to a local workload. |
 
 ---
 
@@ -523,26 +593,40 @@ main.go
 ### Join Flow
 
 ```
-New Node                                    Existing Node
-   │                                             │
-   │  POST /api/join                             │
-   │  {secret, id, name, ip, warp_ip}            │
-   ├────────────────────────────────────────────►│
-   │                                             │
-   │                            1. Validate secret
-   │                            2. Check mesh IP collision
-   │                            3. Add peer to state
-   │                                             │
-   │  {peers, workloads, cf_token, mesh_cidr}    │
-   │◄────────────────────────────────────────────┤
-   │                                             │
-   │                            4. Announce peer to others
-   │                                             │
- 5. Store state                                  │
- 6. Start cloudflared/WARP                       │
-   │                                             │
-   ▼                                             ▼
- JOINED                                    CLUSTER UPDATED
+       Admin                  New Node                       Existing Node
+         │                       │                                 │
+         │ POST /api/tokens      │                                 │
+         │ X-API-Key: AdminKey   │                                 │
+         ├──────────────────────────────────────────────────────►│
+         │                       │                                 │
+         │      {token, expires_at, note}                          │
+         │◄──────────────────────────────────────────────────────┤
+         │                                                         │
+         │ (operator pastes the token into the new node's env)    │
+         │                                                         │
+                                 │ POST /api/join                  │
+                                 │ {join_token, id, name, ip,      │
+                                 │  api_key (joiner-generated)}    │
+                                 ├────────────────────────────────►│
+                                 │                                 │
+                                 │             1. Burn token (persist immediately)
+                                 │             2. Check mesh IP collision
+                                 │             3. Register peer with APIKey
+                                 │                                 │
+                                 │  {peers (with api_keys),        │
+                                 │   workloads, cf_token,          │
+                                 │   warp_token, service_cidr,     │
+                                 │   admin_key, encryption_key,    │
+                                 │   env_data (encrypted)}         │
+                                 │◄────────────────────────────────┤
+                                 │                                 │
+                                 │             4. Memberlist gossip propagates
+                                 │                joiner's NodeMeta (incl. APIKey)
+                               5. Persist state
+                               6. Start cloudflared / WARP
+                                 │                                 │
+                                 ▼                                 ▼
+                               JOINED                         CLUSTER UPDATED
 ```
 
 ### Failover Flow
@@ -648,24 +732,39 @@ services:
 
 ## Security
 
-### Authentication
+### Authentication model
 
-**Cluster Secret** (`JETTY_SECRET`)
-- Permanent shared password
-- Required for all join and peer-announce requests
-- Set via environment variable
-- All nodes must use the same secret
+Three distinct credentials, none reused for another purpose:
+
+1. **AdminKey** (`state.AdminKey`) — operator/dashboard credential. Bootstrapped from `JETTY_SECRET` on the first node, persisted, propagated to joiners via the `/api/join` response. Required for: `apiUpdateNode`, `apiBackup`, `apiRestore`, `apiCreateToken`/`apiListTokens`/`apiDeleteToken`, the web terminal endpoints (`/api/workloads/*/exec`, `/api/host/shell`).
+2. **JoinToken** (`state.JoinTokens`) — single-use bootstrap credential for adding a node. Time-bounded (default 1 hour, max 7 days), burned on first successful `apiJoin` and persisted to disk before the handler returns (a crash mid-flow can't leave a token replayable). Minted only by AdminKey holders.
+3. **Peer.APIKey** — each peer's own credential. Generated by the peer at first bootstrap (`SelfAPIKey`) and registered with the cluster during `apiJoin`. Other peers learn it via the join response and via `NodeMeta.APIKey` in memberlist gossip. **Never** mutable via `apiPeerAnnounce` (that endpoint strips the field).
+
+`apiKeyMiddleware` accepts an `X-API-Key` matching any of: AdminKey, this node's SelfAPIKey, or any registered `Peer.APIKey`. All comparisons use `subtle.ConstantTimeCompare`. The peer-key match iterates `state.Peers` linearly under a read lock (O(#peers); fine for the cluster sizes Jetty targets).
 
 ### Encryption
 
-- **WARP**: All inter-node traffic encrypted via Cloudflare
-- **API**: HTTP only (use Cloudflare tunnel for HTTPS)
+- **Env data**: AES-256-GCM under a 32-byte cluster `EncryptionKey`. Generated on bootstrap, propagated to joiners via `/api/join`. Replaces an older Argon2id-derived key — legacy ciphertext is migrated in place on first start of the new code.
+- **WARP**: All inter-node traffic is encrypted by Cloudflare's WARP layer.
+- **Cloudflare tunnel**: External API access goes over HTTPS at the Cloudflare edge. Joining a cluster over plaintext `http://` (to anything other than loopback) is refused — the join token would otherwise travel in cleartext.
 
-### Input Validation
+### Public endpoints
 
-- Workload names: `^[a-zA-Z0-9_-]+$` (prevents path traversal)
-- Mesh IPs: Must be valid IP addresses within mesh CIDR
-- Collision detection: Prevents duplicate mesh IPs
+`/api/health`, `/api/join`, `/swagger/`, and `/` (dashboard) are reachable without an API key. `/api/health` returns only `{status, version}` to anonymous callers; the rich payload (peer list, workload IPs, system metrics) is gated behind authentication.
+
+### What's stripped, validated, or refused
+
+- `Peer.APIKey` is `json:"-"` — never serialized through endpoints that return `Peer` objects (`/api/status`, `/api/nodes`). It's emitted explicitly only in the `/api/join` response (which is point-to-point with the joiner) and in memberlist `NodeMeta`.
+- `apiPeerAnnounce` strips `APIKey` from the request body and refuses to repoint an existing peer's IP unless `r.RemoteAddr` matches the new IP (defense against peer impersonation by anyone holding a peer key).
+- Workload names: `^[a-zA-Z0-9_-]+$` (prevents path traversal in compose-dir writes).
+- Peer hostnames: `^[a-zA-Z0-9._-]+$` (prevents `/etc/hosts` line injection).
+- Mesh IPs: `net.ParseIP` validated; collision-checked against existing peers and workloads.
+- TAR restore: each entry is checked for `..`-traversal and absolute paths; symlinks/devices are skipped.
+- `apiWorkloadProxy` strips `X-API-Key`, `Authorization`, and `Cookie` headers when forwarding to a local workload (workload code is untrusted relative to the cluster control plane).
+
+### Threat model
+
+Peer-API-keys are flat-equivalent in the middleware: any peer key admits every non-admin endpoint. A compromised peer can read state, drop in workload changes, and route packets, but **cannot** mint join tokens, update images, download backups, or open shells. A compromised AdminKey is full cluster ownership.
 
 ---
 
@@ -741,8 +840,8 @@ docker logs jetty 2>&1 | grep cloudflared
 - **No central storage**: State is eventually consistent via gossip
 - **No resource scheduling**: No CPU/memory constraints
 - **No rolling updates**: Workloads are replaced, not updated in-place
-- **No secrets management**: Compose files stored in plaintext
-- **Single failure domain**: If all nodes die, state is lost
+- **Compose files are plaintext on disk** (under `/data/compose`). Use the encrypted env-var system (`/api/env`) for secrets and reference them from compose files via `${VAR_NAME}`.
+- **Single failure domain**: If all nodes die, state is lost. Use `/api/backup` periodically.
 
 ---
 
@@ -761,7 +860,18 @@ docker run -d --name jetty-node1 \
   jetty
 ```
 
-### 2. Start Second Node
+### 2. Mint a Join Token on Node 1
+
+```bash
+TOKEN=$(curl -s -X POST http://node1-ip:6880/api/tokens \
+  -H "X-API-Key: supersecret" \
+  -H "Content-Type: application/json" \
+  -d '{"ttl_seconds":3600,"note":"node2"}' \
+  | jq -r .token)
+echo "Token: $TOKEN"
+```
+
+### 3. Start Second Node with the Token
 
 ```bash
 docker run -d --name jetty-node2 \
@@ -769,10 +879,12 @@ docker run -d --name jetty-node2 \
   --privileged \
   -v jetty2:/data \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -e JETTY_SECRET=supersecret \
   -e JETTY_JOIN=http://node1-ip:6880 \
+  -e JETTY_JOIN_TOKEN=$TOKEN \
   jetty
 ```
+
+The token is consumed on first successful join. If you want a third node, mint another one. `JETTY_SECRET` doesn't need to be set on joiners — they receive the admin key automatically and the dashboard works on the joining node with the same operator password.
 
 ### 3. Deploy a Workload
 
