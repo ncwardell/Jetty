@@ -750,9 +750,31 @@ ws.onmessage = (e) => terminal.write(decodeFrame(e.data));
 
 `WS /api/host/shell` — gated by `JETTY_HOST_SHELL=true` on the node.
 
-Spawns an interactive shell *on the host* (the agent runs `--privileged --net host` as root, so this is effectively root on the machine). Useful for emergency debugging without SSH; **dangerous** because anyone who recovers the AdminKey through any path (dashboard left open on a coworker's laptop, admin key pasted into a shell history file, etc.) can use it.
+Spawns an interactive shell. Two modes depending on how the docker run was set up:
 
-The Generate-Token modal has a checkbox that injects `JETTY_HOST_SHELL=true` into the joining node's `docker run`. Leave it off unless you specifically want host-shell access on that node — it can be enabled later by restarting the container with the env var set.
+**With `--pid=host` (recommended).** PID 1 inside the container's `/proc` is the host's init, in a different mount namespace than the agent. `apiHostShell` notices this and runs:
+
+```
+nsenter -t 1 -m -u -i -n -p -- /bin/bash
+```
+
+The shell drops into the host's mount, UTS, IPC, network, and PID namespaces — you see real `/home/<user>`, `/etc`, host processes, host hostname. This is effectively the same access you'd get over SSH.
+
+**Without `--pid=host`.** PID 1 inside the container is the agent's own entrypoint; `nsenter` would be a no-op. The handler falls back to a plain `exec.Command(shell)` inside the container's filesystem, and writes a banner to the WebSocket before the shell starts so it's clear what you're looking at:
+
+```
+NOTE: this shell is running INSIDE the jetty container, not on the host.
+      Files under /home/, /root/ on the host are not visible here.
+      To get a real host shell, restart the agent with --pid=host on
+      the docker run. The container will then nsenter into PID 1's
+      namespaces automatically.
+```
+
+Detection is a `readlink /proc/self/ns/mnt` vs `readlink /proc/1/ns/mnt` comparison — guaranteed-different inodes if and only if we're in different mount namespaces.
+
+The Generate-Token modal has a checkbox that injects `JETTY_HOST_SHELL=true` into the joining node's `docker run` and adds `--pid=host`. Leave it off unless you specifically want host-shell access on that node — it can be enabled later by restarting the container with both flags set.
+
+**Why this is dangerous.** Anyone who recovers the AdminKey gets root on every node where `JETTY_HOST_SHELL=true`. The container already runs `--privileged`, so escalation paths exist anyway, but the host shell makes it a one-click drive for any admin-credential leak (dashboard left open on a coworker's laptop, admin key in shell history, etc.).
 
 When the endpoint is reached but `JETTY_HOST_SHELL` is unset:
 ```

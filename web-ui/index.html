@@ -2209,10 +2209,10 @@
                 <div class="form-group">
                     <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
                         <input type="checkbox" id="createTokenHostShell">
-                        <span>Enable host shell (<code>JETTY_HOST_SHELL=true</code>) on the new node</span>
+                        <span>Enable host shell on the new node</span>
                     </label>
                     <p style="color: var(--text-secondary); font-size: 12px; margin-top: 4px;">
-                        Lets admins open an interactive root shell on this host through the dashboard. Off by default.
+                        Adds <code>JETTY_HOST_SHELL=true</code> and <code>--pid=host</code> so the dashboard's host shell sees the real host's filesystem and processes (via <code>nsenter</code>), not just the agent container. Off by default.
                     </p>
                 </div>
             </div>
@@ -5266,6 +5266,11 @@
         // Format mirrors the README so an operator can paste this straight
         // onto a fresh box. The token is shown exactly once - this is the
         // copy-it-or-lose-it screen.
+        //
+        // When JETTY_HOST_SHELL=true is requested we also add --pid=host:
+        // that lets the agent nsenter into PID 1's namespaces and give a
+        // shell that actually shows the host's /home, /etc, and processes
+        // (without it the "host" shell is a shell in the agent container).
         function buildJoinDockerRun({ joinURL, token, hostShell, imageTag }) {
             const lines = [
                 'docker run -d',
@@ -5273,12 +5278,17 @@
                 '  --privileged',
                 '  --net host',
                 '  --restart unless-stopped',
+            ];
+            if (hostShell) {
+                lines.push('  --pid=host');
+            }
+            lines.push(
                 '  -v /var/run/docker.sock:/var/run/docker.sock',
                 '  -v /lib/modules:/lib/modules:ro',
                 '  -v jetty-data:/data',
                 `  -e JETTY_JOIN='${joinURL}'`,
                 `  -e JETTY_JOIN_TOKEN='${token}'`,
-            ];
+            );
             if (hostShell) {
                 lines.push('  -e JETTY_HOST_SHELL=true');
             }
