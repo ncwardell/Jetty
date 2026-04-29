@@ -2202,6 +2202,19 @@
                         <option value="604800">7 days</option>
                     </select>
                 </div>
+                <div class="form-group">
+                    <label class="form-label">Image tag for the generated docker run</label>
+                    <input type="text" class="form-input" id="createTokenImageTag" value="ghcr.io/ncwardell/jetty:latest">
+                </div>
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                        <input type="checkbox" id="createTokenHostShell">
+                        <span>Enable host shell (<code>JETTY_HOST_SHELL=true</code>) on the new node</span>
+                    </label>
+                    <p style="color: var(--text-secondary); font-size: 12px; margin-top: 4px;">
+                        Lets admins open an interactive root shell on this host through the dashboard. Off by default.
+                    </p>
+                </div>
             </div>
             <div class="modal-footer">
                 <button class="btn" onclick="closeCreateTokenModal()">Cancel</button>
@@ -2212,26 +2225,34 @@
 
     <!-- Token Result Modal: shows token ONCE after generation -->
     <div class="modal-overlay hidden" id="tokenResultModal">
-        <div class="modal">
+        <div class="modal" style="max-width: 720px;">
             <div class="modal-header">
                 <h2 class="modal-title">Join Token Generated</h2>
                 <button class="modal-close" onclick="closeTokenResultModal()">&times;</button>
             </div>
             <div class="modal-body">
                 <p style="color: var(--text-secondary); margin-bottom: 12px;">
-                    Copy this token now &mdash; it will not be shown again. Use it as <code>JETTY_JOIN_TOKEN</code> on the joining node.
+                    This token will not be shown again. Run the command below on the new node &mdash; the token is consumed on first successful join.
                 </p>
-                <div style="background: var(--bg-primary); padding: 12px; border-radius: 6px; font-family: monospace; word-break: break-all; user-select: all;" id="tokenResultValue"></div>
-                <p style="color: var(--text-secondary); margin-top: 16px; font-size: 12px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
+                    <label class="form-label" style="margin: 0;">Token</label>
+                    <button class="btn btn-icon" onclick="copyTokenToClipboard()" title="Copy token only" style="font-size: 12px;">📋 Copy</button>
+                </div>
+                <div style="background: var(--bg-primary); padding: 12px; border-radius: 6px; font-family: monospace; word-break: break-all; user-select: all; font-size: 12px;" id="tokenResultValue"></div>
+                <p style="color: var(--text-secondary); margin-top: 8px; font-size: 12px;">
                     Expires <span id="tokenResultExpires"></span>
                 </p>
-                <div class="form-group" style="margin-top: 16px;">
-                    <label class="form-label">Example docker run</label>
-                    <pre style="background: var(--bg-primary); padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; color: var(--text-primary);" id="tokenResultDockerRun"></pre>
+
+                <div class="form-group" style="margin-top: 20px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
+                        <label class="form-label" style="margin: 0;">One-click join command</label>
+                        <button class="btn btn-icon" onclick="copyDockerRunToClipboard()" title="Copy command" style="font-size: 12px;">📋 Copy command</button>
+                    </div>
+                    <pre style="background: var(--bg-primary); padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; color: var(--text-primary); user-select: all; line-height: 1.5;" id="tokenResultDockerRun"></pre>
                 </div>
             </div>
             <div class="modal-footer">
-                <button class="btn btn-primary" onclick="copyTokenToClipboard()">Copy Token</button>
+                <button class="btn btn-primary" onclick="copyDockerRunToClipboard()">Copy Command</button>
                 <button class="btn" onclick="closeTokenResultModal()">Close</button>
             </div>
         </div>
@@ -5232,6 +5253,8 @@
         function openCreateTokenModal() {
             document.getElementById('createTokenNote').value = '';
             document.getElementById('createTokenTTL').value = '3600';
+            document.getElementById('createTokenHostShell').checked = false;
+            document.getElementById('createTokenImageTag').value = 'ghcr.io/ncwardell/jetty:latest';
             document.getElementById('createTokenModal').classList.remove('hidden');
         }
 
@@ -5239,9 +5262,37 @@
             document.getElementById('createTokenModal').classList.add('hidden');
         }
 
+        // Build the one-click `docker run` command for a joining node.
+        // Format mirrors the README so an operator can paste this straight
+        // onto a fresh box. The token is shown exactly once - this is the
+        // copy-it-or-lose-it screen.
+        function buildJoinDockerRun({ joinURL, token, hostShell, imageTag }) {
+            const lines = [
+                'docker run -d',
+                '  --name jetty',
+                '  --privileged',
+                '  --net host',
+                '  --restart unless-stopped',
+                '  -v /var/run/docker.sock:/var/run/docker.sock',
+                '  -v /lib/modules:/lib/modules:ro',
+                '  -v jetty-data:/data',
+                `  -e JETTY_JOIN='${joinURL}'`,
+                `  -e JETTY_JOIN_TOKEN='${token}'`,
+            ];
+            if (hostShell) {
+                lines.push('  -e JETTY_HOST_SHELL=true');
+            }
+            lines.push('  ' + (imageTag || 'ghcr.io/ncwardell/jetty:latest'));
+            return lines.join(' \\\n');
+        }
+
+        let lastGeneratedDockerRun = null;
+
         async function submitCreateToken() {
             const note = document.getElementById('createTokenNote').value.trim();
             const ttl = parseInt(document.getElementById('createTokenTTL').value, 10) || 3600;
+            const hostShell = document.getElementById('createTokenHostShell').checked;
+            const imageTag = document.getElementById('createTokenImageTag').value.trim() || 'ghcr.io/ncwardell/jetty:latest';
             try {
                 const result = await apiCall('/tokens', 'POST', { ttl_seconds: ttl, note });
                 closeCreateTokenModal();
@@ -5249,8 +5300,10 @@
                 document.getElementById('tokenResultValue').textContent = result.token;
                 document.getElementById('tokenResultExpires').textContent = formatRelative(result.expires_at);
                 const joinURL = state.connection && state.connection.url ? state.connection.url : 'https://your-cluster';
-                document.getElementById('tokenResultDockerRun').textContent =
-                    `docker run -d \\\n  --name jetty --privileged --net host \\\n  -v /var/run/docker.sock:/var/run/docker.sock \\\n  -v /lib/modules:/lib/modules:ro \\\n  -v jetty-data:/data \\\n  -e JETTY_JOIN='${joinURL}' \\\n  -e JETTY_JOIN_TOKEN='${result.token}' \\\n  ghcr.io/ncwardell/jetty:latest`;
+                lastGeneratedDockerRun = buildJoinDockerRun({
+                    joinURL, token: result.token, hostShell, imageTag,
+                });
+                document.getElementById('tokenResultDockerRun').textContent = lastGeneratedDockerRun;
                 document.getElementById('tokenResultModal').classList.remove('hidden');
                 refreshTokens();
             } catch (error) {
@@ -5260,7 +5313,16 @@
 
         function closeTokenResultModal() {
             lastGeneratedToken = null;
+            lastGeneratedDockerRun = null;
             document.getElementById('tokenResultModal').classList.add('hidden');
+        }
+
+        function copyDockerRunToClipboard() {
+            if (!lastGeneratedDockerRun) return;
+            navigator.clipboard.writeText(lastGeneratedDockerRun).then(
+                () => showToast('Join command copied to clipboard', 'success'),
+                () => showToast('Could not copy - select the command manually', 'error')
+            );
         }
 
         function copyTokenToClipboard() {
