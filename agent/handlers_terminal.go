@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -281,8 +282,20 @@ func (a *Agent) apiWorkloadExec(w http.ResponseWriter, r *http.Request) {
 
 // apiHostShell opens a shell on the host. Gated by JETTY_HOST_SHELL=true.
 //
+// "Host" here is literal when the container was launched with
+// --pid=host: in that case PID 1 inside our /proc is the host's init,
+// living in a different mount namespace than ours. We `nsenter` into
+// it and the shell sees the host's filesystem, processes, and so on -
+// the same picture you'd get over SSH.
+//
+// Without --pid=host, PID 1 is the container's own entrypoint and
+// nsenter would be a no-op. We fall back to a shell in the container's
+// namespace and emit a banner explaining what the user is actually
+// looking at, so files in /home/<user>/ on the real host (which the
+// container can't see) don't appear missing for mysterious reasons.
+//
 // @Summary Open a shell on the host (WebSocket)
-// @Description Upgrades to a WebSocket and runs an interactive shell directly on the host. DISABLED by default. Set JETTY_HOST_SHELL=true to enable. Anyone with JETTY_SECRET can use this to get root on every cluster member, so enable only when you actually need it. Auth: ?api_key=<secret> or X-API-Key header.
+// @Description Upgrades to a WebSocket and runs an interactive shell. With --pid=host on the docker run, this is a true host shell via nsenter. Without it, the shell runs inside the agent container and a banner explains the limitation. DISABLED by default. Set JETTY_HOST_SHELL=true to enable. Auth: ?api_key=<secret> or X-API-Key header.
 // @Tags terminal
 // @Param shell query string false "Shell to run (default /bin/bash, falls back to /bin/sh)"
 // @Router /host/shell [get]
@@ -306,13 +319,60 @@ func (a *Agent) apiHostShell(w http.ResponseWriter, r *http.Request) {
 	// own image installs bash). The shell allowlist accepts /bin/sh as
 	// the safe fallback if bash somehow isn't present.
 	shell := pickShell(r, "/bin/bash")
-	cmd := exec.Command(shell)
+
+	var cmd *exec.Cmd
+	var banner string
+	if hostNamespacesAvailable() {
+		// nsenter into PID 1's mount, UTS, IPC, network, and pid
+		// namespaces - the host's. Network is already shared via
+		// --net host, but including -n keeps the namespace set
+		// internally consistent.
+		cmd = exec.Command("/usr/bin/nsenter",
+			"-t", "1",
+			"-m", "-u", "-i", "-n", "-p",
+			"--", shell)
+	} else {
+		cmd = exec.Command(shell)
+		banner = "\r\n" +
+			"\x1b[33m" + // yellow
+			"NOTE: this shell is running INSIDE the jetty container, not on the host.\r\n" +
+			"      Files under /home/, /root/ on the host are not visible here.\r\n" +
+			"      To get a real host shell, restart the agent with --pid=host on\r\n" +
+			"      the docker run. The container will then nsenter into PID 1's\r\n" +
+			"      namespaces automatically.\r\n" +
+			"\x1b[0m\r\n"
+	}
 	// Reasonable login-shell environment so PATH and prompt are set up.
 	cmd.Env = append(cmd.Env,
 		"TERM=xterm-256color",
 		"HOME=/root",
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 	)
-	log.Printf("Host shell: opened by %s", r.RemoteAddr)
+	if banner != "" {
+		// xterm.js will render this before the shell's first prompt.
+		_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{termMsgData}, []byte(banner)...))
+	}
+	log.Printf("Host shell: opened by %s (host_ns=%v)", r.RemoteAddr, hostNamespacesAvailable())
 	a.attachPTYToWS(conn, cmd)
+}
+
+// hostNamespacesAvailable returns true when the agent's container was
+// launched with --pid=host: PID 1 inside /proc is the host's init,
+// living in a different mount namespace than ours. We check by
+// comparing the namespace inode links - they're guaranteed-different
+// if and only if we're in different namespaces.
+//
+// The check is read-only and runs at first request. We don't memoize
+// because the result can't change at runtime (namespaces are
+// process-lifecycle-stable) and the cost is two readlinks.
+func hostNamespacesAvailable() bool {
+	ourMnt, err := os.Readlink("/proc/self/ns/mnt")
+	if err != nil {
+		return false
+	}
+	pid1Mnt, err := os.Readlink("/proc/1/ns/mnt")
+	if err != nil {
+		return false
+	}
+	return ourMnt != pid1Mnt
 }

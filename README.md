@@ -503,11 +503,11 @@ Two WebSocket endpoints give you an interactive shell from the dashboard, both *
 | Endpoint | What it does | Gating |
 |---|---|---|
 | `WS /api/workloads/{name}/exec` | `docker exec`-style PTY into one of the workload's containers (the agent picks the first container in `docker compose -p jetty_<name>`). | Always available. Admin key only. |
-| `WS /api/host/shell` | Interactive shell on the **host** (the agent runs as root with `--privileged`, so this is effectively root on the box). | Off by default. Set `JETTY_HOST_SHELL=true` on a node to enable that node's host-shell endpoint. Admin key only. |
+| `WS /api/host/shell` | Interactive shell on the **host**. With `--pid=host` on the docker run, `nsenter`s into PID 1's namespaces so you see the real host's `/home`, `/etc`, processes, etc. Without `--pid=host` it falls back to a shell inside the agent container and prints a banner explaining what you're looking at. | Off by default. Set `JETTY_HOST_SHELL=true` (and recommended: `--pid=host`) to enable. Admin key only. |
 
 The dashboard exposes both via a 🖥️ button on workload and node detail pages. Renderer is xterm.js loaded from a CDN.
 
-> **`JETTY_HOST_SHELL=true` is dangerous.** It hands an authenticated admin a root shell on every node where it's enabled. Only turn it on if you're the only operator and you trust the admin-key handling chain (no shared dashboards, no proxied `?api_key=`, no admin key in shell history). The Generate-Token modal in the dashboard has a checkbox that toggles this on the joining node — leave it off unless you specifically want it.
+> **`JETTY_HOST_SHELL=true` is dangerous.** It hands an authenticated admin a root shell on every node where it's enabled. Only turn it on if you're the only operator and you trust the admin-key handling chain (no shared dashboards, no admin key in shell history). The Generate-Token modal in the dashboard has a checkbox that toggles this on the joining node and adds the `--pid=host` flag automatically — leave it off unless you specifically want it.
 
 ---
 
