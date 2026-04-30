@@ -103,3 +103,78 @@ func TestHandleEnvUndelete(t *testing.T) {
 		t.Error("handleEnvUndelete did not clear the tombstone")
 	}
 }
+
+// TestHandleEnvUpdate_VersionNewerThanTombstone covers the gossip race
+// the merge fix exists to absorb at the /api/sync layer: env_update
+// arrives at a peer that still has a stale tombstone (because
+// env_undelete was lost or arrives later). With version > tombstone,
+// the peer must retire the tombstone and accept the value, instead of
+// waiting up to 30s for the next sync round.
+func TestHandleEnvUpdate_VersionNewerThanTombstone(t *testing.T) {
+	a := envTestAgent(t)
+	a.state.DeletedEnvKeys["FOO"] = &DeletedEnvKey{Key: "FOO", Version: 100}
+
+	a.handleEnvUpdate("FOO", "v2", 200)
+
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	if _, present := a.state.DeletedEnvKeys["FOO"]; present {
+		t.Error("stale tombstone should have been retired")
+	}
+	if a.state.EnvData["FOO"] != "v2" {
+		t.Errorf("EnvData not updated, got %q", a.state.EnvData["FOO"])
+	}
+}
+
+// TestHandleEnvUpdate_VersionOlderThanTombstone is the inverse: a stale
+// re-broadcast (version <= tombstone.version) must NOT resurrect a
+// value the cluster has legitimately deleted.
+func TestHandleEnvUpdate_VersionOlderThanTombstone(t *testing.T) {
+	a := envTestAgent(t)
+	a.state.DeletedEnvKeys["FOO"] = &DeletedEnvKey{Key: "FOO", Version: 200}
+
+	a.handleEnvUpdate("FOO", "stale", 100)
+
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	if _, present := a.state.DeletedEnvKeys["FOO"]; !present {
+		t.Error("fresher tombstone should still be present")
+	}
+	if _, present := a.state.EnvData["FOO"]; present {
+		t.Error("value should not have been resurrected")
+	}
+}
+
+// TestHandleEnvUpdate_ZeroVersionBackcompat covers the rolling-upgrade
+// case where a pre-versioned peer broadcasts env_update with version=0.
+// We keep the conservative behavior (drop if tombstone present) so the
+// older peer can't resurrect a value via a stale broadcast - /api/sync
+// merge logic heals these cases within 30s instead.
+func TestHandleEnvUpdate_ZeroVersionBackcompat(t *testing.T) {
+	a := envTestAgent(t)
+	a.state.DeletedEnvKeys["FOO"] = &DeletedEnvKey{Key: "FOO", Version: 100}
+
+	a.handleEnvUpdate("FOO", "v2", 0)
+
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	if _, present := a.state.DeletedEnvKeys["FOO"]; !present {
+		t.Error("tombstone should still be present when broadcast has no version")
+	}
+	if _, present := a.state.EnvData["FOO"]; present {
+		t.Error("value should not be set when broadcast has no version and tombstone exists")
+	}
+}
+
+// TestHandleEnvUpdate_NoTombstoneAcceptsValue covers the trivial happy
+// path: no local tombstone, the value is accepted regardless of
+// version.
+func TestHandleEnvUpdate_NoTombstoneAcceptsValue(t *testing.T) {
+	a := envTestAgent(t)
+	a.handleEnvUpdate("FOO", "v1", 0)
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	if a.state.EnvData["FOO"] != "v1" {
+		t.Errorf("EnvData not stored, got %q", a.state.EnvData["FOO"])
+	}
+}

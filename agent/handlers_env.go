@@ -93,6 +93,12 @@ func (a *Agent) apiSetEnv(w http.ResponseWriter, r *http.Request) {
 		encryptedMap[key] = encrypted
 	}
 
+	// version is stamped on every env_update broadcast so receivers can
+	// compare it against their local tombstone version (see
+	// handleEnvUpdate). We use a single timestamp for the whole batch -
+	// they were all set "now" from the cluster's point of view.
+	setVersion := time.Now().UnixNano()
+
 	a.stateMu.Lock()
 	added := make([]string, 0)
 	updated := make([]string, 0)
@@ -120,12 +126,14 @@ func (a *Agent) apiSetEnv(w http.ResponseWriter, r *http.Request) {
 	// Push the change out via memberlist so peers see it within a few
 	// hundred ms instead of waiting for the 30s /api/sync poll. Order
 	// matters: send env_undelete first so any tombstone-aware peer
-	// clears its tombstone before the env_update arrives.
+	// clears its tombstone before the env_update arrives. Even if the
+	// gossip arrives out of order, the version on env_update lets the
+	// receiver retire its stale tombstone in handleEnvUpdate.
 	for _, key := range undeleted {
 		a.broadcastEnvUndelete(key)
 	}
 	for key, encrypted := range encryptedMap {
-		a.broadcastEnvUpdate(key, encrypted)
+		a.broadcastEnvUpdate(key, encrypted, setVersion)
 	}
 
 	sort.Strings(added)
