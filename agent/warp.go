@@ -128,6 +128,84 @@ func (a *Agent) ipMonitorLoop() {
 	}
 }
 
+// warpRegistrationKind queries the host's warp-cli to determine what
+// kind of WARP registration is currently active.
+//
+// Returns one of:
+//   "none"      - no registration ("Missing registration" from warp-cli)
+//   "connector" - registered as a WARP Connector (mesh peer; what we want)
+//   "consumer"  - registered as a regular WARP client (split-tunnel only,
+//                 NOT reachable from other WARP peers)
+//   "unknown"   - warp-cli not installed or returned something unexpected
+//
+// The connector vs consumer distinction matters because both create the
+// same CloudflareWARP interface. The interface alone is not enough to
+// know whether other peers can reach us - that depends on registration
+// type. Connector registrations have a "Connector ID" line in
+// "warp-cli registration show"; consumer registrations show
+// account/email metadata instead.
+func warpRegistrationKind() string {
+	out, err := exec.Command("warp-cli", "--accept-tos", "registration", "show").CombinedOutput()
+	s := string(out)
+	if strings.Contains(s, "Missing registration") {
+		return "none"
+	}
+	if err != nil {
+		return "unknown"
+	}
+	if strings.Contains(s, "Connector") {
+		return "connector"
+	}
+	return "consumer"
+}
+
+// ensureWarpConnector makes sure the host's WARP daemon is registered
+// as a Connector using the given token.
+//
+//   - Already a connector: no-op (just nudge `connect` in case it's idle).
+//   - Consumer mode: tear it down and re-register as Connector. The
+//     operator's existing consumer-WARP install is replaced because a
+//     cluster node MUST be reachable in both directions; consumer-only
+//     means other nodes can't initiate to us.
+//   - No registration: configure from scratch.
+//
+// Set JETTY_WARP_NO_TAKEOVER=true to opt out of the consumer→connector
+// rewrite (e.g. if the operator wants to keep their consumer WARP and
+// is OK with the cluster being one-way).
+func (a *Agent) ensureWarpConnector(token string) error {
+	if token == "" {
+		return fmt.Errorf("no WARP Connector token available")
+	}
+	kind := warpRegistrationKind()
+
+	if kind == "connector" {
+		log.Printf("WARP already registered as Connector; ensuring connected")
+		_ = exec.Command("warp-cli", "--accept-tos", "connect").Run()
+		a.detectWarpIP()
+		return nil
+	}
+
+	if kind == "consumer" {
+		if strings.EqualFold(getEnv("JETTY_WARP_NO_TAKEOVER", "false"), "true") {
+			log.Printf("!!! WARP is in consumer mode and JETTY_WARP_NO_TAKEOVER=true. Cluster mesh will only work in one direction (we can reach peers; they can NOT reach us). !!!")
+			a.detectWarpIP()
+			return nil
+		}
+		log.Printf("WARP is in consumer mode (%q). Replacing with Connector registration so the cluster mesh is bidirectional.",
+			"WarpWithDnsOverHttps-style")
+		_ = exec.Command("warp-cli", "--accept-tos", "disconnect").Run()
+		// "registration delete" wipes the consumer registration so
+		// "connector new" below can install ours without conflict.
+		if out, err := exec.Command("warp-cli", "--accept-tos", "registration", "delete").CombinedOutput(); err != nil {
+			log.Printf("Warning: warp-cli registration delete: %v (%s)", err, out)
+		}
+		// Clear the cached IP so post-configure detect picks up the new one.
+		a.ip = ""
+	}
+
+	return a.configureWarpRuntime(token)
+}
+
 // configureWarpRuntime brings up WARP using a connector token received from
 // the cluster join response. Called only on joining nodes - bootstrap nodes
 // have WARP started by the entrypoint before the agent boots.

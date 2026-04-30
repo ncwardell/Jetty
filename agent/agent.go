@@ -196,11 +196,21 @@ func (a *Agent) Start() error {
 		log.Printf("!!! Host shell endpoint /api/host/shell is ENABLED - anyone with the cluster admin key can run shell commands on this host. !!!")
 	}
 
-	// Record whether WARP was already running before we touched anything.
-	// If it was, the operator owns it and we must not tear it down on Stop().
+	// Record whether a CloudflareWARP CONNECTOR was already running
+	// before we touched anything. If a connector is preinstalled by
+	// the operator, we leave it alone on Stop(). Consumer-mode WARP
+	// does NOT count as preexisting because a cluster node has to be
+	// a connector to be reachable from other peers; if we find
+	// consumer WARP we'll replace it with a connector below.
+	warpKind := "none"
 	if _, err := net.InterfaceByName("CloudflareWARP"); err == nil {
+		warpKind = warpRegistrationKind()
+	}
+	if warpKind == "connector" {
 		a.warpPreexisting = true
-		log.Printf("CloudflareWARP interface already present - Jetty will not tear it down on shutdown")
+		log.Printf("CloudflareWARP Connector already present - Jetty will not tear it down on shutdown")
+	} else if warpKind == "consumer" {
+		log.Printf("CloudflareWARP interface present but in CONSUMER mode - will replace with Connector once a token is available (set JETTY_WARP_NO_TAKEOVER=true to opt out)")
 	}
 
 	// Clean up any orphaned state from previous unclean shutdown
@@ -225,6 +235,20 @@ func (a *Agent) Start() error {
 	// AdminKey is bootstrapped from JETTY_SECRET on the first node only;
 	// joiners get it from the /api/join response.
 	a.bootstrapKeys()
+
+	// If we already have a Connector token from a prior join AND the
+	// host's WARP isn't yet a Connector, fix that BEFORE we go any
+	// further. This catches the "consumer WARP was running on the
+	// host, agent restarted" path that would otherwise leave us as a
+	// one-way mesh peer.
+	a.stateMu.RLock()
+	storedWarpToken := a.state.WarpToken
+	a.stateMu.RUnlock()
+	if storedWarpToken != "" && warpKind != "connector" {
+		if err := a.ensureWarpConnector(storedWarpToken); err != nil {
+			log.Printf("Warning: ensureWarpConnector at startup: %v", err)
+		}
+	}
 
 	// Check if we need to join a cluster first (before WARP is configured)
 	a.stateMu.RLock()
