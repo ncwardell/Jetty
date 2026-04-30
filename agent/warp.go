@@ -1,11 +1,14 @@
 package agent
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -128,6 +131,61 @@ func (a *Agent) ipMonitorLoop() {
 	}
 }
 
+// parseConnectorTokenID returns the connector-ID UUID embedded in a
+// Cloudflare WARP Connector token. The token is the base64 encoding of
+//
+//	{"a":"<account>","t":"<connector-id>","s":"<secret>"}
+//
+// Returns "" on parse failure - callers should treat that as "can't
+// reconcile" and fall back to "trust whatever's already registered".
+// We never log the secret half; only the connector ID round-trips
+// through this code.
+func parseConnectorTokenID(token string) string {
+	if token == "" {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(token)
+	if err != nil {
+		// Some operators paste URL-safe variants - try that as a
+		// fallback before giving up.
+		decoded, err = base64.URLEncoding.DecodeString(token)
+		if err != nil {
+			return ""
+		}
+	}
+	var parsed struct {
+		T string `json:"t"`
+	}
+	if err := json.Unmarshal(decoded, &parsed); err != nil {
+		return ""
+	}
+	return parsed.T
+}
+
+// deregisterWarp tells warp-svc to release its current registration
+// with Cloudflare, freeing the device slot in the team's connector
+// registry. Called on graceful shutdown so a planned restart of the
+// agent doesn't leak a dangling device on Cloudflare's side.
+//
+// Best-effort: if warp-cli isn't present or the daemon already exited,
+// we log and move on. The operator can clean up dangling devices in
+// the Cloudflare dashboard if needed.
+func (a *Agent) deregisterWarp() {
+	if _, err := exec.LookPath("warp-cli"); err != nil {
+		return
+	}
+	if out, err := exec.Command("warp-cli", "--accept-tos", "disconnect").CombinedOutput(); err != nil {
+		log.Printf("WARP deregister: disconnect: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("warp-cli", "--accept-tos", "registration", "delete").CombinedOutput(); err != nil {
+		log.Printf("WARP deregister: registration delete: %v (%s)", err, out)
+		return
+	}
+	// Wipe the connector-ID stamp so the next start re-registers cleanly.
+	_ = os.Remove(filepath.Join(a.dataDir, "warp", "registered-connector-id"))
+	log.Printf("WARP deregistered with Cloudflare (device slot freed)")
+}
+
 // configureWarpRuntime brings up WARP using a connector token received from
 // the cluster join response. Called only on joining nodes - bootstrap nodes
 // have WARP started by the entrypoint before the agent boots.
@@ -172,16 +230,48 @@ func (a *Agent) configureWarpRuntime(token string) error {
 		}
 	}
 
-	// Skip registration if we already did it on a prior boot. Registration
-	// state lives in /data/warp which is persisted across container restarts.
+	// Reconcile the existing registration (if any) against the connector
+	// token we were handed. Three cases:
+	//
+	//  1. No existing registration: register fresh.
+	//  2. Existing registration matches our token: connect, done. Same
+	//     device, no Cloudflare-side churn on every restart.
+	//  3. Existing registration is for a DIFFERENT connector (operator
+	//     changed JETTY_WARP_CONNECTOR_TOKEN, or /data/warp was migrated
+	//     from another deploy): tear it down and register fresh,
+	//     otherwise the new token's connector shows zero attached
+	//     devices in the Cloudflare dashboard while we're still
+	//     attached to the old one.
+	expectedConnectorID := parseConnectorTokenID(token) // best-effort; "" if we can't parse
+	stampPath := filepath.Join(a.dataDir, "warp", "registered-connector-id")
 	output, _ := exec.Command("warp-cli", "--accept-tos", "registration", "show").CombinedOutput()
-	if !strings.Contains(string(output), "Missing registration") {
+	needsRegister := strings.Contains(string(output), "Missing registration")
+	if !needsRegister && expectedConnectorID != "" {
+		stamped, _ := os.ReadFile(stampPath)
+		if string(stamped) != expectedConnectorID {
+			log.Printf("WARP registration is bound to a different Connector (%q) than the env token (%q); re-registering",
+				string(stamped), expectedConnectorID)
+			if out, err := exec.Command("warp-cli", "--accept-tos", "registration", "delete").CombinedOutput(); err != nil {
+				log.Printf("Warning: warp-cli registration delete: %v (%s)", err, out)
+			}
+			needsRegister = true
+		} else {
+			log.Printf("WARP already registered to expected Connector %s, connecting...", expectedConnectorID)
+		}
+	} else if !needsRegister {
 		log.Printf("WARP already registered, connecting...")
-	} else {
+	}
+
+	if needsRegister {
 		log.Printf("Registering WARP connector...")
 		cmd := exec.Command("warp-cli", "--accept-tos", "connector", "new", token)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("failed to register WARP connector: %s", output)
+		}
+		// Stamp the registration so the next start can detect a token
+		// change without having to call into Cloudflare.
+		if expectedConnectorID != "" {
+			_ = os.WriteFile(stampPath, []byte(expectedConnectorID), 0600)
 		}
 	}
 
