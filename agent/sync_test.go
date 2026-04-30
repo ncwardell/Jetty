@@ -197,20 +197,60 @@ func TestMergeWorkloadStateEnvDeleteWithTombstone(t *testing.T) {
 	}
 }
 
-func TestMergeWorkloadStateTombstonedEnvKeyNotResurrected(t *testing.T) {
+// TestMergeWorkloadStateStaleLocalTombstoneRetired covers the
+// delete-then-re-set race: the originator broadcasts env_undelete +
+// env_update via memberlist, but a peer who lost the broadcast (or
+// got it out of order) still has the tombstone locally. On the next
+// /api/sync round the peer fetches our state, which has the value
+// and NO tombstone for it - that means our tombstone is stale and
+// must be retired, otherwise it gets re-broadcast and silently
+// re-deletes the value cluster-wide.
+func TestMergeWorkloadStateStaleLocalTombstoneRetired(t *testing.T) {
 	a := newTestAgent("s")
 	a.state.DeletedEnvKeys["DATABASE_URL"] = &DeletedEnvKey{
 		Key: "DATABASE_URL", Version: 100,
 	}
 
-	// Peer happens to still have the value cached. Tombstone should win.
+	// Peer's authoritative state: value alive, no tombstone for it.
+	resp := &SyncResponse{
+		EnvData: map[string]string{
+			"DATABASE_URL": "v2:alive",
+		},
+	}
+	res := a.mergeWorkloadState(resp)
+	if !res.EnvUpdated {
+		t.Error("EnvUpdated should be true after retiring stale tombstone")
+	}
+	if a.state.EnvData["DATABASE_URL"] != "v2:alive" {
+		t.Errorf("env value not adopted, got %q", a.state.EnvData["DATABASE_URL"])
+	}
+	if _, present := a.state.DeletedEnvKeys["DATABASE_URL"]; present {
+		t.Error("stale local tombstone should have been retired")
+	}
+}
+
+// TestMergeWorkloadStateTombstonedByPeerWins is the inverse: if peer
+// also has a tombstone for the key (even alongside a stale value),
+// the deletion is real and our local tombstone stands.
+func TestMergeWorkloadStateTombstonedByPeerWins(t *testing.T) {
+	a := newTestAgent("s")
+	a.state.DeletedEnvKeys["DATABASE_URL"] = &DeletedEnvKey{
+		Key: "DATABASE_URL", Version: 100,
+	}
+
 	resp := &SyncResponse{
 		EnvData: map[string]string{
 			"DATABASE_URL": "v2:stale",
 		},
+		DeletedEnvKeys: []*DeletedEnvKey{
+			{Key: "DATABASE_URL", Version: 100},
+		},
 	}
 	a.mergeWorkloadState(resp)
 	if _, exists := a.state.EnvData["DATABASE_URL"]; exists {
-		t.Error("tombstoned env key should not have been re-added")
+		t.Error("env key should not have been re-added when peer also tombstoned it")
+	}
+	if _, present := a.state.DeletedEnvKeys["DATABASE_URL"]; !present {
+		t.Error("tombstone should remain when peer also has it")
 	}
 }
