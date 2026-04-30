@@ -217,3 +217,76 @@ func TestRestoreRejectsPeerKey(t *testing.T) {
 		t.Errorf("peer key should be rejected, got %d", rec.Code)
 	}
 }
+
+// TestBackupEncryptedRoundTrip - GET /api/backup with passphrase
+// produces a JETTY-ENC-V1 blob; POST /api/restore unwraps it given
+// the same passphrase.
+func TestBackupEncryptedRoundTrip(t *testing.T) {
+	a := newAgentWithDataDir(t)
+	a.state.Workloads["10.100.0.1"] = &Workload{
+		Name: "nginx", IP: "10.100.0.1", Owner: a.hwid,
+		Compose: "services:\n  web: { image: nginx }",
+	}
+	a.saveState()
+	wlDir := filepath.Join(a.composeDir, "nginx")
+	os.MkdirAll(wlDir, 0700)
+	os.WriteFile(filepath.Join(wlDir, "docker-compose.yml"), []byte("services:\n  web: { image: nginx }\n"), 0644)
+
+	const pass = "correct-horse-battery-staple"
+
+	// Backup with passphrase.
+	rec := httptest.NewRecorder()
+	req := withAdminAuth(httptest.NewRequest("GET", "/api/backup", nil))
+	req.Header.Set("X-Backup-Passphrase", pass)
+	a.apiBackup(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("backup status: %d %s", rec.Code, rec.Body.String())
+	}
+	wrapped := rec.Body.Bytes()
+	if !strings.HasPrefix(string(wrapped), "JETTY-ENC-V1") {
+		t.Fatalf("expected JETTY-ENC-V1 prefix, got first 12 bytes: %q", wrapped[:12])
+	}
+	// And it should NOT be a tar.gz (no gzip magic 0x1f 0x8b at start).
+	if len(wrapped) > 1 && wrapped[0] == 0x1f && wrapped[1] == 0x8b {
+		t.Errorf("expected encrypted blob, got plain gzip")
+	}
+
+	// Restore with wrong passphrase fails.
+	a2 := newAgentWithDataDir(t)
+	rec2 := httptest.NewRecorder()
+	req2 := withAdminAuth(httptest.NewRequest("POST", "/api/restore", bytes.NewReader(wrapped)))
+	req2.Header.Set("X-Backup-Passphrase", "WRONG")
+	a2.apiRestore(rec2, req2)
+	if rec2.Code != 400 {
+		t.Errorf("wrong passphrase should 400, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+
+	// Restore without passphrase on encrypted body fails with helpful error.
+	a3 := newAgentWithDataDir(t)
+	rec3 := httptest.NewRecorder()
+	req3 := withAdminAuth(httptest.NewRequest("POST", "/api/restore", bytes.NewReader(wrapped)))
+	a3.apiRestore(rec3, req3)
+	if rec3.Code != 400 {
+		t.Errorf("missing passphrase on encrypted backup should 400, got %d", rec3.Code)
+	}
+	if !strings.Contains(rec3.Body.String(), "X-Backup-Passphrase") {
+		t.Errorf("error should mention the header; got %q", rec3.Body.String())
+	}
+
+	// Restore with correct passphrase succeeds.
+	a4 := newAgentWithDataDir(t)
+	rec4 := httptest.NewRecorder()
+	req4 := withAdminAuth(httptest.NewRequest("POST", "/api/restore", bytes.NewReader(wrapped)))
+	req4.Header.Set("X-Backup-Passphrase", pass)
+	a4.apiRestore(rec4, req4)
+	if rec4.Code != 200 {
+		t.Errorf("correct passphrase should 200, got %d: %s", rec4.Code, rec4.Body.String())
+	}
+	stateBytes, err := os.ReadFile(filepath.Join(a4.dataDir, "state.json"))
+	if err != nil {
+		t.Fatalf("state.json not restored: %v", err)
+	}
+	if !strings.Contains(string(stateBytes), "10.100.0.1") {
+		t.Errorf("restored state.json doesn't contain expected workload")
+	}
+}

@@ -556,8 +556,18 @@ Imports also tell you which `${VAR_NAME}` references the compose YAML carries (`
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `GET /api/backup` | GET | Download a tar.gz of `state.json` + compose dir + warp dir. |
-| `POST /api/restore` | POST | Atomically replace state from a backup tar.gz. Path-traversal protected. |
+| `GET /api/backup` | GET | Download a tar.gz of `state.json` + compose dir + warp dir. Set `X-Backup-Passphrase` header to wrap the response with Argon2id + AES-GCM (`JETTY-ENC-V1` format) — safe to store offsite. |
+| `POST /api/restore` | POST | Atomically replace state from a backup tar.gz. If the body starts with `JETTY-ENC-V1`, the same `X-Backup-Passphrase` is required. Path-traversal protected. |
+| `GET /api/backup/schedule` | GET | Read the cluster's scheduled-backup config (passphrase is redacted to `<set>` if present). |
+| `POST /api/backup/schedule` | POST | Configure scheduled backups: `{interval_minutes (>=5), retention (0=unlimited), passphrase?}`. Backups land at `$dataDir/backups/jetty-backup-<timestamp>.tar.gz` (or `.enc` if a passphrase is set). Only the lowest-HWID healthy node runs each interval (same election rule as failover). |
+| `DELETE /api/backup/schedule` | DELETE | Disable scheduled backups. Existing backup files on disk are left in place. |
+
+### Key rotation (admin-only)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `POST /api/admin-key/rotate` | POST | Generate (or accept via `{new_key}` body) a fresh AdminKey. Persists locally, broadcasts to peers via memberlist so the whole cluster flips together. The new key is shown once in the response — save it from there. |
+| `POST /api/peers/{id}/rotate-key` | POST | Rotate the named peer's `SelfAPIKey`. Use `id=self` for this node, or any HWID/hostname for another peer (the request is proxied). The target regenerates `SelfAPIKey`, persists, and pushes via memberlist `NodeMeta.APIKey`; other peers adopt it via `NotifyUpdate`. Old key is invalid as gossip propagates. |
 
 ### Web Terminals (admin-only)
 

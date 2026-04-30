@@ -4,6 +4,9 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/aes"
+	"crypto/cipher"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,7 +16,95 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/argon2"
 )
+
+// Passphrase-wrapped backup format:
+//   [12 bytes magic "JETTY-ENC-V1"][16 byte salt][12 byte nonce][ciphertext]
+// where ciphertext = AES-256-GCM(passphrase-derived-key, nonce, tar.gz).
+// Argon2id parameters are picked for "wait a couple of seconds on
+// modern hardware" - this is offline-resistant by design since the
+// backup ends up on disk somewhere.
+var backupEncMagic = []byte("JETTY-ENC-V1")
+
+const (
+	backupSaltSize     = 16
+	backupNonceSize    = 12 // AES-GCM standard
+	backupArgonTime    uint32 = 3
+	backupArgonMemory  uint32 = 64 * 1024
+	backupArgonThreads uint8  = 4
+	backupArgonKeyLen  uint32 = 32
+)
+
+// deriveBackupKey runs Argon2id over (passphrase, salt) for a 32-byte AES key.
+func deriveBackupKey(passphrase string, salt []byte) []byte {
+	return argon2.IDKey([]byte(passphrase), salt,
+		backupArgonTime, backupArgonMemory, backupArgonThreads, backupArgonKeyLen)
+}
+
+// encryptBackup wraps plain in JETTY-ENC-V1 format. Caller-supplied
+// passphrase is run through Argon2id with a fresh per-backup salt.
+func encryptBackup(plain []byte, passphrase string) ([]byte, error) {
+	salt := make([]byte, backupSaltSize)
+	if _, err := io.ReadFull(cryptorand.Reader, salt); err != nil {
+		return nil, fmt.Errorf("salt: %w", err)
+	}
+	nonce := make([]byte, backupNonceSize)
+	if _, err := io.ReadFull(cryptorand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("nonce: %w", err)
+	}
+	key := deriveBackupKey(passphrase, salt)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	ciphertext := gcm.Seal(nil, nonce, plain, nil)
+
+	out := make([]byte, 0, len(backupEncMagic)+len(salt)+len(nonce)+len(ciphertext))
+	out = append(out, backupEncMagic...)
+	out = append(out, salt...)
+	out = append(out, nonce...)
+	out = append(out, ciphertext...)
+	return out, nil
+}
+
+// decryptBackup is the inverse of encryptBackup. Returns the
+// plaintext (tar.gz bytes) or an error if the magic doesn't match,
+// the passphrase is wrong, etc.
+func decryptBackup(blob []byte, passphrase string) ([]byte, error) {
+	if !bytes.HasPrefix(blob, backupEncMagic) {
+		return nil, fmt.Errorf("not a passphrase-wrapped backup")
+	}
+	if len(blob) < len(backupEncMagic)+backupSaltSize+backupNonceSize {
+		return nil, fmt.Errorf("backup truncated")
+	}
+	off := len(backupEncMagic)
+	salt := blob[off : off+backupSaltSize]
+	off += backupSaltSize
+	nonce := blob[off : off+backupNonceSize]
+	off += backupNonceSize
+	ciphertext := blob[off:]
+
+	key := deriveBackupKey(passphrase, salt)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	plain, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt failed (wrong passphrase?): %w", err)
+	}
+	return plain, nil
+}
 
 // =============================================================================
 // HTTP Handlers - cluster state backup and restore
@@ -32,10 +123,11 @@ import (
 
 // apiBackup godoc
 // @Summary Download a backup of cluster state
-// @Description Returns a tar.gz containing state.json, the compose directory, and the WARP state directory. Sufficient to reconstruct this node's view of the cluster on a fresh data dir given the same JETTY_SECRET.
+// @Description Returns a tar.gz of state.json + compose dir + warp dir. If X-Backup-Passphrase header is set, the tar.gz is wrapped with Argon2id+AES-GCM into the JETTY-ENC-V1 format - safe to share/store. Without the header, output is plain tar.gz (full credentials in the clear).
 // @Tags backup
+// @Param X-Backup-Passphrase header string false "Optional passphrase. If present, the response body is JETTY-ENC-V1 wrapped instead of plain tar.gz."
 // @Produce application/gzip
-// @Success 200 {file} file "tar.gz archive"
+// @Success 200 {file} file "tar.gz archive (or JETTY-ENC-V1 blob if passphrase set)"
 // @Router /backup [get]
 func (a *Agent) apiBackup(w http.ResponseWriter, r *http.Request) {
 	// Backup contains state.json which now carries AdminKey,
@@ -47,45 +139,72 @@ func (a *Agent) apiBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Persist any pending state before we read it back from disk.
+	passphrase := r.Header.Get("X-Backup-Passphrase")
+	a.writeBackup(w, passphrase, fmt.Sprintf("jetty-backup-%s.tar.gz", time.Now().UTC().Format("20060102-150405")))
+}
+
+// writeBackup is the shared backup-emitter. Used by apiBackup and by
+// the scheduled backup goroutine. When passphrase is empty, streams
+// plain tar.gz to w. When set, builds the tar.gz into a buffer,
+// wraps with JETTY-ENC-V1 (Argon2id+AES-GCM), and writes the result.
+//
+// w may be a stand-in (e.g. os.File-wrapping ResponseWriter) when
+// called from the scheduled-backup path. filename is purely for the
+// Content-Disposition header on HTTP responses.
+func (a *Agent) writeBackup(w http.ResponseWriter, passphrase, filename string) {
 	a.saveState()
 
-	w.Header().Set("Content-Type", "application/gzip")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(
-		`attachment; filename="jetty-backup-%s.tar.gz"`, time.Now().UTC().Format("20060102-150405")))
+	if passphrase == "" {
+		w.Header().Set("Content-Type", "application/gzip")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, filename))
+		_ = a.streamBackupTarGz(w)
+		return
+	}
 
-	gz := gzip.NewWriter(w)
+	// Encrypted path: build tar.gz in-memory, wrap, write.
+	var buf bytes.Buffer
+	if err := a.streamBackupTarGz(&buf); err != nil {
+		log.Printf("Backup: build failed: %v", err)
+		http.Error(w, "backup build failed: "+err.Error(), 500)
+		return
+	}
+	wrapped, err := encryptBackup(buf.Bytes(), passphrase)
+	if err != nil {
+		log.Printf("Backup: encrypt failed: %v", err)
+		http.Error(w, "backup encrypt failed: "+err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf(`attachment; filename=%q`, strings.TrimSuffix(filename, ".gz")+".enc"))
+	_, _ = w.Write(wrapped)
+}
+
+// streamBackupTarGz writes the tar.gz of state.json + compose + warp
+// to dst. Used by both the live HTTP handler (writing directly to the
+// response) and the encrypted path (writing to a buffer first).
+func (a *Agent) streamBackupTarGz(dst io.Writer) error {
+	gz := gzip.NewWriter(dst)
 	defer gz.Close()
 	tw := tar.NewWriter(gz)
 	defer tw.Close()
 
-	// state.json
 	if err := writeFileToTar(tw, filepath.Join(a.dataDir, "state.json"), "state.json"); err != nil {
 		log.Printf("Backup: failed to add state.json: %v", err)
-		// Can't change response code now; just log and continue.
 	}
-
-	// hwid (so the restored node keeps its identity if restoring on the
-	// same machine; if the operator wants a fresh identity they can delete
-	// it manually after restore).
 	if err := writeFileToTar(tw, filepath.Join(a.dataDir, "hwid"), "hwid"); err != nil {
 		log.Printf("Backup: failed to add hwid: %v", err)
 	}
-
-	// compose/ directory tree (workload compose files + override files)
 	if err := writeDirToTar(tw, a.composeDir, "compose"); err != nil {
 		log.Printf("Backup: failed to add compose dir: %v", err)
 	}
-
-	// warp/ (WARP connector registration so the restored node doesn't need
-	// to re-register with Cloudflare on first start). Best-effort - if WARP
-	// isn't configured, just skip.
 	warpDir := filepath.Join(a.dataDir, "warp")
 	if _, err := os.Stat(warpDir); err == nil {
 		if err := writeDirToTar(tw, warpDir, "warp"); err != nil {
 			log.Printf("Backup: failed to add warp dir: %v", err)
 		}
 	}
+	return nil
 }
 
 // apiRestore godoc
@@ -114,6 +233,24 @@ func (a *Agent) apiRestore(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(buf, io.LimitReader(r.Body, 64<<20)); err != nil {
 		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// If the body is the encrypted JETTY-ENC-V1 format, unwrap it
+	// using the passphrase from X-Backup-Passphrase. Symmetric with
+	// the encrypted-write path in apiBackup.
+	body := buf.Bytes()
+	if bytes.HasPrefix(body, backupEncMagic) {
+		passphrase := r.Header.Get("X-Backup-Passphrase")
+		if passphrase == "" {
+			http.Error(w, "encrypted backup detected; X-Backup-Passphrase header required", http.StatusBadRequest)
+			return
+		}
+		plain, err := decryptBackup(body, passphrase)
+		if err != nil {
+			http.Error(w, "decrypt: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		buf = bytes.NewBuffer(plain)
 	}
 
 	gz, err := gzip.NewReader(buf)

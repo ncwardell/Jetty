@@ -71,12 +71,15 @@ type portableWorkload struct {
 // catches all the practical cases.
 var envRefRe = regexp.MustCompile(`\$\{([A-Z_][A-Z0-9_]*)\}`)
 
-// apiExportWorkloads dumps a JSON payload of selected workloads.
-//
-// Selection (apply at most one):
-//   ?tag=media          - all workloads tagged "media"
-//   ?names=a,b,c        - explicit name list
-//   (none)              - all workloads
+// apiExportWorkloads godoc
+// @Summary Export workloads as JSON
+// @Description Returns a portable JSON payload of selected workloads (filtered by ?tag=X or ?names=a,b,c, or all when no filter). Includes the list of env-var keys referenced in compose YAML so the operator knows what to set on the destination cluster. Owner+Version are stripped so the payload imports cleanly anywhere.
+// @Tags workloads
+// @Param tag query string false "Filter to workloads carrying this tag"
+// @Param names query string false "Comma-separated list of workload names"
+// @Produce json
+// @Success 200 {object} PortableExport
+// @Router /workloads/export [get]
 func (a *Agent) apiExportWorkloads(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	tag := strings.ToLower(strings.TrimSpace(q.Get("tag")))
@@ -170,6 +173,17 @@ type importReport struct {
 	Entries []importEntry `json:"entries"`
 }
 
+// apiImportWorkloads godoc
+// @Summary Import workloads from a previous export
+// @Description Restores workloads from a payload produced by /api/workloads/export. mode controls name-collision handling (skip|replace|fail). reassign_ips (default true) auto-allocates a fresh mesh IP when the requested one is taken. Returns a per-workload report.
+// @Tags workloads
+// @Accept json
+// @Produce json
+// @Param request body ImportRequest true "Mode + payload"
+// @Success 200 {object} ImportReport
+// @Failure 400 {object} ErrorResponse "Invalid mode or payload"
+// @Failure 409 {object} ErrorResponse "Atomic-fail mode hit a collision"
+// @Router /workloads/import [post]
 func (a *Agent) apiImportWorkloads(w http.ResponseWriter, r *http.Request) {
 	var req importRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

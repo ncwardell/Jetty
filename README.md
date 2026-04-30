@@ -349,7 +349,18 @@ DELETE /api/tunnel            # Remove tunnel
 ### Backup / Restore (admin only)
 ```bash
 GET    /api/backup            # tar.gz of state.json + compose dir + warp dir
-POST   /api/restore           # Atomically replace state from a backup tar.gz
+                              # (set X-Backup-Passphrase to wrap with Argon2id+AES-GCM)
+POST   /api/restore           # Atomically replace state from a backup tar.gz / .enc
+GET    /api/backup/schedule   # Read scheduled-backup config
+POST   /api/backup/schedule   # {interval_minutes, retention, passphrase?}
+DELETE /api/backup/schedule   # Disable scheduled backups
+```
+
+### Key rotation (admin only)
+```bash
+POST   /api/admin-key/rotate              # Mint a fresh AdminKey, gossip to peers
+POST   /api/peers/{id}/rotate-key         # Rotate that peer's SelfAPIKey
+                                          # (proxied to the target if not local)
 ```
 
 ### Web Terminals (admin only)

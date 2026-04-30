@@ -147,10 +147,30 @@ type State struct {
 	// window then garbage-collected.
 	JoinTokens map[string]*JoinToken `json:"join_tokens,omitempty"`
 
+	// BackupSchedule is the cluster-wide scheduled-backup config.
+	// Persisted so a restart preserves the schedule. nil means
+	// scheduled backups are disabled.
+	BackupSchedule *BackupSchedule `json:"backup_schedule,omitempty"`
+
 	// EncryptionSalt is the legacy Argon2id salt. Kept on disk so an
 	// upgrade can read pre-existing env_data with the old key once,
 	// re-encrypt it under EncryptionKey, then ignore this field.
 	EncryptionSalt []byte `json:"encryption_salt,omitempty"`
+}
+
+// BackupSchedule controls the agent's automatic-backup loop.
+// Configured via POST /api/backup/schedule (admin-only); persisted in
+// state and gossiped so any node can run the backup. Only the
+// least-HWID healthy node actually writes the file - same election
+// rule failover uses, so we don't get N copies on every node.
+type BackupSchedule struct {
+	IntervalMinutes int       `json:"interval_minutes"`        // 0 = disabled
+	Retention       int       `json:"retention,omitempty"`     // keep this many on-disk backups (0 = unlimited)
+	Passphrase      string    `json:"passphrase,omitempty"`    // optional - if set, every scheduled backup is JETTY-ENC-V1 wrapped
+	LastRunAt       time.Time `json:"last_run_at,omitempty"`   // updated on every successful run
+	LastStatus      string    `json:"last_status,omitempty"`   // "ok" or "error: ..."
+	LastBackupPath  string    `json:"last_backup_path,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at,omitempty"`    // when the schedule itself was last changed
 }
 
 // JoinToken is a single-use bearer credential that authorizes a new

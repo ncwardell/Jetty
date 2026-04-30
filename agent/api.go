@@ -286,6 +286,9 @@ func (a *Agent) runAPI() {
 	// --- Backup / restore (handlers_backup.go) -----------------------
 	r.HandleFunc("/api/backup", a.apiBackup).Methods("GET")
 	r.HandleFunc("/api/restore", a.apiRestore).Methods("POST")
+	r.HandleFunc("/api/backup/schedule", a.apiGetBackupSchedule).Methods("GET")
+	r.HandleFunc("/api/backup/schedule", a.apiSetBackupSchedule).Methods("POST")
+	r.HandleFunc("/api/backup/schedule", a.apiDeleteBackupSchedule).Methods("DELETE")
 
 	// --- One-time join tokens (handlers_tokens.go) -------------------
 	// Admin-only: apiCreateToken/apiListTokens/apiDeleteToken each
@@ -294,6 +297,12 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/tokens", a.apiCreateToken).Methods("POST")
 	r.HandleFunc("/api/tokens", a.apiListTokens).Methods("GET")
 	r.HandleFunc("/api/tokens/{id}", a.apiDeleteToken).Methods("DELETE")
+
+	// --- Admin-key rotation (handlers_admin_key.go) ------------------
+	r.HandleFunc("/api/admin-key/rotate", a.apiRotateAdminKey).Methods("POST")
+
+	// --- Per-peer key rotation (handlers_peer_rotate.go) -------------
+	r.HandleFunc("/api/peers/{id}/rotate-key", a.apiRotatePeerKey).Methods("POST")
 
 	// --- HTTP proxy to a workload by mesh IP (handlers_workloads.go) -
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)

@@ -124,6 +124,18 @@ The token's value *is* its identifier — if you stick it in a URL it ends up in
 - Memberlist gossip on port 6881 — bound to the WARP IP only. Trust boundary inherited from WARP itself.
 - The Cloudflare tunnel terminates TLS at the Cloudflare edge; traffic between the edge and the local agent is plaintext on `127.0.0.1`.
 
+### Key rotation
+
+`POST /api/admin-key/rotate` mints a fresh `state.AdminKey` (or accepts an operator-supplied value), persists it locally, and gossips it via memberlist so every peer flips together. The dashboard displays the new key once on the response — it must be saved or memorized at that point because there's no read-back endpoint.
+
+`POST /api/peers/{id}/rotate-key` rotates a single peer's `SelfAPIKey`. Only the peer itself owns its key, so the request is proxied to the target node when the caller hits a different node. The target regenerates `SelfAPIKey`, persists, and updates its memberlist `NodeMeta.APIKey` — every other peer adopts it via `NotifyUpdate`. The `meta.ID == node.Name` check in `NotifyJoin`/`NotifyUpdate` prevents a peer from broadcasting under another peer's identity, which is what makes this propagation safe.
+
+### Backup encryption
+
+Backups carry every credential the cluster uses (AdminKey, EncryptionKey, SelfAPIKey, every peer's APIKey). A leaked plain `.tar.gz` is full cluster compromise. To make backups safe to store offsite, set `X-Backup-Passphrase` on `GET /api/backup`: the response is wrapped with Argon2id(passphrase) → AES-256-GCM into the `JETTY-ENC-V1` format. `POST /api/restore` detects the format prefix automatically and requires the same passphrase.
+
+`state.BackupSchedule` plus the agent's `scheduledBackupLoop` writes timestamped backups to `$dataDir/backups/` on a configurable interval. Only the lowest-HWID healthy node runs each interval (same election rule as failover) so we don't get N copies cluster-wide. Retention is honored (oldest deleted past the configured count).
+
 ---
 
 ## State Synchronization
@@ -388,6 +400,34 @@ Success reset: 30 seconds running = reset counters
 **Why 30-second success reset?**
 
 If the process runs for 30+ seconds, it's probably working correctly. Reset the failure counter so transient crashes don't accumulate toward the 10-failure limit.
+
+---
+
+## Operational caveats
+
+A few non-obvious behaviors worth knowing about before you trust this thing with production-ish workloads.
+
+### Imports don't auto-deploy
+
+`POST /api/workloads/import` writes the workloads into `state.Workloads` but does NOT shell out to `docker compose up` for each one. Reasoning: importing N workloads serially blocks the request handler for tens of seconds to minutes; failing partway through leaves the operator wondering what state things landed in.
+
+Instead: imported workloads land in state with a fresh `Owner` and `Version`, the next sync round propagates them to peers, and the operator brings them up explicitly via the dashboard's "Start" buttons (or `POST /api/workloads/{name}/start`). For a tag full of workloads, hit `POST /api/workloads/bulk` with `{tag, action: "start"}` after import.
+
+This is a deliberate trade-off, but it means a freshly-imported cluster is in "definitions present, not yet running" mode until you start things explicitly.
+
+### Network partitions and conflicting writes
+
+Sync is eventually-consistent with `version`-wins (where version is `time.Now().UnixNano()`). If the cluster splits into two halves that can't reach each other, both halves continue to accept mutations, and when the partition heals the higher version wins per workload/per env-key.
+
+In practice this means: don't deploy/edit during a known partition. If you have to, the most-recent write wins on rejoin — earlier writes silently disappear. There's no log of what was lost. The conflict-resolution mechanism is intentionally simple (no vector clocks, no merge UI) because the simplicity is most of why the cluster works without a coordinator.
+
+If your nodes are on the same WAN segment and behind the same Cloudflare account, partitions are rare. If you have nodes in genuinely different network domains, plan around it.
+
+### State.json is the only source of truth
+
+There is no external database. Everything — peers, workloads, env data, tokens, the AdminKey, the EncryptionKey — lives in `state.json` on each node. Lose every node's `state.json` simultaneously and the cluster is gone (workloads keep running until they restart, but there's no way to manage them or recover the encrypted env data).
+
+The scheduled-backup loop (`state.BackupSchedule` + `scheduledBackupLoop`) is the recommended mitigation — set an interval, set a passphrase if the backup will leave the host, set retention so the directory doesn't grow unbounded.
 
 ---
 
