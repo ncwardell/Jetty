@@ -170,6 +170,15 @@ func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
 	if !validIngestedNodeMeta(meta) {
 		return
 	}
+	// Enforce that the peer's claimed meta.ID matches the trusted
+	// node.Name (set by the peer's own memberlist config). Without
+	// this, peer X could broadcast NodeMeta with ID="peer-Y" and we'd
+	// merge their data onto peer Y's record.
+	if meta.ID != node.Name {
+		log.Printf("Memberlist: peer %s broadcast meta.ID=%s; refusing to merge",
+			node.Name, meta.ID)
+		return
+	}
 
 	log.Printf("Memberlist: node %s (%s) joined at %s", meta.Name, shortID(meta.ID, 12), meta.IP)
 
@@ -187,10 +196,11 @@ func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
 	peer.Arch = meta.Arch
 	peer.Healthy = true
 	peer.LastSeen = time.Now()
-	// Adopt APIKey from gossip if we don't already know one for this
-	// peer. Don't overwrite a known APIKey - the join-receiving node
-	// recorded the canonical value first; gossip just propagates it.
-	if peer.APIKey == "" && meta.APIKey != "" {
+	// Adopt APIKey from gossip whenever it differs - the broadcasting
+	// peer is the canonical owner of its own SelfAPIKey, so we follow
+	// their lead. The node.Name == meta.ID enforcement above is what
+	// makes this safe (peer X can't claim to be peer Y on the wire).
+	if meta.APIKey != "" && peer.APIKey != meta.APIKey {
 		peer.APIKey = meta.APIKey
 	}
 	e.agent.stateMu.Unlock()
@@ -249,17 +259,29 @@ func (e *jettyEventDelegate) NotifyUpdate(node *memberlist.Node) {
 	if !validIngestedNodeMeta(meta) {
 		return
 	}
+	if meta.ID != node.Name {
+		log.Printf("Memberlist update: peer %s broadcast meta.ID=%s; refusing",
+			node.Name, meta.ID)
+		return
+	}
 
 	e.agent.stateMu.Lock()
 	if peer := e.agent.state.Peers[meta.ID]; peer != nil {
 		oldIP := peer.IP
+		oldKey := peer.APIKey
 		peer.IP = meta.IP
 		peer.Version = meta.Version
 		peer.Arch = meta.Arch
 		peer.Healthy = true
 		peer.LastSeen = time.Now()
-		if peer.APIKey == "" && meta.APIKey != "" {
+		// Adopt APIKey from the broadcasting peer's NodeMeta. With
+		// the meta.ID == node.Name check above, we know this is the
+		// peer rotating its own key, not impersonation.
+		if meta.APIKey != "" && peer.APIKey != meta.APIKey {
 			peer.APIKey = meta.APIKey
+			if oldKey != "" {
+				log.Printf("Memberlist: adopted rotated APIKey for peer %s", shortID(meta.ID, 12))
+			}
 		}
 
 		// If IP changed, update tunnel
@@ -382,7 +404,61 @@ func (a *Agent) handleBroadcast(msg *BroadcastMessage) {
 			return
 		}
 		a.handleEnvDelete(&dek)
+
+	case "admin_key_rotate":
+		var ak struct {
+			Key string `json:"key"`
+		}
+		if err := json.Unmarshal(msg.Payload, &ak); err != nil {
+			log.Printf("Memberlist: failed to unmarshal admin-key rotation: %v", err)
+			return
+		}
+		a.handleAdminKeyRotate(ak.Key)
 	}
+}
+
+// handleAdminKeyRotate adopts a new AdminKey gossiped from another
+// node. The rotation is initiated by an admin-authenticated POST to
+// /api/admin-key/rotate, which already verified the caller. By the
+// time this gossip lands, the originating node has accepted the new
+// key, so we trust the broadcast.
+func (a *Agent) handleAdminKeyRotate(newKey string) {
+	if newKey == "" {
+		return
+	}
+	a.stateMu.Lock()
+	if a.state.AdminKey == newKey {
+		a.stateMu.Unlock()
+		return
+	}
+	a.state.AdminKey = newKey
+	a.stateMu.Unlock()
+	a.saveState()
+	log.Printf("AdminKey rotated via gossip")
+}
+
+// broadcastAdminKey gossips a new AdminKey to all peers. Called from
+// apiRotateAdminKey after the originating node has already saved the
+// new key locally.
+func (a *Agent) broadcastAdminKey(newKey string) {
+	if a.mlDelegate == nil {
+		return
+	}
+	payload, err := json.Marshal(map[string]string{"key": newKey})
+	if err != nil {
+		log.Printf("Warning: failed to marshal admin-key broadcast: %v", err)
+		return
+	}
+	msg := BroadcastMessage{
+		Type:    "admin_key_rotate",
+		Payload: payload,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("Warning: failed to marshal admin-key broadcast: %v", err)
+		return
+	}
+	a.mlDelegate.broadcasts.QueueBroadcast(&simpleBroadcast{msg: data})
 }
 
 // handleWorkloadUpdate processes a workload update broadcast.

@@ -300,6 +300,10 @@ func (a *Agent) Start() error {
 	// Start failover monitor
 	go a.failoverLoop()
 
+	// Start scheduled-backup ticker (no-op when no schedule is set;
+	// when set, the lowest-HWID healthy node runs each interval)
+	go a.scheduledBackupLoop()
+
 	// Start IP monitor (detects WARP IP changes and re-announces)
 	go a.ipMonitorLoop()
 

@@ -31,7 +31,16 @@ const (
 	usedTokenRetention  = 24 * time.Hour
 )
 
-// apiCreateToken mints a fresh JoinToken.
+// apiCreateToken godoc
+// @Summary Mint a one-time join token
+// @Description Generates a fresh single-use bearer token a new node can pass as JETTY_JOIN_TOKEN. Burned on first successful /api/join. Admin only.
+// @Tags tokens
+// @Accept json
+// @Produce json
+// @Param request body CreateTokenRequest false "TTL + note (both optional)"
+// @Success 200 {object} CreateTokenResponse
+// @Failure 401 {object} ErrorResponse "Admin auth required"
+// @Router /tokens [post]
 func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
 		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
@@ -90,9 +99,14 @@ func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// apiListTokens returns all known tokens. Burned tokens are kept around
-// briefly for audit so the operator can confirm a join consumed the
-// expected one.
+// apiListTokens godoc
+// @Summary List join tokens
+// @Description Returns pending and recently-burned tokens. Pending token IDs are redacted (only an 8-char prefix shown); used tokens show in full because they can no longer be replayed. Admin only.
+// @Tags tokens
+// @Produce json
+// @Success 200 {object} ListTokensResponse
+// @Failure 401 {object} ErrorResponse "Admin auth required"
+// @Router /tokens [get]
 func (a *Agent) apiListTokens(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
 		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
@@ -123,8 +137,15 @@ func (a *Agent) apiListTokens(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"tokens": tokens})
 }
 
-// apiDeleteToken revokes a token by id. Works on both pending and
-// already-burned tokens (the latter just expunges the audit record).
+// apiDeleteToken godoc
+// @Summary Revoke a join token
+// @Description Deletes a token by ID. Works on both pending tokens (true revocation) and already-burned tokens (just expunges the audit record). Admin only.
+// @Tags tokens
+// @Param id path string true "Token ID (the secret value itself)"
+// @Produce json
+// @Success 200 {object} RevokeTokenResponse
+// @Failure 401 {object} ErrorResponse "Admin auth required"
+// @Router /tokens/{id} [delete]
 func (a *Agent) apiDeleteToken(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
 		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)

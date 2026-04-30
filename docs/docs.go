@@ -23,6 +23,149 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
+        "/admin-key/rotate": {
+            "post": {
+                "description": "Generates (or accepts) a new admin key, persists it on this node, and broadcasts it via memberlist so every peer adopts it. Returns the new key in the response. Admin only.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Rotate the cluster admin key",
+                "parameters": [
+                    {
+                        "description": "Rotation parameters (new_key optional - server generates if absent)",
+                        "name": "request",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/agent.RotateAdminKeyRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.RotateAdminKeyResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid new key",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Admin auth required",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/backup": {
+            "get": {
+                "description": "Returns a tar.gz of state.json + compose dir + warp dir. If X-Backup-Passphrase header is set, the tar.gz is wrapped with Argon2id+AES-GCM into the JETTY-ENC-V1 format - safe to share/store. Without the header, output is plain tar.gz (full credentials in the clear).",
+                "produces": [
+                    "application/gzip"
+                ],
+                "tags": [
+                    "backup"
+                ],
+                "summary": "Download a backup of cluster state",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Optional passphrase. If present, the response body is JETTY-ENC-V1 wrapped instead of plain tar.gz.",
+                        "name": "X-Backup-Passphrase",
+                        "in": "header"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "tar.gz archive (or JETTY-ENC-V1 blob if passphrase set)",
+                        "schema": {
+                            "type": "file"
+                        }
+                    }
+                }
+            }
+        },
+        "/backup/schedule": {
+            "get": {
+                "description": "Returns the cluster's current backup schedule (or null if disabled). Admin only.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "backup"
+                ],
+                "summary": "Read the scheduled-backup config",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.BackupSchedule"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Admin-only. Body fields: interval_minutes (\u003e=5), retention (0=unlimited), passphrase (optional, JETTY-ENC-V1 wraps every backup if set).",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "backup"
+                ],
+                "summary": "Create or update the scheduled-backup config",
+                "parameters": [
+                    {
+                        "description": "Schedule",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/agent.BackupSchedule"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.BackupSchedule"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Removes the cluster's scheduled-backup config. Existing backup files on disk are not deleted. Admin only.",
+                "tags": [
+                    "backup"
+                ],
+                "summary": "Disable scheduled backups",
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    }
+                }
+            }
+        },
         "/env": {
             "get": {
                 "description": "Returns all stored environment variable keys (values are encrypted)",
@@ -178,6 +321,70 @@ const docTemplate = `{
                         }
                     }
                 }
+            }
+        },
+        "/host/compose": {
+            "get": {
+                "description": "Returns containers grouped by compose project. Standalone containers (no compose project) are grouped under an empty project name.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "host"
+                ],
+                "summary": "List Docker compose projects on this node",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/agent.HostComposeProject"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/host/containers": {
+            "get": {
+                "description": "Returns every container on the host, including those not managed by Jetty. The agent's own container is excluded.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "host"
+                ],
+                "summary": "List all Docker containers on this node",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/agent.HostContainer"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/host/shell": {
+            "get": {
+                "description": "Upgrades to a WebSocket and runs an interactive shell. With --pid=host on the docker run, this is a true host shell via nsenter. Without it, the shell runs inside the agent container and a banner explains the limitation. DISABLED by default. Set JETTY_HOST_SHELL=true to enable. Auth: ?api_key=\u003csecret\u003e or X-API-Key header.",
+                "tags": [
+                    "terminal"
+                ],
+                "summary": "Open a shell on the host (WebSocket)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Shell to run (default /bin/bash, falls back to /bin/sh)",
+                        "name": "shell",
+                        "in": "query"
+                    }
+                ],
+                "responses": {}
             }
         },
         "/join": {
@@ -352,6 +559,79 @@ const docTemplate = `{
                 }
             }
         },
+        "/peers/{id}/rotate-key": {
+            "post": {
+                "description": "Admin-only. Forces the named peer to regenerate its outbound peer credential. The peer itself owns the key, so the request is proxied to the target node when needed. After rotation gossip propagates, the old key is invalid cluster-wide.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Rotate a peer's SelfAPIKey",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Peer HWID or hostname (use 'self' for this node)",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.RotatePeerKeyResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Admin auth required",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Peer not found",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/restore": {
+            "post": {
+                "description": "Accepts a tar.gz produced by /api/backup and overwrites state.json and the compose directory. Destructive. Restart the agent after restore to pick up the new state.",
+                "consumes": [
+                    "application/gzip"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "backup"
+                ],
+                "summary": "Restore cluster state from a backup",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "invalid archive",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/status": {
             "get": {
                 "description": "Returns full cluster status including node info, peers, workloads, and connectivity status",
@@ -367,6 +647,104 @@ const docTemplate = `{
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/agent.StatusResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/tokens": {
+            "get": {
+                "description": "Returns pending and recently-burned tokens. Pending token IDs are redacted (only an 8-char prefix shown); used tokens show in full because they can no longer be replayed. Admin only.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "tokens"
+                ],
+                "summary": "List join tokens",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ListTokensResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Admin auth required",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Generates a fresh single-use bearer token a new node can pass as JETTY_JOIN_TOKEN. Burned on first successful /api/join. Admin only.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "tokens"
+                ],
+                "summary": "Mint a one-time join token",
+                "parameters": [
+                    {
+                        "description": "TTL + note (both optional)",
+                        "name": "request",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/agent.CreateTokenRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.CreateTokenResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Admin auth required",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/tokens/{id}": {
+            "delete": {
+                "description": "Deletes a token by ID. Works on both pending tokens (true revocation) and already-burned tokens (just expunges the audit record). Admin only.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "tokens"
+                ],
+                "summary": "Revoke a join token",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Token ID (the secret value itself)",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.RevokeTokenResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Admin auth required",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
                         }
                     }
                 }
@@ -517,6 +895,126 @@ const docTemplate = `{
                 }
             }
         },
+        "/workloads/bulk": {
+            "post": {
+                "description": "Runs start/stop/restart/delete against a set of workloads selected by tag, names, or all. Exactly one selector must be set. Returns a per-workload result map; remote workloads are proxied to their owner.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "workloads"
+                ],
+                "summary": "Bulk workload action by selector",
+                "parameters": [
+                    {
+                        "description": "Selector + action",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/agent.BulkRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.BulkResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad selector or action",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/workloads/export": {
+            "get": {
+                "description": "Returns a portable JSON payload of selected workloads (filtered by ?tag=X or ?names=a,b,c, or all when no filter). Includes the list of env-var keys referenced in compose YAML so the operator knows what to set on the destination cluster. Owner+Version are stripped so the payload imports cleanly anywhere.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "workloads"
+                ],
+                "summary": "Export workloads as JSON",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Filter to workloads carrying this tag",
+                        "name": "tag",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Comma-separated list of workload names",
+                        "name": "names",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.PortableExport"
+                        }
+                    }
+                }
+            }
+        },
+        "/workloads/import": {
+            "post": {
+                "description": "Restores workloads from a payload produced by /api/workloads/export. mode controls name-collision handling (skip|replace|fail). reassign_ips (default true) auto-allocates a fresh mesh IP when the requested one is taken. Returns a per-workload report.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "workloads"
+                ],
+                "summary": "Import workloads from a previous export",
+                "parameters": [
+                    {
+                        "description": "Mode + payload",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/agent.ImportRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ImportReport"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid mode or payload",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Atomic-fail mode hit a collision",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/workloads/{name}": {
             "get": {
                 "description": "Returns details for a specific workload by name",
@@ -636,6 +1134,37 @@ const docTemplate = `{
                 }
             }
         },
+        "/workloads/{name}/exec": {
+            "get": {
+                "description": "Upgrades to a WebSocket and runs docker exec -i -t against the workload's first container (or ?service=X for a specific service). Use ?shell=/bin/bash to override the default /bin/sh. Auth: ?api_key=\u003csecret\u003e or X-API-Key header.",
+                "tags": [
+                    "terminal"
+                ],
+                "summary": "Open an interactive shell in a workload container (WebSocket)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Workload name",
+                        "name": "name",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Compose service name (default: first container)",
+                        "name": "service",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Shell to exec (default /bin/sh)",
+                        "name": "shell",
+                        "in": "query"
+                    }
+                ],
+                "responses": {}
+            }
+        },
         "/workloads/{name}/logs": {
             "get": {
                 "description": "Returns container logs for a workload",
@@ -711,6 +1240,82 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Workload or target not found",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/workloads/{name}/prepull": {
+            "post": {
+                "description": "Asks this node to pull the workload's image into its docker cache. Used by other cluster members to warm caches on potential failover targets, so failover doesn't have to download images during the outage. Returns immediately; the pull runs in the background.",
+                "tags": [
+                    "workloads"
+                ],
+                "summary": "Pre-pull a workload's image on this node",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Workload name",
+                        "name": "name",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "202": {
+                        "description": "Pre-pull scheduled",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Workload not found in cluster state",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/workloads/{name}/restart": {
+            "post": {
+                "description": "Recreates the workload's containers, picking up any config changes (env, extra_hosts, image updates that have been pulled). Equivalent to docker compose up -d --force-recreate. To pick up a new image, call /workloads/{name} PATCH with a new compose first, then /workloads/{name}/restart.",
+                "tags": [
+                    "workloads"
+                ],
+                "summary": "Restart a workload (force-recreate)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Workload name",
+                        "name": "name",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Workload not found",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Restart failed",
                         "schema": {
                             "$ref": "#/definitions/agent.ErrorResponse"
                         }
@@ -802,6 +1407,122 @@ const docTemplate = `{
         }
     },
     "definitions": {
+        "agent.BackupSchedule": {
+            "type": "object",
+            "properties": {
+                "interval_minutes": {
+                    "description": "0 = disabled",
+                    "type": "integer"
+                },
+                "last_backup_path": {
+                    "type": "string"
+                },
+                "last_run_at": {
+                    "description": "updated on every successful run",
+                    "type": "string"
+                },
+                "last_status": {
+                    "description": "\"ok\" or \"error: ...\"",
+                    "type": "string"
+                },
+                "passphrase": {
+                    "description": "optional - if set, every scheduled backup is JETTY-ENC-V1 wrapped",
+                    "type": "string"
+                },
+                "retention": {
+                    "description": "keep this many on-disk backups (0 = unlimited)",
+                    "type": "integer"
+                },
+                "updated_at": {
+                    "description": "when the schedule itself was last changed",
+                    "type": "string"
+                }
+            }
+        },
+        "agent.BulkRequest": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "example": "stop"
+                },
+                "all": {
+                    "type": "boolean"
+                },
+                "names": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "nginx",
+                        "redis"
+                    ]
+                },
+                "tag": {
+                    "type": "string",
+                    "example": "prod"
+                }
+            }
+        },
+        "agent.BulkResponse": {
+            "type": "object",
+            "properties": {
+                "results": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/definitions/agent.BulkResponseEntry"
+                    }
+                },
+                "selected": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "agent.BulkResponseEntry": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                },
+                "ok": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "agent.CreateTokenRequest": {
+            "type": "object",
+            "properties": {
+                "note": {
+                    "type": "string",
+                    "example": "for arnold's laptop"
+                },
+                "ttl_seconds": {
+                    "type": "integer",
+                    "example": 3600
+                }
+            }
+        },
+        "agent.CreateTokenResponse": {
+            "type": "object",
+            "properties": {
+                "expires_at": {
+                    "type": "string",
+                    "example": "2026-04-30T03:00:00Z"
+                },
+                "note": {
+                    "type": "string",
+                    "example": "for arnold's laptop"
+                },
+                "token": {
+                    "type": "string",
+                    "example": "H8mC...43-char-base64..."
+                }
+            }
+        },
         "agent.EnvGetResponse": {
             "type": "object",
             "properties": {
@@ -953,6 +1674,138 @@ const docTemplate = `{
                 }
             }
         },
+        "agent.HostComposeProject": {
+            "type": "object",
+            "properties": {
+                "containers": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/agent.HostContainer"
+                    }
+                },
+                "managed_by_jetty": {
+                    "type": "boolean"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "workload_name": {
+                    "description": "populated when managed_by_jetty",
+                    "type": "string"
+                }
+            }
+        },
+        "agent.HostContainer": {
+            "type": "object",
+            "properties": {
+                "compose_project": {
+                    "type": "string"
+                },
+                "compose_service": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "description": "unix seconds",
+                    "type": "integer"
+                },
+                "id": {
+                    "description": "short ID",
+                    "type": "string"
+                },
+                "image": {
+                    "description": "image:tag",
+                    "type": "string"
+                },
+                "managed_by_jetty": {
+                    "type": "boolean"
+                },
+                "name": {
+                    "description": "primary container name (without leading /)",
+                    "type": "string"
+                },
+                "ports": {
+                    "description": "e.g. \"0.0.0.0:80-\u003e80/tcp\"",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "state": {
+                    "description": "\"running\", \"exited\", \"paused\", ...",
+                    "type": "string"
+                },
+                "status": {
+                    "description": "human-readable e.g. \"Up 5 hours\"",
+                    "type": "string"
+                },
+                "workload_name": {
+                    "description": "populated when managed_by_jetty",
+                    "type": "string"
+                }
+            }
+        },
+        "agent.ImportReport": {
+            "type": "object",
+            "properties": {
+                "created": {
+                    "type": "integer"
+                },
+                "entries": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/agent.ImportReportEntry"
+                    }
+                },
+                "errors": {
+                    "type": "integer"
+                },
+                "mode": {
+                    "type": "string"
+                },
+                "skipped": {
+                    "type": "integer"
+                },
+                "total": {
+                    "type": "integer"
+                }
+            }
+        },
+        "agent.ImportReportEntry": {
+            "type": "object",
+            "properties": {
+                "assigned_ip": {
+                    "type": "string"
+                },
+                "detail": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "original_ip": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string",
+                    "example": "imported"
+                }
+            }
+        },
+        "agent.ImportRequest": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "example": "skip"
+                },
+                "payload": {
+                    "$ref": "#/definitions/agent.PortableExport"
+                },
+                "reassign_ips": {
+                    "type": "boolean"
+                }
+            }
+        },
         "agent.JoinRequest": {
             "type": "object",
             "properties": {
@@ -1005,6 +1858,50 @@ const docTemplate = `{
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/agent.Workload"
+                    }
+                }
+            }
+        },
+        "agent.JoinToken": {
+            "type": "object",
+            "properties": {
+                "created_at": {
+                    "description": "When minted",
+                    "type": "string"
+                },
+                "expires_at": {
+                    "description": "After this, refused even if unused",
+                    "type": "string"
+                },
+                "id": {
+                    "description": "Random hex; the token value itself",
+                    "type": "string"
+                },
+                "note": {
+                    "description": "Free-form (\"for arnold's laptop\")",
+                    "type": "string"
+                },
+                "used": {
+                    "description": "True after a successful join consumed it",
+                    "type": "boolean"
+                },
+                "used_at": {
+                    "description": "When consumed",
+                    "type": "string"
+                },
+                "used_by": {
+                    "description": "Joining peer's ID (audit)",
+                    "type": "string"
+                }
+            }
+        },
+        "agent.ListTokensResponse": {
+            "type": "object",
+            "properties": {
+                "tokens": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/agent.JoinToken"
                     }
                 }
             }
@@ -1118,7 +2015,7 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "id": {
-                    "description": "HWID",
+                    "description": "HWID (hardware ID)",
                     "type": "string"
                 },
                 "ip": {
@@ -1135,6 +2032,125 @@ const docTemplate = `{
                 "version": {
                     "description": "Agent version",
                     "type": "string"
+                }
+            }
+        },
+        "agent.PortableExport": {
+            "type": "object",
+            "properties": {
+                "exported_at": {
+                    "type": "string",
+                    "example": "2026-04-30T03:00:00Z"
+                },
+                "referenced_env_keys": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "DATABASE_URL",
+                        "API_KEY"
+                    ]
+                },
+                "version": {
+                    "type": "string",
+                    "example": "1"
+                },
+                "workloads": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/agent.PortableWorkload"
+                    }
+                }
+            }
+        },
+        "agent.PortableWorkload": {
+            "type": "object",
+            "properties": {
+                "allowed_nodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "autostart": {
+                    "type": "boolean"
+                },
+                "compose": {
+                    "type": "string"
+                },
+                "compose_amd64": {
+                    "type": "string"
+                },
+                "compose_arm64": {
+                    "type": "string"
+                },
+                "ip": {
+                    "type": "string",
+                    "example": "10.100.0.10"
+                },
+                "name": {
+                    "type": "string",
+                    "example": "nginx"
+                },
+                "revive": {
+                    "type": "boolean"
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "prod",
+                        "web"
+                    ]
+                }
+            }
+        },
+        "agent.RevokeTokenResponse": {
+            "type": "object",
+            "properties": {
+                "revoked": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "agent.RotateAdminKeyRequest": {
+            "type": "object",
+            "properties": {
+                "new_key": {
+                    "type": "string"
+                }
+            }
+        },
+        "agent.RotateAdminKeyResponse": {
+            "type": "object",
+            "properties": {
+                "hint": {
+                    "type": "string"
+                },
+                "new_key": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string",
+                    "example": "rotated"
+                }
+            }
+        },
+        "agent.RotatePeerKeyResponse": {
+            "type": "object",
+            "properties": {
+                "hint": {
+                    "type": "string"
+                },
+                "peer_id": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string",
+                    "example": "rotated"
                 }
             }
         },
@@ -1228,6 +2244,13 @@ const docTemplate = `{
                 "revive": {
                     "description": "Auto-failover to another node if owner dies",
                     "type": "boolean"
+                },
+                "tags": {
+                    "description": "Tags group workloads for filtering and bulk operations (start\nall tagged \"media\", export all tagged \"prod\", etc.). Free-form\nstrings; validated with validTagPattern. Sorted+deduped on\ningest so the wire form is canonical.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "version": {
                     "description": "Unix timestamp",

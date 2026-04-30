@@ -60,6 +60,16 @@ type bulkSelected struct {
 	local bool
 }
 
+// apiBulkWorkload godoc
+// @Summary Bulk workload action by selector
+// @Description Runs start/stop/restart/delete against a set of workloads selected by tag, names, or all. Exactly one selector must be set. Returns a per-workload result map; remote workloads are proxied to their owner.
+// @Tags workloads
+// @Accept json
+// @Produce json
+// @Param request body BulkRequest true "Selector + action"
+// @Success 200 {object} BulkResponse
+// @Failure 400 {object} ErrorResponse "Bad selector or action"
+// @Router /workloads/bulk [post]
 func (a *Agent) apiBulkWorkload(w http.ResponseWriter, r *http.Request) {
 	var req bulkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

@@ -1,5 +1,85 @@
 basePath: /api
 definitions:
+  agent.BackupSchedule:
+    properties:
+      interval_minutes:
+        description: 0 = disabled
+        type: integer
+      last_backup_path:
+        type: string
+      last_run_at:
+        description: updated on every successful run
+        type: string
+      last_status:
+        description: '"ok" or "error: ..."'
+        type: string
+      passphrase:
+        description: optional - if set, every scheduled backup is JETTY-ENC-V1 wrapped
+        type: string
+      retention:
+        description: keep this many on-disk backups (0 = unlimited)
+        type: integer
+      updated_at:
+        description: when the schedule itself was last changed
+        type: string
+    type: object
+  agent.BulkRequest:
+    properties:
+      action:
+        example: stop
+        type: string
+      all:
+        type: boolean
+      names:
+        example:
+        - nginx
+        - redis
+        items:
+          type: string
+        type: array
+      tag:
+        example: prod
+        type: string
+    type: object
+  agent.BulkResponse:
+    properties:
+      results:
+        additionalProperties:
+          $ref: '#/definitions/agent.BulkResponseEntry'
+        type: object
+      selected:
+        items:
+          type: string
+        type: array
+    type: object
+  agent.BulkResponseEntry:
+    properties:
+      error:
+        type: string
+      ok:
+        type: boolean
+    type: object
+  agent.CreateTokenRequest:
+    properties:
+      note:
+        example: for arnold's laptop
+        type: string
+      ttl_seconds:
+        example: 3600
+        type: integer
+    type: object
+  agent.CreateTokenResponse:
+    properties:
+      expires_at:
+        example: "2026-04-30T03:00:00Z"
+        type: string
+      note:
+        example: for arnold's laptop
+        type: string
+      token:
+        example: H8mC...43-char-base64...
+        type: string
+    type: object
   agent.EnvGetResponse:
     properties:
       key:
@@ -106,6 +186,96 @@ definitions:
         example: 5
         type: integer
     type: object
+  agent.HostComposeProject:
+    properties:
+      containers:
+        items:
+          $ref: '#/definitions/agent.HostContainer'
+        type: array
+      managed_by_jetty:
+        type: boolean
+      name:
+        type: string
+      workload_name:
+        description: populated when managed_by_jetty
+        type: string
+    type: object
+  agent.HostContainer:
+    properties:
+      compose_project:
+        type: string
+      compose_service:
+        type: string
+      created_at:
+        description: unix seconds
+        type: integer
+      id:
+        description: short ID
+        type: string
+      image:
+        description: image:tag
+        type: string
+      managed_by_jetty:
+        type: boolean
+      name:
+        description: primary container name (without leading /)
+        type: string
+      ports:
+        description: e.g. "0.0.0.0:80->80/tcp"
+        items:
+          type: string
+        type: array
+      state:
+        description: '"running", "exited", "paused", ...'
+        type: string
+      status:
+        description: human-readable e.g. "Up 5 hours"
+        type: string
+      workload_name:
+        description: populated when managed_by_jetty
+        type: string
+    type: object
+  agent.ImportReport:
+    properties:
+      created:
+        type: integer
+      entries:
+        items:
+          $ref: '#/definitions/agent.ImportReportEntry'
+        type: array
+      errors:
+        type: integer
+      mode:
+        type: string
+      skipped:
+        type: integer
+      total:
+        type: integer
+    type: object
+  agent.ImportReportEntry:
+    properties:
+      assigned_ip:
+        type: string
+      detail:
+        type: string
+      name:
+        type: string
+      original_ip:
+        type: string
+      status:
+        example: imported
+        type: string
+    type: object
+  agent.ImportRequest:
+    properties:
+      mode:
+        example: skip
+        type: string
+      payload:
+        $ref: '#/definitions/agent.PortableExport'
+      reassign_ips:
+        type: boolean
+    type: object
   agent.JoinRequest:
     properties:
       arch:
@@ -142,6 +312,37 @@ definitions:
       workloads:
         items:
           $ref: '#/definitions/agent.Workload'
+        type: array
+    type: object
+  agent.JoinToken:
+    properties:
+      created_at:
+        description: When minted
+        type: string
+      expires_at:
+        description: After this, refused even if unused
+        type: string
+      id:
+        description: Random hex; the token value itself
+        type: string
+      note:
+        description: Free-form ("for arnold's laptop")
+        type: string
+      used:
+        description: True after a successful join consumed it
+        type: boolean
+      used_at:
+        description: When consumed
+        type: string
+      used_by:
+        description: Joining peer's ID (audit)
+        type: string
+    type: object
+  agent.ListTokensResponse:
+    properties:
+      tokens:
+        items:
+          $ref: '#/definitions/agent.JoinToken'
         type: array
     type: object
   agent.MoveRequest:
@@ -221,7 +422,7 @@ definitions:
       healthy:
         type: boolean
       id:
-        description: HWID
+        description: HWID (hardware ID)
         type: string
       ip:
         description: WARP IP (100.96.x.x) - primary address for node communication
@@ -233,6 +434,86 @@ definitions:
         type: string
       version:
         description: Agent version
+        type: string
+    type: object
+  agent.PortableExport:
+    properties:
+      exported_at:
+        example: "2026-04-30T03:00:00Z"
+        type: string
+      referenced_env_keys:
+        example:
+        - DATABASE_URL
+        - API_KEY
+        items:
+          type: string
+        type: array
+      version:
+        example: "1"
+        type: string
+      workloads:
+        items:
+          $ref: '#/definitions/agent.PortableWorkload'
+        type: array
+    type: object
+  agent.PortableWorkload:
+    properties:
+      allowed_nodes:
+        items:
+          type: string
+        type: array
+      autostart:
+        type: boolean
+      compose:
+        type: string
+      compose_amd64:
+        type: string
+      compose_arm64:
+        type: string
+      ip:
+        example: 10.100.0.10
+        type: string
+      name:
+        example: nginx
+        type: string
+      revive:
+        type: boolean
+      tags:
+        example:
+        - prod
+        - web
+        items:
+          type: string
+        type: array
+    type: object
+  agent.RevokeTokenResponse:
+    properties:
+      revoked:
+        type: boolean
+    type: object
+  agent.RotateAdminKeyRequest:
+    properties:
+      new_key:
+        type: string
+    type: object
+  agent.RotateAdminKeyResponse:
+    properties:
+      hint:
+        type: string
+      new_key:
+        type: string
+      status:
+        example: rotated
+        type: string
+    type: object
+  agent.RotatePeerKeyResponse:
+    properties:
+      hint:
+        type: string
+      peer_id:
+        type: string
+      status:
+        example: rotated
         type: string
     type: object
   agent.StatusResponse:
@@ -299,6 +580,15 @@ definitions:
       revive:
         description: Auto-failover to another node if owner dies
         type: boolean
+      tags:
+        description: |-
+          Tags group workloads for filtering and bulk operations (start
+          all tagged "media", export all tagged "prod", etc.). Free-form
+          strings; validated with validTagPattern. Sorted+deduped on
+          ingest so the wire form is canonical.
+        items:
+          type: string
+        type: array
       version:
         description: Unix timestamp
         type: integer
@@ -356,6 +646,108 @@ info:
   title: Jetty API
   version: "2.0"
 paths:
+  /admin-key/rotate:
+    post:
+      consumes:
+      - application/json
+      description: Generates (or accepts) a new admin key, persists it on this node,
+        and broadcasts it via memberlist so every peer adopts it. Returns the new
+        key in the response. Admin only.
+      parameters:
+      - description: Rotation parameters (new_key optional - server generates if absent)
+        in: body
+        name: request
+        schema:
+          $ref: '#/definitions/agent.RotateAdminKeyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.RotateAdminKeyResponse'
+        "400":
+          description: Invalid new key
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "401":
+          description: Admin auth required
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Rotate the cluster admin key
+      tags:
+      - admin
+  /backup:
+    get:
+      description: Returns a tar.gz of state.json + compose dir + warp dir. If X-Backup-Passphrase
+        header is set, the tar.gz is wrapped with Argon2id+AES-GCM into the JETTY-ENC-V1
+        format - safe to share/store. Without the header, output is plain tar.gz (full
+        credentials in the clear).
+      parameters:
+      - description: Optional passphrase. If present, the response body is JETTY-ENC-V1
+          wrapped instead of plain tar.gz.
+        in: header
+        name: X-Backup-Passphrase
+        type: string
+      produces:
+      - application/gzip
+      responses:
+        "200":
+          description: tar.gz archive (or JETTY-ENC-V1 blob if passphrase set)
+          schema:
+            type: file
+      summary: Download a backup of cluster state
+      tags:
+      - backup
+  /backup/schedule:
+    delete:
+      description: Removes the cluster's scheduled-backup config. Existing backup
+        files on disk are not deleted. Admin only.
+      responses:
+        "204":
+          description: No Content
+      summary: Disable scheduled backups
+      tags:
+      - backup
+    get:
+      description: Returns the cluster's current backup schedule (or null if disabled).
+        Admin only.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.BackupSchedule'
+      summary: Read the scheduled-backup config
+      tags:
+      - backup
+    post:
+      consumes:
+      - application/json
+      description: 'Admin-only. Body fields: interval_minutes (>=5), retention (0=unlimited),
+        passphrase (optional, JETTY-ENC-V1 wraps every backup if set).'
+      parameters:
+      - description: Schedule
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/agent.BackupSchedule'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.BackupSchedule'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Create or update the scheduled-backup config
+      tags:
+      - backup
   /env:
     get:
       description: Returns all stored environment variable keys (values are encrypted)
@@ -461,6 +853,54 @@ paths:
       summary: Health check
       tags:
       - cluster
+  /host/compose:
+    get:
+      description: Returns containers grouped by compose project. Standalone containers
+        (no compose project) are grouped under an empty project name.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/agent.HostComposeProject'
+            type: array
+      summary: List Docker compose projects on this node
+      tags:
+      - host
+  /host/containers:
+    get:
+      description: Returns every container on the host, including those not managed
+        by Jetty. The agent's own container is excluded.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/agent.HostContainer'
+            type: array
+      summary: List all Docker containers on this node
+      tags:
+      - host
+  /host/shell:
+    get:
+      description: 'Upgrades to a WebSocket and runs an interactive shell. With --pid=host
+        on the docker run, this is a true host shell via nsenter. Without it, the
+        shell runs inside the agent container and a banner explains the limitation.
+        DISABLED by default. Set JETTY_HOST_SHELL=true to enable. Auth: ?api_key=<secret>
+        or X-API-Key header.'
+      parameters:
+      - description: Shell to run (default /bin/bash, falls back to /bin/sh)
+        in: query
+        name: shell
+        type: string
+      responses: {}
+      summary: Open a shell on the host (WebSocket)
+      tags:
+      - terminal
   /join:
     post:
       consumes:
@@ -577,6 +1017,59 @@ paths:
       summary: Update a node (self-update)
       tags:
       - nodes
+  /peers/{id}/rotate-key:
+    post:
+      description: Admin-only. Forces the named peer to regenerate its outbound peer
+        credential. The peer itself owns the key, so the request is proxied to the
+        target node when needed. After rotation gossip propagates, the old key is
+        invalid cluster-wide.
+      parameters:
+      - description: Peer HWID or hostname (use 'self' for this node)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.RotatePeerKeyResponse'
+        "401":
+          description: Admin auth required
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "404":
+          description: Peer not found
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Rotate a peer's SelfAPIKey
+      tags:
+      - admin
+  /restore:
+    post:
+      consumes:
+      - application/gzip
+      description: Accepts a tar.gz produced by /api/backup and overwrites state.json
+        and the compose directory. Destructive. Restart the agent after restore to
+        pick up the new state.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: invalid archive
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Restore cluster state from a backup
+      tags:
+      - backup
   /status:
     get:
       description: Returns full cluster status including node info, peers, workloads,
@@ -591,6 +1084,74 @@ paths:
       summary: Get cluster status
       tags:
       - cluster
+  /tokens:
+    get:
+      description: Returns pending and recently-burned tokens. Pending token IDs are
+        redacted (only an 8-char prefix shown); used tokens show in full because they
+        can no longer be replayed. Admin only.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.ListTokensResponse'
+        "401":
+          description: Admin auth required
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: List join tokens
+      tags:
+      - tokens
+    post:
+      consumes:
+      - application/json
+      description: Generates a fresh single-use bearer token a new node can pass as
+        JETTY_JOIN_TOKEN. Burned on first successful /api/join. Admin only.
+      parameters:
+      - description: TTL + note (both optional)
+        in: body
+        name: request
+        schema:
+          $ref: '#/definitions/agent.CreateTokenRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.CreateTokenResponse'
+        "401":
+          description: Admin auth required
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Mint a one-time join token
+      tags:
+      - tokens
+  /tokens/{id}:
+    delete:
+      description: Deletes a token by ID. Works on both pending tokens (true revocation)
+        and already-burned tokens (just expunges the audit record). Admin only.
+      parameters:
+      - description: Token ID (the secret value itself)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.RevokeTokenResponse'
+        "401":
+          description: Admin auth required
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Revoke a join token
+      tags:
+      - tokens
   /tunnel:
     delete:
       description: Removes the Cloudflare tunnel configuration
@@ -765,6 +1326,29 @@ paths:
       summary: Update a workload
       tags:
       - workloads
+  /workloads/{name}/exec:
+    get:
+      description: 'Upgrades to a WebSocket and runs docker exec -i -t against the
+        workload''s first container (or ?service=X for a specific service). Use ?shell=/bin/bash
+        to override the default /bin/sh. Auth: ?api_key=<secret> or X-API-Key header.'
+      parameters:
+      - description: Workload name
+        in: path
+        name: name
+        required: true
+        type: string
+      - description: 'Compose service name (default: first container)'
+        in: query
+        name: service
+        type: string
+      - description: Shell to exec (default /bin/sh)
+        in: query
+        name: shell
+        type: string
+      responses: {}
+      summary: Open an interactive shell in a workload container (WebSocket)
+      tags:
+      - terminal
   /workloads/{name}/logs:
     get:
       description: Returns container logs for a workload
@@ -819,6 +1403,62 @@ paths:
       summary: Move workload to another node
       tags:
       - workloads
+  /workloads/{name}/prepull:
+    post:
+      description: Asks this node to pull the workload's image into its docker cache.
+        Used by other cluster members to warm caches on potential failover targets,
+        so failover doesn't have to download images during the outage. Returns immediately;
+        the pull runs in the background.
+      parameters:
+      - description: Workload name
+        in: path
+        name: name
+        required: true
+        type: string
+      responses:
+        "202":
+          description: Pre-pull scheduled
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Workload not found in cluster state
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Pre-pull a workload's image on this node
+      tags:
+      - workloads
+  /workloads/{name}/restart:
+    post:
+      description: Recreates the workload's containers, picking up any config changes
+        (env, extra_hosts, image updates that have been pulled). Equivalent to docker
+        compose up -d --force-recreate. To pick up a new image, call /workloads/{name}
+        PATCH with a new compose first, then /workloads/{name}/restart.
+      parameters:
+      - description: Workload name
+        in: path
+        name: name
+        required: true
+        type: string
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Workload not found
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "500":
+          description: Restart failed
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Restart a workload (force-recreate)
+      tags:
+      - workloads
   /workloads/{name}/start:
     post:
       description: Starts the containers for a workload that was previously stopped
@@ -871,6 +1511,92 @@ paths:
           schema:
             $ref: '#/definitions/agent.ErrorResponse'
       summary: Stop a running workload
+      tags:
+      - workloads
+  /workloads/bulk:
+    post:
+      consumes:
+      - application/json
+      description: Runs start/stop/restart/delete against a set of workloads selected
+        by tag, names, or all. Exactly one selector must be set. Returns a per-workload
+        result map; remote workloads are proxied to their owner.
+      parameters:
+      - description: Selector + action
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/agent.BulkRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.BulkResponse'
+        "400":
+          description: Bad selector or action
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Bulk workload action by selector
+      tags:
+      - workloads
+  /workloads/export:
+    get:
+      description: Returns a portable JSON payload of selected workloads (filtered
+        by ?tag=X or ?names=a,b,c, or all when no filter). Includes the list of env-var
+        keys referenced in compose YAML so the operator knows what to set on the destination
+        cluster. Owner+Version are stripped so the payload imports cleanly anywhere.
+      parameters:
+      - description: Filter to workloads carrying this tag
+        in: query
+        name: tag
+        type: string
+      - description: Comma-separated list of workload names
+        in: query
+        name: names
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.PortableExport'
+      summary: Export workloads as JSON
+      tags:
+      - workloads
+  /workloads/import:
+    post:
+      consumes:
+      - application/json
+      description: Restores workloads from a payload produced by /api/workloads/export.
+        mode controls name-collision handling (skip|replace|fail). reassign_ips (default
+        true) auto-allocates a fresh mesh IP when the requested one is taken. Returns
+        a per-workload report.
+      parameters:
+      - description: Mode + payload
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/agent.ImportRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.ImportReport'
+        "400":
+          description: Invalid mode or payload
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "409":
+          description: Atomic-fail mode hit a collision
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Import workloads from a previous export
       tags:
       - workloads
 schemes:
