@@ -343,6 +343,14 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	wl.Owner = a.hwid
 	wl.Version = time.Now().UnixNano()
 	a.state.Workloads[wl.IP] = &wl
+	// If this IP had a tombstone (e.g. the workload was deleted earlier
+	// and the operator is creating a fresh one at the same IP), drop
+	// it. The new workload's version is strictly greater than any prior
+	// tombstone for this IP, so peers will accept the workload over the
+	// tombstone on sync - but our own state is the source of truth in
+	// /api/sync responses, and a stale local tombstone would propagate
+	// for an hour until GC.
+	delete(a.state.DeletedWorkloads, wl.IP)
 	a.stateMu.Unlock()
 
 	// Deploy (outside lock to avoid blocking other operations)
@@ -357,7 +365,9 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 
 	a.updateHosts()
 	a.saveState()
-	a.broadcastState()
+	// Push the new workload via memberlist so peers see it sub-second
+	// instead of waiting up to 30s for the periodic sync poll.
+	a.broadcastWorkloadUpdate(&wl)
 
 	// Ask allowed peers to pre-pull this workload's image so future
 	// failover doesn't have to download during the outage.
@@ -693,7 +703,9 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 
 	a.updateHosts()
 	a.saveState()
-	a.broadcastState()
+	// Push the updated workload entry via memberlist for sub-second
+	// propagation. Periodic sync would catch it eventually, but slowly.
+	a.broadcastWorkloadUpdate(found)
 
 	// If the compose changed, refresh peer pre-pulls so they cache the
 	// new image before any failover.
@@ -995,8 +1007,12 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 
 	a.updateHosts()
 	a.saveState()
-	if !isMove {
-		a.broadcastState()
+	// Push the tombstone via memberlist for sub-second propagation;
+	// otherwise peers wouldn't learn of the deletion until the next
+	// 30s periodic sync poll. Skip for moves - by definition, no
+	// tombstone exists to broadcast there.
+	if !isMove && tombstone != nil {
+		a.broadcastWorkloadDelete(tombstone)
 	}
 
 	w.WriteHeader(204)
