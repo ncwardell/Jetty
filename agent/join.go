@@ -162,10 +162,17 @@ func (a *Agent) joinCluster() error {
 
 	a.saveState()
 
-	// Configure WARP at runtime if we received a token and WARP isn't connected yet
-	if result.WarpToken != "" && a.ip == "" {
-		if err := a.configureWarpRuntime(result.WarpToken); err != nil {
-			log.Printf("Warning: failed to configure WARP at runtime: %v", err)
+	// Make sure the host's WARP is registered as a Connector using the
+	// token we just received. ensureWarpConnector handles three cases:
+	//   - no WARP at all          -> configure from scratch
+	//   - existing consumer WARP  -> tear down + replace with connector
+	//   - existing connector WARP -> no-op
+	// This is what makes the joiner work even when the host had
+	// consumer WARP running before the agent started (which would
+	// otherwise look "connected" but be one-way).
+	if result.WarpToken != "" {
+		if err := a.ensureWarpConnector(result.WarpToken); err != nil {
+			log.Printf("Warning: failed to ensure WARP Connector at runtime: %v", err)
 		}
 	}
 
