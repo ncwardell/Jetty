@@ -219,9 +219,16 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 	return result
 }
 
-// mergeStartupSyncData is similar to mergeWorkloadState but with startup-specific logging.
-// Must be called with stateMu held.
-func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) {
+// mergeStartupSyncData is similar to mergeWorkloadState but with startup-specific
+// logging. Must be called with stateMu held. Returns LostOwnership so the caller
+// can stop containers we own locally that the rest of the cluster has reassigned -
+// without this, an update or restart that lasted long enough for failover to
+// claim our workloads leaves orphan containers running on this node forever
+// (the steady-state syncWorkloads path doesn't catch them either, because by
+// then state.Workloads[X].Owner already matches the peer's view).
+func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) *MergeResult {
+	result := &MergeResult{}
+
 	// Process deleted workloads (tombstones) first
 	for _, dw := range syncResp.DeletedWorkloads {
 		if !validIngestedTombstone(dw) {
@@ -234,6 +241,9 @@ func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) {
 		existing := a.state.Workloads[dw.IP]
 		if existing != nil && dw.Version > existing.Version {
 			log.Printf("Startup sync: workload %s was deleted while we were down", existing.Name)
+			if existing.Owner == a.hwid {
+				result.LostOwnership = append(result.LostOwnership, existing)
+			}
 			delete(a.state.Workloads, dw.IP)
 		}
 	}
@@ -251,6 +261,7 @@ func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) {
 		if existing == nil || w.Version > existing.Version {
 			if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
 				log.Printf("Workload %s was revived by %s while we were down", w.Name, shortID(w.Owner, 12))
+				result.LostOwnership = append(result.LostOwnership, existing)
 			}
 			a.state.Workloads[w.IP] = w
 			if tombstone != nil {
@@ -297,6 +308,8 @@ func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) {
 		}
 		a.state.EnvData[k] = v
 	}
+
+	return result
 }
 
 // syncStateOnStartup synchronizes state with peers during startup.
@@ -315,6 +328,7 @@ func (a *Agent) syncStateOnStartup() {
 
 	log.Printf("Syncing state with cluster on startup...")
 	synced := false
+	var allLostOwnership []*Workload
 
 	// Try tunnel first (works even if WARP IPs have changed)
 	if a.tunnelDomain != "" {
@@ -328,8 +342,9 @@ func (a *Agent) syncStateOnStartup() {
 					var syncResp SyncResponse
 					if err := json.NewDecoder(resp.Body).Decode(&syncResp); err == nil {
 						a.stateMu.Lock()
-						a.mergeStartupSyncData(&syncResp)
+						result := a.mergeStartupSyncData(&syncResp)
 						a.stateMu.Unlock()
+						allLostOwnership = append(allLostOwnership, result.LostOwnership...)
 						synced = true
 					}
 				}()
@@ -354,11 +369,20 @@ func (a *Agent) syncStateOnStartup() {
 			var syncResp SyncResponse
 			if err := json.NewDecoder(resp.Body).Decode(&syncResp); err == nil {
 				a.stateMu.Lock()
-				a.mergeStartupSyncData(&syncResp)
+				result := a.mergeStartupSyncData(&syncResp)
 				a.stateMu.Unlock()
+				allLostOwnership = append(allLostOwnership, result.LostOwnership...)
 				synced = true
 			}
 		}()
+	}
+
+	// Stop containers we no longer own. removeWorkload runs `docker compose
+	// down -v` and is safe to call without the state lock - we already
+	// updated state inside the merge.
+	for _, wl := range allLostOwnership {
+		log.Printf("Startup sync: stopping local workload %s - ownership transferred during downtime", wl.Name)
+		a.removeWorkload(wl)
 	}
 
 	if synced {

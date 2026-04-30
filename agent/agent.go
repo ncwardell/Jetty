@@ -267,8 +267,14 @@ func (a *Agent) Start() error {
 	// Announce our current IP to peers (handles IP changes during restart/update)
 	go a.announceOurIP()
 
-	// Auto-start owned workloads (only those we still own after sync)
-	a.autostartWorkloads()
+	// Auto-start owned workloads in the background. `docker compose up`
+	// can be slow (image pulls, init sidecars on network filesystems,
+	// etc.) and used to block the rest of startup - meaning the API,
+	// memberlist, and cloudflared couldn't come up until every workload
+	// finished deploying. Running it as a goroutine lets the agent come
+	// online immediately; new sync rounds and failover behave correctly
+	// while autostart is still finishing.
+	go a.autostartWorkloads()
 
 	// Update hosts file
 	a.updateHosts()
