@@ -96,17 +96,37 @@ func (a *Agent) apiSetEnv(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.Lock()
 	added := make([]string, 0)
 	updated := make([]string, 0)
+	undeleted := make([]string, 0)
 	for key, encrypted := range encryptedMap {
 		if _, exists := a.state.EnvData[key]; exists {
 			updated = append(updated, key)
 		} else {
 			added = append(added, key)
 		}
+		// Setting a key after it was deleted: the tombstone in
+		// DeletedEnvKeys would otherwise win on the next sync round
+		// and re-delete the value. Clear it locally and remember to
+		// broadcast the un-delete so peers clear theirs too.
+		if _, hadTombstone := a.state.DeletedEnvKeys[key]; hadTombstone {
+			delete(a.state.DeletedEnvKeys, key)
+			undeleted = append(undeleted, key)
+		}
 		a.state.EnvData[key] = encrypted
 	}
 	a.stateMu.Unlock()
 
 	a.saveState()
+
+	// Push the change out via memberlist so peers see it within a few
+	// hundred ms instead of waiting for the 30s /api/sync poll. Order
+	// matters: send env_undelete first so any tombstone-aware peer
+	// clears its tombstone before the env_update arrives.
+	for _, key := range undeleted {
+		a.broadcastEnvUndelete(key)
+	}
+	for key, encrypted := range encryptedMap {
+		a.broadcastEnvUpdate(key, encrypted)
+	}
 
 	sort.Strings(added)
 	sort.Strings(updated)
@@ -166,13 +186,15 @@ func (a *Agent) apiDeleteEnv(w http.ResponseWriter, r *http.Request) {
 
 	a.stateMu.Lock()
 	_, exists := a.state.EnvData[key]
+	var tombstone *DeletedEnvKey
 	if exists {
 		delete(a.state.EnvData, key)
 		// Create tombstone to propagate deletion across cluster
-		a.state.DeletedEnvKeys[key] = &DeletedEnvKey{
+		tombstone = &DeletedEnvKey{
 			Key:     key,
 			Version: time.Now().UnixNano(),
 		}
+		a.state.DeletedEnvKeys[key] = tombstone
 	}
 	a.stateMu.Unlock()
 
@@ -182,6 +204,14 @@ func (a *Agent) apiDeleteEnv(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.saveState()
+
+	// Push the deletion via memberlist so peers tombstone immediately
+	// instead of waiting up to 30s for the next /api/sync round. The
+	// receiver's handleEnvDelete deletes the value from its own
+	// EnvData and stores the tombstone.
+	if tombstone != nil {
+		a.broadcastEnvDelete(tombstone)
+	}
 
 	w.WriteHeader(204)
 	log.Printf("Env deleted: %s, created tombstone for sync propagation", key)
