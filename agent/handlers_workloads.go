@@ -961,18 +961,32 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Cleaning up orphaned workload %s (owner %s unreachable)", name, found.Owner)
 	}
 
-	// Local workload or orphaned cleanup - delete from state and add tombstone
+	// Distinguish a real deletion from the source-side cleanup half of a
+	// move. A real DELETE creates a tombstone so peers tear down stale
+	// copies. A move's DELETE must NOT tombstone - the new owner has
+	// already recorded a workload entry with a fresh version, and a
+	// tombstone created right after would have a higher version (it's
+	// stamped with time.Now() on the source) and win the next sync round,
+	// silently rolling the move back and deleting the workload entirely.
+	isMove := r.URL.Query().Get("move") == "true"
+
 	a.stateMu.Lock()
 	delete(a.state.Workloads, foundIP)
-	// Add tombstone with version greater than the deleted workload's version
-	// This ensures the deletion propagates to peers even if they have older copies
-	a.state.DeletedWorkloads[foundIP] = &DeletedWorkload{
-		IP:      foundIP,
-		Version: time.Now().UnixNano(),
+	var tombstone *DeletedWorkload
+	if !isMove {
+		tombstone = &DeletedWorkload{
+			IP:      foundIP,
+			Version: time.Now().UnixNano(),
+		}
+		a.state.DeletedWorkloads[foundIP] = tombstone
 	}
 	a.stateMu.Unlock()
 
-	log.Printf("Deleted workload %s (IP %s), created tombstone for sync propagation", name, foundIP)
+	if isMove {
+		log.Printf("Move: stopping local %s (IP %s); new owner already recorded", name, foundIP)
+	} else {
+		log.Printf("Deleted workload %s (IP %s), created tombstone for sync propagation", name, foundIP)
+	}
 
 	// Remove if we're running it
 	if found.Owner == a.hwid {
@@ -981,7 +995,9 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 
 	a.updateHosts()
 	a.saveState()
-	a.broadcastState()
+	if !isMove {
+		a.broadcastState()
+	}
 
 	w.WriteHeader(204)
 }
@@ -1097,11 +1113,13 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		a.state.Workloads[found.IP] = &localWl
 		a.stateMu.Unlock()
 
-		// Now that we're serving, ask the source to drop its copy.
-		// If this fails, both nodes briefly run the workload; sync's
-		// "highest version wins" cleans up at the next gossip tick.
+		// Now that we're serving, ask the source to drop its copy. The
+		// ?move=true flag tells the source not to create a tombstone -
+		// a tombstone here would race the workload entry we just wrote
+		// (and win, because it'd be stamped slightly later), undoing
+		// the move on the next sync round.
 		if currentOwner != nil && currentOwner.Healthy {
-			deleteURL := a.getPeerAPIURL(currentOwner, "/api/workloads/"+name)
+			deleteURL := a.getPeerAPIURL(currentOwner, "/api/workloads/"+name+"?move=true")
 			delReq, _ := a.peerRequest("DELETE", deleteURL, nil)
 			delResp, err := httpClient.Do(delReq)
 			if err != nil {
@@ -1148,8 +1166,10 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		if found.Owner == a.hwid {
 			a.removeWorkload(found)
 		} else if currentOwner != nil && currentOwner.Healthy {
-			// Proxy delete to current owner
-			deleteURL := a.getPeerAPIURL(currentOwner, "/api/workloads/"+name)
+			// Proxy delete to current owner. ?move=true suppresses the
+			// tombstone that DELETE normally creates - see apiDeleteWorkload
+			// for the race this prevents.
+			deleteURL := a.getPeerAPIURL(currentOwner, "/api/workloads/"+name+"?move=true")
 			delReq, _ := a.peerRequest("DELETE", deleteURL, nil)
 			delResp, err := httpClient.Do(delReq)
 			if err != nil {
