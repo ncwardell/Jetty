@@ -94,9 +94,12 @@ func (a *Agent) checkPeers() {
 	results := make([]peerResult, 0, len(peers))
 
 	for _, peer := range peers {
-		// Use ?node=local to get only the peer's local health, avoiding recursive peer queries
+		// Use ?node=local to get only the peer's local health, avoiding recursive peer queries.
+		// peerClient (5s) instead of httpClient (30s) so a stale TCP connection
+		// from before a network blip costs at most one tick to expire instead of
+		// blocking checkPeers for half a minute.
 		url := fmt.Sprintf("http://%s:%d/api/health?node=local", peer.ip, a.apiPort)
-		resp, err := httpClient.Get(url)
+		resp, err := peerClient.Get(url)
 
 		result := peerResult{id: peer.id, healthy: false}
 		if err == nil {

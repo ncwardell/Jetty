@@ -115,6 +115,15 @@ func (a *Agent) ipMonitorLoop() {
 			a.ip = newIP
 			log.Printf("WARP IP changed: %s -> %s", oldIP, newIP)
 
+			// Drop any pooled HTTP connections - they were established
+			// over the previous WARP socket and the peer-side endpoint
+			// is now unreachable through them. Without this, the next
+			// checkPeers / syncWorkloads round hangs against a stale
+			// keepalive until the timeout fires.
+			httpClient.CloseIdleConnections()
+			peerClient.CloseIdleConnections()
+			unhealthyPeerClient.CloseIdleConnections()
+
 			// Notify memberlist of IP change (if using memberlist)
 			a.updateMemberlistIP(newIP)
 

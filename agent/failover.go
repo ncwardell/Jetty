@@ -3,10 +3,49 @@ package agent
 import (
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
 )
+
+// hasInternetWitness returns true if this node can reach the public
+// internet. Used by checkFailover as a partition-detection guard:
+// before claiming a workload because the peer "looks dead," we need
+// to confirm that we're not the side that's actually offline. With
+// only two nodes there's no quorum, so an external witness is the
+// best we can do.
+//
+// Probes in order:
+//  1. The cluster's tunnel domain (https). A success here proves at
+//     least one cloudflared connector is reachable - and Cloudflare's
+//     edge confirms general internet connectivity at the same time.
+//  2. TCP 1.1.1.1:443. Generic always-on endpoint; only used when
+//     the cluster has no tunnel configured.
+//
+// Hard-capped at ~1.5s total so the failover scan still feels snappy.
+func (a *Agent) hasInternetWitness() bool {
+	if a.tunnelDomain != "" {
+		url := fmt.Sprintf("https://%s/api/health?node=local", a.tunnelDomain)
+		req, err := http.NewRequest("GET", url, nil)
+		if err == nil {
+			resp, err := unhealthyPeerClient.Do(req)
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode < 500 {
+					return true
+				}
+			}
+		}
+	}
+	conn, err := net.DialTimeout("tcp", "1.1.1.1:443", 1500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
 
 // =============================================================================
 // Failover
@@ -36,6 +75,13 @@ func (a *Agent) checkFailover() {
 		}
 	}
 	a.failoverInProgressMu.Unlock()
+
+	// Witness probe before taking the state lock - if we have no
+	// public-internet connectivity, we're almost certainly the
+	// partitioned side and the "dead" peer is still serving traffic
+	// just fine. Done outside the lock so the network call doesn't
+	// block other state operations.
+	hasWitness := a.hasInternetWitness()
 
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
@@ -75,14 +121,51 @@ func (a *Agent) checkFailover() {
 		}
 
 		if ownerHealthy {
-			continue // Owner is alive
+			// Owner recovered (or never actually went away). Clear any
+			// pending unhealthy timer so a future blip starts a fresh
+			// grace window.
+			a.peerUnhealthySinceMu.Lock()
+			delete(a.peerUnhealthySince, wl.Owner)
+			a.peerUnhealthySinceMu.Unlock()
+			continue
 		}
 
-		// Owner is dead. Before electing, check whether *any* node in the
-		// cluster can run this workload. If not, the workload is marooned -
-		// usually because its arch-specific compose file matches no live
-		// node. Surface a periodic warning so the user knows their
-		// arm64-only workload is sitting orphaned with the arm64 node down.
+		// Owner appears dead. Apply a debounce: don't claim until the
+		// peer has been unreachable for at least FailoverGracePeriod.
+		// Memberlist marks a node "left" on a single missed heartbeat,
+		// which a 5-second WiFi blip or laptop suspend can trigger;
+		// without this gate we end up with split-brain ownership the
+		// moment the network recovers and both sides claim.
+		a.peerUnhealthySinceMu.Lock()
+		firstSeen, exists := a.peerUnhealthySince[wl.Owner]
+		if !exists {
+			a.peerUnhealthySince[wl.Owner] = time.Now()
+			a.peerUnhealthySinceMu.Unlock()
+			continue
+		}
+		elapsed := time.Since(firstSeen)
+		a.peerUnhealthySinceMu.Unlock()
+		if elapsed < FailoverGracePeriod {
+			continue
+		}
+
+		// Witness check: if we couldn't reach the public internet at
+		// the start of this scan, refuse to claim. With only two nodes
+		// there's no quorum, so this is our only defense against
+		// split-brain when WE are the partitioned side - claiming
+		// would just duplicate the workload while the peer keeps
+		// serving traffic perfectly fine.
+		if !hasWitness {
+			a.warnPartitioned(wl)
+			continue
+		}
+
+		// Owner has been unreachable for the full grace window. Before
+		// electing, check whether *any* node in the cluster can run this
+		// workload. If not, the workload is marooned - usually because
+		// its arch-specific compose file matches no live node. Surface a
+		// periodic warning so the user knows their arm64-only workload
+		// is sitting orphaned with the arm64 node down.
 		if !a.anyNodeCanRun(wl) {
 			a.warnMarooned(wl)
 			continue
@@ -194,6 +277,22 @@ func (a *Agent) warnMarooned(wl *Workload) {
 	}
 	log.Printf("Workload %s (%s) is MAROONED: owner is dead and no other node is compatible (%s)",
 		wl.Name, wl.IP, strings.Join(reasons, ", "))
+}
+
+// warnPartitioned logs a "we appear to be partitioned" warning,
+// rate-limited per workload so the failover loop doesn't spam during
+// an outage. Reuses the marooned-log map since both are per-workload
+// suppress-spam log throttles - they don't overlap (a workload is
+// either MAROONED or its peer-owner is just unreachable from us).
+func (a *Agent) warnPartitioned(wl *Workload) {
+	a.maroonedLoggedMu.Lock()
+	defer a.maroonedLoggedMu.Unlock()
+	if last, ok := a.maroonedLogged[wl.IP]; ok && time.Since(last) < 10*time.Minute {
+		return
+	}
+	a.maroonedLogged[wl.IP] = time.Now()
+	log.Printf("Failover: refusing to claim %s (owned by %s) - this node has no public-internet connectivity, so we may be the partitioned side. Will retry when connectivity returns.",
+		wl.Name, shortID(wl.Owner, 12))
 }
 
 // shouldClaim determines if this node should claim an orphaned workload.

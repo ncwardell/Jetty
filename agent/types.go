@@ -25,6 +25,7 @@ const (
 	HealthTimeout         = 15 * time.Second // Hard timeout for HTTP-gossip mode (memberlist usually fires sub-second)
 	GossipInterval        = 5 * time.Second  // How often to check peers and sync state in HTTP-gossip fallback mode
 	FailoverCheckInterval = 5 * time.Second  // How often to scan for orphaned workloads
+	FailoverGracePeriod   = 30 * time.Second // Peer must stay unreachable this long before failover claims its workloads
 	IPMonitorInterval     = 10 * time.Second // How often to check for WARP IP changes
 	CPUSampleInterval     = 30 * time.Second // How often to sample CPU usage
 	TombstoneMaxAge       = 1 * time.Hour    // How long to keep deletion tombstones
@@ -50,11 +51,24 @@ const (
 // HTTP Clients
 // =============================================================================
 
-// Global HTTP clients with different timeouts for different use cases
+// Global HTTP clients with different timeouts for different use cases.
+// All share a transport with a short IdleConnTimeout: after a network
+// event (laptop suspend/resume, WARP reconnect) the kernel can hold an
+// idle connection in the pool that's silently dead. The next request
+// hangs against it for the full client Timeout. Forcing the pool to
+// recycle every few seconds means a stale connection costs at most one
+// round of waiting before a fresh dial happens.
+func newClusterTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.IdleConnTimeout = 5 * time.Second
+	t.MaxIdleConnsPerHost = 4
+	return t
+}
+
 var (
-	httpClient          = &http.Client{Timeout: DefaultHTTPTimeout}   // General requests (30s)
-	peerClient          = &http.Client{Timeout: PeerHTTPTimeout}      // Peer communication (5s)
-	unhealthyPeerClient = &http.Client{Timeout: UnhealthyPeerTimeout} // Known-unhealthy peers (1s)
+	httpClient          = &http.Client{Timeout: DefaultHTTPTimeout, Transport: newClusterTransport()}   // General requests (30s)
+	peerClient          = &http.Client{Timeout: PeerHTTPTimeout, Transport: newClusterTransport()}      // Peer communication (5s)
+	unhealthyPeerClient = &http.Client{Timeout: UnhealthyPeerTimeout, Transport: newClusterTransport()} // Known-unhealthy peers (1s)
 )
 
 // =============================================================================
@@ -314,6 +328,13 @@ type Agent struct {
 	// Failover tracking (prevents duplicate claims during deployment)
 	failoverInProgress   map[string]time.Time // workload IP -> claim start time
 	failoverInProgressMu sync.Mutex
+
+	// peerUnhealthySince records when each peer first appeared
+	// unreachable; used to debounce failover so a brief network blip
+	// (laptop suspend/resume, WiFi handoff) doesn't trigger an
+	// ownership claim. Cleared the moment the peer recovers.
+	peerUnhealthySince   map[string]time.Time
+	peerUnhealthySinceMu sync.Mutex
 
 	// hostsBlockHash is the SHA-256 of the JETTY-managed block we last wrote
 	// to /etc/hosts. updateHosts skips the write when the block hasn't changed,
