@@ -340,6 +340,15 @@ func (a *Agent) Stop() {
 
 	// Clean up network resources
 	a.cleanupNetwork()
+
+	// Tell Cloudflare we're going away so they don't keep this device
+	// in the team's connector registry. Skipped when WARP was
+	// preexisting (operator owns it; not ours to deregister) or when
+	// the container is killed without graceful shutdown (force-rm
+	// bypasses Stop entirely).
+	if !a.warpPreexisting {
+		a.deregisterWarp()
+	}
 }
 
 // gracefulDrain announces our departure to peers immediately so they can
