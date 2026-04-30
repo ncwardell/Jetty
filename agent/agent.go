@@ -46,6 +46,7 @@ func New() (*Agent, error) {
 		workloadRoutes:     make(map[string]string),
 		ipipWarnedPeers:    make(map[string]bool),
 		failoverInProgress: make(map[string]time.Time),
+		peerUnhealthySince: make(map[string]time.Time),
 		maroonedLogged:     make(map[string]time.Time),
 		state: &State{
 			Peers:            make(map[string]*Peer),

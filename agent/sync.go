@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 )
 
 // validIngestedWorkload checks that a workload received from a peer has a
@@ -376,11 +377,19 @@ func (a *Agent) syncWorkloads() {
 		return
 	}
 
-	// Direct mode: sync with each peer via mesh IP
+	// Direct mode: sync with each peer via mesh IP.
+	//
+	// Attempt every peer regardless of cached p.Healthy. A stale
+	// "unhealthy" flag (from a transient network blip that never got
+	// updated) used to skip sync, leaving split-brain ownership stuck
+	// because the lower-version owner never saw the higher-version
+	// peer state. Treat the sync request itself as the live health
+	// probe: success flips the peer to healthy and bumps LastSeen,
+	// failure leaves the existing state alone for checkPeers to retry.
 	a.stateMu.RLock()
 	peers := make([]*Peer, 0)
 	for _, p := range a.state.Peers {
-		if p.Healthy {
+		if p.IP != "" {
 			peers = append(peers, p)
 		}
 	}
@@ -388,6 +397,7 @@ func (a *Agent) syncWorkloads() {
 
 	var allLostOwnership []*Workload
 	var anyEnvUpdated bool
+	var recoveredPeers []string
 
 	for _, peer := range peers {
 		url := fmt.Sprintf("http://%s:%d/api/sync", peer.IP, a.apiPort)
@@ -395,10 +405,13 @@ func (a *Agent) syncWorkloads() {
 		if err != nil {
 			continue
 		}
-		resp, err := httpClient.Do(req)
+		resp, err := peerClient.Do(req)
 		if err != nil {
 			continue
 		}
+
+		// Sync call succeeded - peer is reachable right now.
+		recoveredPeers = append(recoveredPeers, peer.ID)
 
 		func() {
 			defer resp.Body.Close()
@@ -422,6 +435,29 @@ func (a *Agent) syncWorkloads() {
 	for _, wl := range allLostOwnership {
 		log.Printf("Stopping local workload %s - ownership transferred", wl.Name)
 		a.removeWorkload(wl)
+	}
+
+	// Reflect live reachability into the cached peer state. Without
+	// this, a peer that was marked unhealthy by a stale network blip
+	// stays unhealthy in state.json (and in the dashboard) until the
+	// next checkPeers tick happens to land on a fresh connection.
+	if len(recoveredPeers) > 0 {
+		now := time.Now()
+		a.stateMu.Lock()
+		for _, id := range recoveredPeers {
+			if peer := a.state.Peers[id]; peer != nil {
+				peer.Healthy = true
+				peer.LastSeen = now
+			}
+		}
+		a.stateMu.Unlock()
+		// Drop any pending failover-grace timer for these peers; they
+		// just answered an HTTP request, they're clearly alive.
+		a.peerUnhealthySinceMu.Lock()
+		for _, id := range recoveredPeers {
+			delete(a.peerUnhealthySince, id)
+		}
+		a.peerUnhealthySinceMu.Unlock()
 	}
 
 	if anyEnvUpdated {
