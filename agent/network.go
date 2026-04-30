@@ -116,14 +116,29 @@ func (a *Agent) initNetwork() error {
 	// simplicity in a mesh.
 	a.applyMeshIptablesRules(true /* verbose */)
 
-	// Check which tunnel mode is available for cross-node routing
-	// Try IPIP first (most efficient), then GRE as fallback
-	a.tunnelMode = a.detectTunnelMode()
+	// Check which tunnel mode is available for cross-node routing.
+	// Try IPIP first (most efficient), then GRE as fallback. Operators
+	// can override with JETTY_TUNNEL_MODE - some carriers (notably the
+	// Cloudflare WARP Connector) silently drop non-TCP/UDP traffic, so
+	// even when the kernel can create an IPIP interface the packets
+	// never reach the peer. Setting JETTY_TUNNEL_MODE=userspace forces
+	// every cross-node /32 route through jetty_tun (UDP-encapsulated
+	// over the WS tunnel).
+	switch strings.ToLower(getEnv("JETTY_TUNNEL_MODE", "")) {
+	case "userspace", "none":
+		a.tunnelMode = ""
+		log.Printf("Tunnel mode forced to userspace (JETTY_TUNNEL_MODE=userspace)")
+	case "ipip":
+		a.tunnelMode = "ipip"
+		log.Printf("Tunnel mode forced to IPIP (JETTY_TUNNEL_MODE=ipip)")
+	case "gre":
+		a.tunnelMode = "gre"
+		log.Printf("Tunnel mode forced to GRE (JETTY_TUNNEL_MODE=gre)")
+	default:
+		a.tunnelMode = a.detectTunnelMode()
+	}
 	if a.tunnelMode == "" {
-		log.Printf("!!! WARNING: IPIP/GRE tunnels not available - falling back to userspace tunnel.    !!!")
-		log.Printf("!!! The userspace tunnel hand-rolls TCP/UDP/ICMP responses and is not a real TCP   !!!")
-		log.Printf("!!! stack. Long-running connections may hang under loss; large transfers may stall !!!")
-		log.Printf("!!! under load. Load the 'ipip' kernel module if at all possible.                  !!!")
+		log.Printf("Cross-node workload traffic will use userspace tunnel (jetty_tun)")
 	}
 
 	// ALWAYS start userspace tunnel listener - even if we have IPIP for sending,
