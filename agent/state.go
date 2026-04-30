@@ -20,7 +20,12 @@ func (a *Agent) saveState() {
 	data, _ := json.MarshalIndent(a.state, "", "  ")
 	a.stateMu.RUnlock()
 
-	// Atomic write: write to temp file then rename
+	// Serialize concurrent writers. Two goroutines both calling
+	// os.WriteFile on the same tempPath would interleave their bytes
+	// in the kernel and the rename could publish a corrupted file.
+	a.saveMu.Lock()
+	defer a.saveMu.Unlock()
+
 	statePath := filepath.Join(a.dataDir, "state.json")
 	tempPath := statePath + ".tmp"
 

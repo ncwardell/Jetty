@@ -268,6 +268,11 @@ type Agent struct {
 	// State
 	state   *State
 	stateMu sync.RWMutex
+	// saveMu serializes saveState's write+rename. Without it,
+	// concurrent goroutines call os.WriteFile on the same temp path
+	// and their writes interleave at the kernel level, producing a
+	// corrupted state.json.tmp that may then be renamed into place.
+	saveMu sync.Mutex
 
 	// Paths
 	composeDir string

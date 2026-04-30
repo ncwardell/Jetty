@@ -145,7 +145,7 @@ func (d *jettyDelegate) MergeRemoteState(buf []byte, join bool) {
 		d.agent.removeWorkload(wl)
 	}
 
-	if result.EnvUpdated || len(result.LostOwnership) > 0 {
+	if result.Changed {
 		d.agent.saveState()
 	}
 
@@ -388,14 +388,15 @@ func (a *Agent) handleBroadcast(msg *BroadcastMessage) {
 
 	case "env_update":
 		var update struct {
-			Key   string `json:"key"`
-			Value string `json:"value"`
+			Key     string `json:"key"`
+			Value   string `json:"value"`
+			Version int64  `json:"version,omitempty"`
 		}
 		if err := json.Unmarshal(msg.Payload, &update); err != nil {
 			log.Printf("Memberlist: failed to unmarshal env update: %v", err)
 			return
 		}
-		a.handleEnvUpdate(update.Key, update.Value)
+		a.handleEnvUpdate(update.Key, update.Value, update.Version)
 
 	case "env_delete":
 		var dek DeletedEnvKey
@@ -533,8 +534,15 @@ func (a *Agent) handleWorkloadDelete(dw *DeletedWorkload) {
 	}
 }
 
-// handleEnvUpdate processes an env update broadcast
-func (a *Agent) handleEnvUpdate(key, value string) {
+// handleEnvUpdate processes an env update broadcast.
+//
+// version is the originator's wall-clock at apiSetEnv time. We use it
+// to decide whether our local tombstone (if any) is fresher than this
+// update. Peers running pre-versioned builds send version=0; for those
+// we keep the old "drop if tombstone present" behavior so a stale
+// re-broadcast can't resurrect a value that another node legitimately
+// just deleted.
+func (a *Agent) handleEnvUpdate(key, value string, version int64) {
 	if !ValidateEnvKey(key) {
 		return
 	}
@@ -542,8 +550,19 @@ func (a *Agent) handleEnvUpdate(key, value string) {
 	a.stateMu.Lock()
 	changed := false
 	if tombstone := a.state.DeletedEnvKeys[key]; tombstone != nil {
-		a.stateMu.Unlock()
-		return
+		// Old peers don't send a version - fall back to the conservative
+		// path: tombstone wins, drop the update. /api/sync's merge logic
+		// will heal within 30s using value-with-no-tombstone signaling.
+		if version == 0 || version <= tombstone.Version {
+			a.stateMu.Unlock()
+			return
+		}
+		// Our tombstone is older than the originator's set - retire it.
+		// This is the broadcast-side analog of the merge fix in
+		// mergeWorkloadState; it lets the common delete-then-re-set
+		// pattern converge without waiting for the next sync round.
+		delete(a.state.DeletedEnvKeys, key)
+		changed = true
 	}
 	if a.state.EnvData[key] != value {
 		a.state.EnvData[key] = value
@@ -724,13 +743,20 @@ func (a *Agent) broadcastWorkloadDelete(dw *DeletedWorkload) {
 	a.mlDelegate.broadcasts.QueueBroadcast(&simpleBroadcast{msg: data})
 }
 
-// broadcastEnvUpdate broadcasts an env var change to all nodes
-func (a *Agent) broadcastEnvUpdate(key, value string) {
+// broadcastEnvUpdate broadcasts an env var change to all nodes.
+// version should be the originator's wall-clock (UnixNano) at the
+// moment apiSetEnv accepted the change - receivers compare it against
+// their local tombstone to decide whether to retire it.
+func (a *Agent) broadcastEnvUpdate(key, value string, version int64) {
 	if a.mlDelegate == nil {
 		return
 	}
 
-	payload, err := json.Marshal(map[string]string{"key": key, "value": value})
+	payload, err := json.Marshal(struct {
+		Key     string `json:"key"`
+		Value   string `json:"value"`
+		Version int64  `json:"version,omitempty"`
+	}{Key: key, Value: value, Version: version})
 	if err != nil {
 		log.Printf("Warning: failed to marshal env update for broadcast: %v", err)
 		return

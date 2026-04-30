@@ -88,7 +88,14 @@ func validIngestedPeer(p *Peer) bool {
 // MergeResult contains the results of merging sync data
 type MergeResult struct {
 	LostOwnership []*Workload // Workloads we lost ownership of
-	EnvUpdated    bool        // Whether env data was updated
+	EnvUpdated    bool        // Whether env data or env tombstones were modified
+	// Changed is true if ANY local mutation happened during the merge
+	// (new tombstones, adopted workloads, retired tombstones, env
+	// updates, ownership transfer). Callers that need to persist must
+	// check Changed, not just EnvUpdated/LostOwnership - otherwise
+	// adopting a peer's new tombstone or workload silently fails to
+	// persist and is lost on restart until the next /api/sync round.
+	Changed bool
 }
 
 // mergeWorkloadState merges incoming sync data with local state.
@@ -107,6 +114,7 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 		existingTombstone := a.state.DeletedWorkloads[dw.IP]
 		if existingTombstone == nil || dw.Version > existingTombstone.Version {
 			a.state.DeletedWorkloads[dw.IP] = dw
+			result.Changed = true
 		}
 		// Check if we have a local workload that should be deleted
 		existing := a.state.Workloads[dw.IP]
@@ -117,6 +125,7 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 				result.LostOwnership = append(result.LostOwnership, existing)
 			}
 			delete(a.state.Workloads, dw.IP)
+			result.Changed = true
 		}
 	}
 
@@ -139,6 +148,7 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 				result.LostOwnership = append(result.LostOwnership, existing)
 			}
 			a.state.Workloads[w.IP] = w
+			result.Changed = true
 			// Clear any older tombstone since we're accepting a newer workload
 			if tombstone != nil {
 				delete(a.state.DeletedWorkloads, w.IP)
@@ -154,6 +164,7 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 		existingTombstone := a.state.DeletedEnvKeys[dek.Key]
 		if existingTombstone == nil || dek.Version > existingTombstone.Version {
 			a.state.DeletedEnvKeys[dek.Key] = dek
+			result.Changed = true
 		}
 		if _, exists := a.state.EnvData[dek.Key]; exists {
 			log.Printf("Sync: removing env key %s - deleted by peer", dek.Key)
@@ -199,6 +210,11 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 		}
 	}
 
+	// EnvUpdated and LostOwnership both imply Changed; mirror the flag
+	// so callers can rely on Changed alone.
+	if result.EnvUpdated || len(result.LostOwnership) > 0 {
+		result.Changed = true
+	}
 	return result
 }
 
