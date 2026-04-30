@@ -4264,12 +4264,21 @@
             });
         }
 
-        function openHostTerminal(nodeName) {
+        function openHostTerminal(nodeName, nodeId) {
+            // If nodeId is set and isn't the dashboard's host node, the
+            // local agent will proxy our WS to that peer's host shell
+            // (see proxyHostShell on the agent side). Auth is the same
+            // AdminKey the proxy already uses cluster-wide.
+            const localID = (state.node && state.node.id) || '';
+            const remote = nodeId && nodeId !== localID;
+            const query = remote
+                ? `node=${encodeURIComponent(nodeId)}&shell=/bin/bash`
+                : 'shell=/bin/bash';
             launchTerminal({
                 title: `host: ${nodeName || (state.node && state.node.name) || 'this node'}`,
-                subtitle: `/bin/bash`,
+                subtitle: remote ? `/bin/bash (proxied via ${state.node?.name || 'this node'})` : `/bin/bash`,
                 wsPath: `/api/host/shell`,
-                wsQuery: 'shell=/bin/bash',
+                wsQuery: query,
             });
         }
 
@@ -5152,9 +5161,7 @@
                             </svg>
                             Update Node
                         </button>
-                        ${isCurrentNode ? `
-                        <button class="btn" onclick='openHostTerminal(${JSON.stringify(nodeName)})' title="Requires JETTY_HOST_SHELL=true on the agent">Host Shell</button>
-                        ` : ''}
+                        <button class="btn" onclick='openHostTerminal(${JSON.stringify(nodeName)}, ${JSON.stringify(nodeHealth.id)})' title="Requires JETTY_HOST_SHELL=true on the target node${isCurrentNode ? '' : '. Proxied through this dashboard\'s node.'}">Host Shell</button>
                         ${!isCurrentNode ? `
                         <button class="btn btn-danger" onclick="deleteNode('${nodeId}'); closeNodeDetailPanel();">Remove Node</button>
                         ` : ''}
