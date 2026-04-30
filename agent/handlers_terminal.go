@@ -4,8 +4,10 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -303,6 +305,17 @@ func (a *Agent) apiHostShell(w http.ResponseWriter, r *http.Request) {
 	if !a.authorizeTerminalRequest(w, r) {
 		return
 	}
+
+	// Cross-node proxy: ?node=<id> targets that peer's host shell. The
+	// dashboard always serves WS from whichever agent is hosting it, so
+	// without this proxy the "Host Shell" button on a remote node has
+	// nowhere to connect. AdminKey is gossiped cluster-wide so we
+	// authenticate to the peer with our own AdminKey.
+	if nodeID := r.URL.Query().Get("node"); nodeID != "" && nodeID != a.hwid {
+		a.proxyHostShell(w, r, nodeID)
+		return
+	}
+
 	if !a.hostShellEnabled {
 		http.Error(w, "host shell disabled - set JETTY_HOST_SHELL=true on the agent to enable", http.StatusForbidden)
 		return
@@ -375,4 +388,104 @@ func hostNamespacesAvailable() bool {
 		return false
 	}
 	return ourMnt != pid1Mnt
+}
+
+// proxyHostShell bridges a browser's WebSocket to a peer's
+// /api/host/shell endpoint. Used when the dashboard is loaded on node X
+// but the operator wants a shell on node Y. We dial Y first - if Y
+// rejects (e.g. JETTY_HOST_SHELL=false on Y), we forward the HTTP
+// status to the browser BEFORE upgrading, so the user gets a clean
+// error instead of a silent disconnect.
+func (a *Agent) proxyHostShell(w http.ResponseWriter, r *http.Request, nodeID string) {
+	a.stateMu.RLock()
+	peer := a.state.Peers[nodeID]
+	admin := a.state.AdminKey
+	a.stateMu.RUnlock()
+
+	if peer == nil || peer.IP == "" {
+		http.Error(w, fmt.Sprintf("peer %s not found or has no WARP IP", nodeID), http.StatusBadGateway)
+		return
+	}
+	if admin == "" {
+		// authorizeTerminalRequest already enforces this for the local
+		// path, but we re-check here because the proxy uses AdminKey to
+		// authenticate to the peer.
+		http.Error(w, "admin key not configured", http.StatusUnauthorized)
+		return
+	}
+
+	// Build the peer URL. Drop ?node= so the peer doesn't try to
+	// proxy onward; preserve ?shell= so the user's choice carries.
+	target := url.URL{
+		Scheme: "ws",
+		Host:   fmt.Sprintf("%s:%d", peer.IP, a.apiPort),
+		Path:   "/api/host/shell",
+	}
+	q := target.Query()
+	if shell := r.URL.Query().Get("shell"); shell != "" {
+		q.Set("shell", shell)
+	}
+	q.Set("api_key", admin)
+	target.RawQuery = q.Encode()
+
+	peerConn, resp, err := websocket.DefaultDialer.Dial(target.String(), nil)
+	if err != nil {
+		if resp != nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			http.Error(w,
+				fmt.Sprintf("peer %s rejected shell (HTTP %d): %s",
+					peer.Name, resp.StatusCode, strings.TrimSpace(string(body))),
+				http.StatusBadGateway)
+		} else {
+			http.Error(w, fmt.Sprintf("dial peer host shell: %v", err), http.StatusBadGateway)
+		}
+		return
+	}
+	defer peerConn.Close()
+
+	clientConn, err := termWSUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Host shell proxy: WS upgrade failed: %v", err)
+		return
+	}
+	defer clientConn.Close()
+
+	log.Printf("Host shell proxy: %s -> peer %s (%s)", r.RemoteAddr, peer.Name, shortID(nodeID, 12))
+	bridgeWebSockets(clientConn, peerConn)
+}
+
+// bridgeWebSockets shuffles messages between two WebSockets until either
+// side closes. Forwards message types (binary/text/control) verbatim so
+// the terminal frame protocol passes through unchanged.
+//
+// The two ReadMessage loops can race against each other on the writes;
+// gorilla/websocket's NextWriter is not safe for concurrent use, but
+// each goroutine writes to a different connection so this is fine.
+func bridgeWebSockets(a, b *websocket.Conn) {
+	done := make(chan struct{}, 2)
+
+	pump := func(src, dst *websocket.Conn) {
+		defer func() { done <- struct{}{} }()
+		for {
+			msgType, data, err := src.ReadMessage()
+			if err != nil {
+				return
+			}
+			if err := dst.WriteMessage(msgType, data); err != nil {
+				return
+			}
+		}
+	}
+
+	go pump(a, b)
+	go pump(b, a)
+
+	<-done
+	// Closing both connections wakes the still-blocked pump's
+	// ReadMessage so the second goroutine exits and the deferred
+	// closes (clientConn/peerConn) run cleanly.
+	a.Close()
+	b.Close()
+	<-done
 }
