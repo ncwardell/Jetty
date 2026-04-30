@@ -405,24 +405,56 @@ func (a *Agent) setupWorkloadIP(wl *Workload) {
 }
 
 // getWorkloadContainerIP returns the container IP for a workload, or empty string if not found.
+//
+// Multi-container compose (e.g. an app + an init sidecar + a sync sidecar) used
+// to be a coin flip: docker ps returned all of them and we picked whichever
+// happened to be first by creation time. That landed traffic on the sidecar with
+// no listener and produced "connection refused" downstream. Prefer the container
+// that publishes a host port - that's structurally always the "main" service in
+// a Jetty workload (it's how external traffic reaches it). Fall back to first
+// container if no service publishes ports (rare; e.g. a worker-only workload).
 func (a *Agent) getWorkloadContainerIP(name string) string {
-	// Get container ID
-	out, err := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+name).Output()
+	out, err := exec.Command("docker", "ps",
+		"-f", "label=com.docker.compose.project=jetty_"+name,
+		"--format", "{{.ID}}\t{{.Ports}}",
+	).Output()
 	if err != nil || len(out) == 0 {
 		return ""
 	}
 
-	containerID := strings.Split(strings.TrimSpace(string(out)), "\n")[0]
+	var containerID, fallbackID string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) < 1 || parts[0] == "" {
+			continue
+		}
+		id := parts[0]
+		ports := ""
+		if len(parts) == 2 {
+			ports = parts[1]
+		}
+		if fallbackID == "" {
+			fallbackID = id
+		}
+		// "->" indicates a host port publication (e.g. "0.0.0.0:80->80/tcp").
+		// Internal-only EXPOSE doesn't contain "->".
+		if strings.Contains(ports, "->") {
+			containerID = id
+			break
+		}
+	}
+
+	if containerID == "" {
+		containerID = fallbackID
+	}
 	if containerID == "" {
 		return ""
 	}
 
-	// Get container IP
 	out, err = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID).Output()
 	if err != nil {
 		return ""
 	}
-
 	return strings.TrimSpace(string(out))
 }
 
