@@ -2173,6 +2173,9 @@ const docTemplate = `{
                 "tunnel": {
                     "$ref": "#/definitions/agent.TunnelStatus"
                 },
+                "warp": {
+                    "$ref": "#/definitions/agent.WarpStatus"
+                },
                 "workloads": {
                     "type": "array",
                     "items": {
@@ -2200,6 +2203,19 @@ const docTemplate = `{
                 "running": {
                     "type": "boolean",
                     "example": true
+                }
+            }
+        },
+        "agent.WarpStatus": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "example": true
+                },
+                "ip": {
+                    "type": "string",
+                    "example": "100.96.0.20"
                 }
             }
         },
