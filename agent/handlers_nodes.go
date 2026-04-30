@@ -200,16 +200,22 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Proxy request to target node. peerRequest sets X-API-Key
-		// from this node's SelfAPIKey so the receiver authenticates us
-		// as a known peer.
+		// Proxy request to target node. Forward the cluster AdminKey -
+		// the receiver's apiUpdateNode also requires admin auth, and
+		// peerRequest's SelfAPIKey would be rejected there. AdminKey is
+		// gossiped cluster-wide so our local copy matches the peer's.
 		proxyURL := fmt.Sprintf("http://%s:%d/api/nodes/self/update", targetPeer.IP, a.apiPort)
 		reqBody, _ := json.Marshal(req)
-		proxyReq, err := a.peerRequest("POST", proxyURL, strings.NewReader(string(reqBody)))
+		proxyReq, err := http.NewRequest("POST", proxyURL, strings.NewReader(string(reqBody)))
 		if err != nil {
 			http.Error(w, fmt.Sprintf("build proxy request: %v", err), 500)
 			return
 		}
+		a.stateMu.RLock()
+		adminKey := a.state.AdminKey
+		a.stateMu.RUnlock()
+		proxyReq.Header.Set("X-API-Key", adminKey)
+		proxyReq.Header.Set("Content-Type", "application/json")
 
 		resp, err := peerClient.Do(proxyReq)
 		if err != nil {
