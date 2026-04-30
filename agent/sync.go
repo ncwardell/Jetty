@@ -162,15 +162,36 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 		}
 	}
 
-	// Merge env data from peer (only if not tombstoned)
+	// Merge env data from peer.
+	//
+	// Subtle: an authoritative peer that has env_data[k] AND does NOT
+	// have a tombstone for k is telling us "this key is alive". If we
+	// still have a local tombstone, ours is stale (e.g. an out-of-order
+	// memberlist broadcast left us with the tombstone after the
+	// originator already retired it). Trust peer's view, clear our
+	// tombstone, accept the value. Without this, a delete-then-re-set
+	// race silently re-deletes the value.
+	peerTombstoned := make(map[string]bool, len(syncResp.DeletedEnvKeys))
+	for _, dek := range syncResp.DeletedEnvKeys {
+		if dek != nil {
+			peerTombstoned[dek.Key] = true
+		}
+	}
 	for k, v := range syncResp.EnvData {
 		if !ValidateEnvKey(k) {
 			log.Printf("Sync: rejecting env key with invalid name %q", k)
 			continue
 		}
-		tombstone := a.state.DeletedEnvKeys[k]
-		if tombstone != nil {
-			continue
+		if tombstone := a.state.DeletedEnvKeys[k]; tombstone != nil {
+			if peerTombstoned[k] {
+				// Peer has both the value and a tombstone for it -
+				// shouldn't happen in well-formed state, but be safe
+				// and trust the tombstone.
+				continue
+			}
+			// Peer has the value, no tombstone - retire ours.
+			delete(a.state.DeletedEnvKeys, k)
+			result.EnvUpdated = true
 		}
 		if a.state.EnvData[k] != v {
 			a.state.EnvData[k] = v
@@ -236,15 +257,26 @@ func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) {
 		}
 	}
 
-	// Merge env data from peer (only if not tombstoned)
+	// Merge env data from peer. Same stale-tombstone retirement as
+	// mergeWorkloadState: if peer has the value AND no tombstone for
+	// it, peer is authoritative; clear our local tombstone instead of
+	// letting it silently re-delete the value.
+	peerTombstoned := make(map[string]bool, len(syncResp.DeletedEnvKeys))
+	for _, dek := range syncResp.DeletedEnvKeys {
+		if dek != nil {
+			peerTombstoned[dek.Key] = true
+		}
+	}
 	for k, v := range syncResp.EnvData {
 		if !ValidateEnvKey(k) {
 			log.Printf("Startup sync: rejecting env key with invalid name %q", k)
 			continue
 		}
-		tombstone := a.state.DeletedEnvKeys[k]
-		if tombstone != nil {
-			continue
+		if a.state.DeletedEnvKeys[k] != nil {
+			if peerTombstoned[k] {
+				continue
+			}
+			delete(a.state.DeletedEnvKeys, k)
 		}
 		a.state.EnvData[k] = v
 	}
