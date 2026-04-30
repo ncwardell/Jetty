@@ -158,8 +158,22 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Fetch health from peer
-			resp, err := client.Get(url)
+			// Fetch health from peer. Use peerRequest so we authenticate
+			// with our SelfAPIKey - without it, the receiving node's
+			// /api/health returns only {status,version} (the M4
+			// auth-gated minimal response) and we lose status, system
+			// metrics, public_ip, workloads list, etc.
+			req, err := a.peerRequest("GET", url, nil)
+			if err != nil {
+				health.Status = "unreachable"
+				health.Error = err.Error()
+				health.Healthy = false
+				mu.Lock()
+				results = append(results, health)
+				mu.Unlock()
+				return
+			}
+			resp, err := client.Do(req)
 			if err != nil {
 				health.Status = "unreachable"
 				health.Error = err.Error()
