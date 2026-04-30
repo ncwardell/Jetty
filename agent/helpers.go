@@ -32,6 +32,60 @@ var validPeerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 // Valid environment variable key pattern
 var envKeyPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
+// validTagPattern accepts lowercase alphanumerics + dash + underscore
+// (and the colon character so users can do prefix tags like "env:prod"
+// if they want, without us needing a full key=value labels system).
+// Lowercase-only keeps the deterministic-color hash stable across
+// case differences a human typed.
+var validTagPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_:-]{0,62}$`)
+
+// ValidateTag returns true if t is an acceptable tag string.
+func ValidateTag(t string) bool {
+	return validTagPattern.MatchString(t)
+}
+
+// normalizeTags lowercases, trims, validates, dedupes, and sorts a
+// tag slice. Returns the canonical slice and the first invalid tag
+// (empty string if all valid). Used on every ingest path so the wire
+// form is canonical and equality comparisons are trivial.
+func normalizeTags(tags []string) ([]string, string) {
+	if len(tags) == 0 {
+		return nil, ""
+	}
+	seen := make(map[string]bool, len(tags))
+	out := make([]string, 0, len(tags))
+	for _, raw := range tags {
+		t := strings.ToLower(strings.TrimSpace(raw))
+		if t == "" {
+			continue
+		}
+		if !ValidateTag(t) {
+			return nil, raw
+		}
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil, ""
+	}
+	sortStrings(out)
+	return out, ""
+}
+
+// sortStrings is a tiny wrapper around sort.Strings kept here so this
+// file doesn't need a sort import (the file is already a kitchen sink
+// of helpers; the sort dependency is only used by normalizeTags).
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
+}
+
 // ValidateWorkloadName checks if a workload name is valid
 func ValidateWorkloadName(name string) bool {
 	return validNamePattern.MatchString(name)

@@ -67,6 +67,7 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 		Revive       bool              `json:"revive"`
 		Autostart    bool              `json:"autostart"`
 		AllowedNodes []string          `json:"allowed_nodes,omitempty"`
+		Tags         []string          `json:"tags,omitempty"`
 		Owner        map[string]string `json:"owner"`
 		Version      int64             `json:"version"`
 		Status       string            `json:"status"`
@@ -173,6 +174,7 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 			Revive:       info.wl.Revive,
 			Autostart:    info.wl.Autostart,
 			AllowedNodes: info.wl.AllowedNodes,
+			Tags:         info.wl.Tags,
 			Owner:        info.ownerInfo,
 			Version:      info.wl.Version,
 			Status:       statuses[info.wl.Name],

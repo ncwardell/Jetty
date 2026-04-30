@@ -222,6 +222,14 @@ func (a *Agent) runAPI() {
 	// --- Workload CRUD (handlers_workloads.go) -----------------------
 	r.HandleFunc("/api/workloads", a.apiListWorkloads).Methods("GET")
 	r.HandleFunc("/api/workloads", a.apiCreateWorkload).Methods("POST")
+	// /bulk is registered BEFORE the {name} wildcard so a POST to
+	// /api/workloads/bulk doesn't first try to match the unregistered
+	// POST /api/workloads/{name}. (Today this is moot - POST isn't
+	// registered on {name} - but registration order is the safer
+	// invariant if that ever changes.)
+	r.HandleFunc("/api/workloads/bulk", a.apiBulkWorkload).Methods("POST")
+	r.HandleFunc("/api/workloads/export", a.apiExportWorkloads).Methods("GET")
+	r.HandleFunc("/api/workloads/import", a.apiImportWorkloads).Methods("POST")
 	r.HandleFunc("/api/workloads/{name}", a.apiGetWorkload).Methods("GET")
 	r.HandleFunc("/api/workloads/{name}", a.apiUpdateWorkload).Methods("PATCH")
 	r.HandleFunc("/api/workloads/{name}", a.apiDeleteWorkload).Methods("DELETE")

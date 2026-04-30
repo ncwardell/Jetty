@@ -1238,6 +1238,65 @@
             color: white;
         }
 
+        /* Tag chips - small colored badges next to workload names. The
+           color is derived from a hash of the tag string so the same
+           tag is the same color everywhere in the UI without needing
+           to persist any mapping. */
+        .tag-chip {
+            display: inline-block;
+            padding: 1px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 500;
+            line-height: 1.5;
+            margin-right: 4px;
+            margin-bottom: 2px;
+            color: #fff;
+            white-space: nowrap;
+            cursor: pointer;
+            user-select: none;
+        }
+        .tag-chip:hover { opacity: 0.85; }
+        .tag-chip.empty { color: var(--text-secondary); background: transparent; }
+        .tag-chip-x {
+            margin-left: 4px;
+            opacity: 0.7;
+            font-weight: 700;
+        }
+        .tag-chip-x:hover { opacity: 1; }
+
+        .tag-input-wrapper {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            align-items: center;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 6px 8px;
+            background: var(--bg-primary);
+            min-height: 38px;
+        }
+        .tag-input-wrapper input {
+            flex: 1;
+            min-width: 100px;
+            border: none;
+            background: transparent;
+            color: var(--text-primary);
+            outline: none;
+            font-size: 13px;
+        }
+
+        .bulk-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 16px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            margin-bottom: 12px;
+        }
+
         /* Mini Resource Bars */
         .mini-resource-bar {
             height: 4px;
@@ -1898,13 +1957,29 @@
                 <div class="page-header">
                     <h1 class="page-title">Workloads</h1>
                     <div style="display: flex; gap: 12px;">
-                        <button class="btn" onclick="refreshStatus()">
+                        <button class="btn" onclick="refreshStatus()" title="Refresh">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <polyline points="23 4 23 10 17 10"/>
                                 <polyline points="1 20 1 14 7 14"/>
                                 <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
                             </svg>
                             Refresh
+                        </button>
+                        <button class="btn" onclick="exportWorkloads()" title="Download a JSON of selected/filtered workloads">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                <polyline points="7 10 12 15 17 10"/>
+                                <line x1="12" y1="15" x2="12" y2="3"/>
+                            </svg>
+                            Export
+                        </button>
+                        <button class="btn" onclick="openImportModal()" title="Restore workloads from a JSON file">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                <polyline points="17 8 12 3 7 8"/>
+                                <line x1="12" y1="3" x2="12" y2="15"/>
+                            </svg>
+                            Import
                         </button>
                         <button class="btn btn-primary" onclick="openDeployModal()">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1933,6 +2008,11 @@
                                 <button class="filter-pill" data-filter="stopped" onclick="setWorkloadFilter('stopped')">Stopped</button>
                                 <button class="filter-pill" data-filter="remote" onclick="setWorkloadFilter('remote')">Remote</button>
                             </div>
+                            <div>
+                                <select class="form-input" id="tagFilter" style="padding: 6px 10px; font-size: 12px; min-width: 160px;" onchange="setWorkloadTagFilter(this.value)">
+                                    <option value="">All tags</option>
+                                </select>
+                            </div>
                             <div class="quick-stats" id="workloadQuickStats">
                                 <div class="quick-stat">
                                     <span class="quick-stat-dot" style="background: var(--accent-green);"></span>
@@ -1947,12 +2027,25 @@
                     </div>
                 </div>
 
+                <!-- Bulk-action toolbar: shown when a tag filter is active. The
+                     three actions act on every workload matching the current
+                     tag filter; backend handles the proxying for remote workloads. -->
+                <div id="bulkToolbar" class="bulk-toolbar" style="display: none;">
+                    <span id="bulkToolbarSummary" style="font-weight: 500;"></span>
+                    <span style="flex: 1;"></span>
+                    <button class="btn btn-sm btn-success" onclick="bulkAction('start')">Start all</button>
+                    <button class="btn btn-sm" onclick="bulkAction('stop')">Stop all</button>
+                    <button class="btn btn-sm" onclick="bulkAction('restart')">Restart all</button>
+                    <button class="btn btn-sm btn-danger" onclick="bulkAction('delete')">Delete all</button>
+                </div>
+
                 <div class="card">
                     <div class="table-container">
                         <table class="data-table" id="workloadsTable">
                             <thead>
                                 <tr>
                                     <th>Name</th>
+                                    <th>Tags</th>
                                     <th>Status</th>
                                     <th>Service IP</th>
                                     <th>Owner Node</th>
@@ -1962,7 +2055,7 @@
                             </thead>
                             <tbody id="workloadsTableBody">
                                 <tr>
-                                    <td colspan="6" class="empty-state" style="padding: 40px;">
+                                    <td colspan="7" class="empty-state" style="padding: 40px;">
                                         <p>No workloads. Connect to a cluster and deploy your first workload.</p>
                                     </td>
                                 </tr>
@@ -2353,6 +2446,11 @@
                     <div class="form-hint">Comma-separated list of node names/IDs. Leave empty for all nodes.</div>
                 </div>
                 <div class="form-group">
+                    <label class="form-label">Tags (optional)</label>
+                    <input type="text" class="form-input" id="workloadTags" placeholder="prod, media, env:staging">
+                    <div class="form-hint">Comma-separated. Lowercase letters, numbers, dash, underscore, colon. Used for filtering, bulk ops, and export.</div>
+                </div>
+                <div class="form-group">
                     <label class="form-checkbox">
                         <input type="checkbox" id="workloadRevive" checked>
                         <span>Enable auto-failover (revive if owner node dies)</span>
@@ -2435,10 +2533,58 @@
                     <input type="text" class="form-input" id="editWorkloadAllowedNodes" placeholder="node1, node2, node3">
                     <small style="color: var(--text-muted);">Comma-separated list of nodes allowed to run this workload (empty = all)</small>
                 </div>
+                <div class="form-group">
+                    <label class="form-label">Tags</label>
+                    <input type="text" class="form-input" id="editWorkloadTags" placeholder="prod, media, env:staging">
+                    <small style="color: var(--text-muted);">Comma-separated. Lowercase letters/numbers/dash/underscore/colon.</small>
+                </div>
             </div>
             <div class="modal-footer">
                 <button class="btn" onclick="closeEditWorkloadModal()">Cancel</button>
                 <button class="btn btn-primary" onclick="saveWorkloadEdit()">Save Changes</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Import Workloads Modal -->
+    <div class="modal-overlay hidden" id="importModal">
+        <div class="modal" style="max-width: 720px;">
+            <div class="modal-header">
+                <h2 class="modal-title">Import Workloads</h2>
+                <button class="modal-close" onclick="closeImportModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">JSON file (from Export)</label>
+                    <input type="file" id="importFile" accept="application/json,.json" class="form-input" onchange="onImportFilePicked()">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">On name collision</label>
+                    <select class="form-input" id="importMode">
+                        <option value="skip" selected>Skip (default) — leave existing workload alone</option>
+                        <option value="replace">Replace — delete existing, recreate from import</option>
+                        <option value="fail">Fail (atomic) — abort the whole import on any conflict</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-checkbox">
+                        <input type="checkbox" id="importReassignIPs" checked>
+                        <span>Auto-reassign IP on collision</span>
+                    </label>
+                    <small style="color: var(--text-muted);">Workloads are reached by name through the mesh DNS, so reassigning IPs is usually safe and avoids spurious skips.</small>
+                </div>
+                <div id="importPreview" style="display: none;">
+                    <h3 style="margin-top: 16px;">Preview</h3>
+                    <div id="importPreviewBody" style="background: var(--bg-primary); padding: 12px; border-radius: 6px; font-size: 12px; max-height: 200px; overflow-y: auto;"></div>
+                </div>
+                <div id="importReport" style="display: none;">
+                    <h3 style="margin-top: 16px;">Result</h3>
+                    <div id="importReportBody" style="background: var(--bg-primary); padding: 12px; border-radius: 6px; font-size: 12px; max-height: 240px; overflow-y: auto;"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeImportModal()">Close</button>
+                <button class="btn btn-primary" id="importApplyBtn" onclick="applyImport()" disabled>Apply Import</button>
             </div>
         </div>
     </div>
@@ -2974,6 +3120,8 @@
         }
 
         // Filter Functions
+        let workloadTagFilter = '';
+
         function setWorkloadFilter(filter) {
             workloadFilter = filter;
             document.querySelectorAll('#workloadFilters .filter-pill').forEach(pill => {
@@ -2982,34 +3130,209 @@
             filterWorkloads();
         }
 
+        function setWorkloadTagFilter(tag) {
+            workloadTagFilter = tag || '';
+            updateBulkToolbar();
+            filterWorkloads();
+        }
+
+        // Lookup table for which workloads match the current tag filter,
+        // built from the fresh state.workloads list (more reliable than
+        // re-parsing tag chips from rendered HTML).
+        function workloadMatchesTagFilter(name) {
+            if (!workloadTagFilter) return true;
+            const wl = state.workloads.find(w => w.name === name);
+            if (!wl) return false;
+            return (wl.tags || []).includes(workloadTagFilter);
+        }
+
         function filterWorkloads() {
             const searchTerm = document.getElementById('workloadSearch')?.value?.toLowerCase() || '';
             const rows = document.querySelectorAll('#workloadsTableBody tr');
 
-            let runningCount = 0;
-            let stoppedCount = 0;
-
             rows.forEach(row => {
                 if (row.querySelector('.empty-state')) return;
-
+                // Columns: 0=name, 1=tags, 2=status, 3=ip, 4=owner, 5=revive, 6=actions
                 const name = row.cells[0]?.textContent?.toLowerCase() || '';
-                const status = row.cells[1]?.textContent?.toLowerCase() || '';
-                const owner = row.cells[3]?.textContent?.toLowerCase() || '';
-
-                // Count for quick stats
-                if (status.includes('running')) runningCount++;
-                if (status.includes('stopped')) stoppedCount++;
-
-                // Apply filters
+                const status = row.cells[2]?.textContent?.toLowerCase() || '';
+                const owner = row.cells[4]?.textContent?.toLowerCase() || '';
                 const matchesSearch = name.includes(searchTerm) || owner.includes(searchTerm);
                 const matchesFilter = workloadFilter === 'all' || status.includes(workloadFilter);
-
-                row.style.display = (matchesSearch && matchesFilter) ? '' : 'none';
+                const matchesTag = workloadMatchesTagFilter(name.trim());
+                row.style.display = (matchesSearch && matchesFilter && matchesTag) ? '' : 'none';
             });
 
             // Update quick stats
             document.getElementById('qs-running').textContent = state.workloads.filter(w => w.status === 'running').length;
             document.getElementById('qs-stopped').textContent = state.workloads.filter(w => w.status === 'stopped').length;
+        }
+
+        // ---- Tag chips + tag-filter dropdown helpers ----------------------
+
+        // Stable, deterministic color for a tag. Hash → HSL hue. Lightness
+        // and saturation are fixed so the chips look like a coherent set
+        // even when the cluster has dozens of tags.
+        function tagColor(tag) {
+            let h = 0;
+            for (let i = 0; i < tag.length; i++) h = ((h << 5) - h + tag.charCodeAt(i)) | 0;
+            const hue = Math.abs(h) % 360;
+            return `hsl(${hue}, 60%, 45%)`;
+        }
+
+        function renderTagChip(tag) {
+            const safe = escapeHtml(tag);
+            return `<span class="tag-chip" style="background:${tagColor(tag)};" onclick="setWorkloadTagFilter('${safe}'); document.getElementById('tagFilter').value='${safe}';">${safe}</span>`;
+        }
+
+        function refreshTagFilterOptions() {
+            const sel = document.getElementById('tagFilter');
+            if (!sel) return;
+            const allTags = new Set();
+            for (const w of state.workloads) {
+                for (const t of (w.tags || [])) allTags.add(t);
+            }
+            const sorted = Array.from(allTags).sort();
+            const current = workloadTagFilter;
+            sel.innerHTML = `<option value="">All tags</option>` +
+                sorted.map(t => `<option value="${escapeHtml(t)}" ${t === current ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('');
+            updateBulkToolbar();
+        }
+
+        function updateBulkToolbar() {
+            const tb = document.getElementById('bulkToolbar');
+            const summary = document.getElementById('bulkToolbarSummary');
+            if (!tb) return;
+            if (!workloadTagFilter) {
+                tb.style.display = 'none';
+                return;
+            }
+            const matching = state.workloads.filter(w => (w.tags || []).includes(workloadTagFilter));
+            tb.style.display = 'flex';
+            summary.innerHTML = `Bulk action on tag <span class="tag-chip" style="background:${tagColor(workloadTagFilter)};">${escapeHtml(workloadTagFilter)}</span> (${matching.length} workload${matching.length === 1 ? '' : 's'})`;
+        }
+
+        async function bulkAction(action) {
+            if (!workloadTagFilter) return;
+            const matching = state.workloads.filter(w => (w.tags || []).includes(workloadTagFilter));
+            if (matching.length === 0) return;
+            const verb = { start: 'Start', stop: 'Stop', restart: 'Restart', delete: 'Delete' }[action] || action;
+            if (!confirm(`${verb} ${matching.length} workload${matching.length === 1 ? '' : 's'} tagged "${workloadTagFilter}"?`)) return;
+            try {
+                const result = await apiCall('/workloads/bulk', 'POST', { tag: workloadTagFilter, action });
+                let okCount = 0, errCount = 0;
+                for (const r of Object.values(result.results || {})) {
+                    if (r.ok) okCount++; else errCount++;
+                }
+                showToast(`${verb}: ${okCount} ok, ${errCount} error${errCount === 1 ? '' : 's'}`, errCount === 0 ? 'success' : 'error');
+                await refreshStatus();
+            } catch (e) {
+                showToast(`Bulk ${action} failed: ${e.message}`, 'error');
+            }
+        }
+
+        // ---- Export / Import ---------------------------------------------
+
+        async function exportWorkloads() {
+            const params = new URLSearchParams();
+            if (workloadTagFilter) params.set('tag', workloadTagFilter);
+            // We could also support selection, but tag filter is the
+            // primary pivot. For "all" the operator just clears the tag
+            // filter before clicking Export.
+            const url = `${state.apiUrl}/api/workloads/export${params.toString() ? '?' + params.toString() : ''}`;
+            try {
+                const resp = await fetch(url, { headers: { 'X-API-Key': state.secretKey } });
+                if (!resp.ok) throw new Error(await resp.text() || `HTTP ${resp.status}`);
+                const blob = await resp.blob();
+                const dlUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = dlUrl;
+                a.download = `jetty-workloads-${new Date().toISOString().slice(0,10)}.json`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(dlUrl);
+                showToast('Export downloaded', 'success');
+            } catch (e) {
+                showToast(`Export failed: ${e.message}`, 'error');
+            }
+        }
+
+        let pendingImportPayload = null;
+
+        function openImportModal() {
+            pendingImportPayload = null;
+            document.getElementById('importFile').value = '';
+            document.getElementById('importPreview').style.display = 'none';
+            document.getElementById('importReport').style.display = 'none';
+            document.getElementById('importApplyBtn').disabled = true;
+            document.getElementById('importMode').value = 'skip';
+            document.getElementById('importReassignIPs').checked = true;
+            document.getElementById('importModal').classList.remove('hidden');
+        }
+        function closeImportModal() {
+            document.getElementById('importModal').classList.add('hidden');
+        }
+
+        function onImportFilePicked() {
+            const f = document.getElementById('importFile').files[0];
+            if (!f) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                try {
+                    const parsed = JSON.parse(reader.result);
+                    if (!parsed || !Array.isArray(parsed.workloads)) {
+                        throw new Error('not a valid Jetty export (missing workloads array)');
+                    }
+                    pendingImportPayload = parsed;
+                    const preview = document.getElementById('importPreview');
+                    const body = document.getElementById('importPreviewBody');
+                    body.innerHTML = `
+                        <p><strong>${parsed.workloads.length}</strong> workload${parsed.workloads.length === 1 ? '' : 's'} in this export.</p>
+                        <p style="color: var(--text-secondary);">Referenced env keys: ${(parsed.referenced_env_keys || []).map(k => `<code>${escapeHtml(k)}</code>`).join(', ') || '<em>none</em>'}</p>
+                        <ul style="margin-top: 8px; padding-left: 20px;">
+                            ${parsed.workloads.slice(0, 20).map(w => `<li><code>${escapeHtml(w.name)}</code> ${(w.tags || []).map(t => `<span class="tag-chip" style="background:${tagColor(t)};">${escapeHtml(t)}</span>`).join('')}</li>`).join('')}
+                            ${parsed.workloads.length > 20 ? `<li><em>... and ${parsed.workloads.length - 20} more</em></li>` : ''}
+                        </ul>
+                    `;
+                    preview.style.display = 'block';
+                    document.getElementById('importApplyBtn').disabled = false;
+                } catch (e) {
+                    pendingImportPayload = null;
+                    document.getElementById('importApplyBtn').disabled = true;
+                    showToast(`Bad import file: ${e.message}`, 'error');
+                }
+            };
+            reader.readAsText(f);
+        }
+
+        async function applyImport() {
+            if (!pendingImportPayload) return;
+            const mode = document.getElementById('importMode').value;
+            const reassign_ips = document.getElementById('importReassignIPs').checked;
+            try {
+                const report = await apiCall('/workloads/import', 'POST', {
+                    mode, reassign_ips, payload: pendingImportPayload,
+                });
+                const body = document.getElementById('importReportBody');
+                body.innerHTML = `
+                    <p><strong>${report.created || 0}</strong> created, <strong>${report.skipped || 0}</strong> skipped, <strong>${report.errors || 0}</strong> error${report.errors === 1 ? '' : 's'} (mode: ${escapeHtml(report.mode)}).</p>
+                    <ul style="margin-top: 8px; padding-left: 20px;">
+                        ${(report.entries || []).map(e => `
+                            <li>
+                                <code>${escapeHtml(e.name)}</code> &mdash; <strong>${escapeHtml(e.status)}</strong>
+                                ${e.assigned_ip ? `<code>${escapeHtml(e.assigned_ip)}</code>` : ''}
+                                ${e.detail ? `<span style="color: var(--text-secondary);">(${escapeHtml(e.detail)})</span>` : ''}
+                            </li>
+                        `).join('')}
+                    </ul>
+                `;
+                document.getElementById('importReport').style.display = 'block';
+                document.getElementById('importApplyBtn').disabled = true;
+                refreshStatus();
+                showToast(`Import complete (${report.created || 0} created)`, report.errors > 0 ? 'error' : 'success');
+            } catch (e) {
+                showToast(`Import failed: ${e.message}`, 'error');
+            }
         }
 
         function setNodeFilter(filter) {
@@ -3677,11 +4000,12 @@
             if (state.workloads.length === 0) {
                 tbody.innerHTML = `
                     <tr>
-                        <td colspan="6" style="text-align: center; padding: 40px; color: var(--text-secondary);">
+                        <td colspan="7" style="text-align: center; padding: 40px; color: var(--text-secondary);">
                             No workloads. Deploy your first workload to get started.
                         </td>
                     </tr>
                 `;
+                refreshTagFilterOptions();
                 return;
             }
 
@@ -3691,6 +4015,7 @@
                 const ownerName = w.owner?.name || w.owner?.id?.substring(0, 8) || 'Unknown';
                 const isLocal = w.status !== 'remote';
                 const isRunning = w.status === 'running';
+                const tagsHtml = (w.tags || []).map(t => renderTagChip(t)).join('') || '<span class="tag-chip empty">—</span>';
 
                 return `
                     <tr>
@@ -3699,6 +4024,7 @@
                                 ${w.name}
                             </a>
                         </td>
+                        <td>${tagsHtml}</td>
                         <td>
                             <span class="status-badge ${statusClass}">
                                 <span class="status-dot ${statusClass === 'running' ? 'connected' : ''}"></span>
@@ -4292,6 +4618,7 @@
             const meshIp = document.getElementById('workloadMeshIp').value.trim();
             const compose = document.getElementById('workloadCompose').value;
             const allowedNodesStr = document.getElementById('workloadAllowedNodes').value.trim();
+            const tagsStr = document.getElementById('workloadTags').value.trim();
             const revive = document.getElementById('workloadRevive').checked;
             const autostart = document.getElementById('workloadAutostart').checked;
 
@@ -4320,6 +4647,10 @@
                 payload.allowed_nodes = allowedNodesStr.split(',').map(s => s.trim()).filter(Boolean);
             }
 
+            if (tagsStr) {
+                payload.tags = tagsStr.split(',').map(s => s.trim()).filter(Boolean);
+            }
+
             try {
                 await apiCall('/workloads', 'POST', payload);
                 showToast(`Workload "${name}" deployed successfully`, 'success');
@@ -4331,6 +4662,7 @@
                 document.getElementById('workloadMeshIp').value = '';
                 document.getElementById('workloadCompose').value = '';
                 document.getElementById('workloadAllowedNodes').value = '';
+                document.getElementById('workloadTags').value = '';
                 document.getElementById('workloadRevive').checked = true;
                 document.getElementById('workloadAutostart').checked = true;
 
@@ -4464,6 +4796,7 @@
             document.getElementById('editWorkloadRevive').checked = workload.revive || false;
             document.getElementById('editWorkloadAutostart').checked = workload.autostart || false;
             document.getElementById('editWorkloadAllowedNodes').value = (workload.allowed_nodes || []).join(', ');
+            document.getElementById('editWorkloadTags').value = (workload.tags || []).join(', ');
 
             document.getElementById('editWorkloadModal').classList.remove('hidden');
         }
@@ -4484,6 +4817,8 @@
             const newAutostart = document.getElementById('editWorkloadAutostart').checked;
             const allowedNodesStr = document.getElementById('editWorkloadAllowedNodes').value.trim();
             const newAllowedNodes = allowedNodesStr ? allowedNodesStr.split(',').map(s => s.trim()).filter(s => s) : [];
+            const tagsStr = document.getElementById('editWorkloadTags').value.trim();
+            const newTags = tagsStr ? tagsStr.split(',').map(s => s.trim()).filter(s => s) : [];
 
             // Only include changed fields
             if (newIP && newIP !== workload.ip) {
@@ -4499,6 +4834,10 @@
             const currentAllowed = workload.allowed_nodes || [];
             if (JSON.stringify(newAllowedNodes.sort()) !== JSON.stringify([...currentAllowed].sort())) {
                 update.allowed_nodes = newAllowedNodes;
+            }
+            const currentTags = workload.tags || [];
+            if (JSON.stringify([...newTags].sort()) !== JSON.stringify([...currentTags].sort())) {
+                update.tags = newTags;
             }
 
             if (Object.keys(update).length === 0) {
