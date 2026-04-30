@@ -75,6 +75,7 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 		Revive       bool              `json:"revive"`
 		Autostart    bool              `json:"autostart"`
 		AllowedNodes []string          `json:"allowed_nodes,omitempty"`
+		Tags         []string          `json:"tags,omitempty"`
 		Owner        map[string]string `json:"owner"`
 		Version      int64             `json:"version"`
 		Status       string            `json:"status"`
@@ -208,6 +209,7 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 			Revive:       info.wl.Revive,
 			Autostart:    info.wl.Autostart,
 			AllowedNodes: info.wl.AllowedNodes,
+			Tags:         info.wl.Tags,
 			Owner:        info.ownerInfo,
 			Version:      info.wl.Version,
 			Status:       statuses[info.wl.Name],
@@ -253,6 +255,15 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	if !validNamePattern.MatchString(wl.Name) {
 		http.Error(w, "invalid name: must be alphanumeric with dash/underscore only", 400)
 		return
+	}
+
+	// Normalize tags so the wire form is canonical (lower-cased, sorted,
+	// deduped) before we hash/compare anywhere downstream.
+	if normTags, badTag := normalizeTags(wl.Tags); badTag != "" {
+		http.Error(w, fmt.Sprintf("invalid tag %q: must match %s", badTag, validTagPattern.String()), 400)
+		return
+	} else {
+		wl.Tags = normTags
 	}
 
 	// Check if this node is allowed to run this workload
@@ -360,6 +371,7 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		"revive":        wl.Revive,
 		"autostart":     wl.Autostart,
 		"allowed_nodes": wl.AllowedNodes,
+		"tags":          wl.Tags,
 		"owner": map[string]string{
 			"id":   a.hwid,
 			"name": a.hostname,
@@ -428,6 +440,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 				"revive":        found.Revive,
 				"autostart":     found.Autostart,
 				"allowed_nodes": found.AllowedNodes,
+		"tags":          found.Tags,
 				"owner":         ownerInfo,
 				"version":       found.Version,
 				"is_local":      false,
@@ -450,6 +463,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 				"revive":        found.Revive,
 				"autostart":     found.Autostart,
 				"allowed_nodes": found.AllowedNodes,
+		"tags":          found.Tags,
 				"owner":         ownerInfo,
 				"version":       found.Version,
 				"is_local":      false,
@@ -483,6 +497,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 		"revive":        found.Revive,
 		"autostart":     found.Autostart,
 		"allowed_nodes": found.AllowedNodes,
+		"tags":          found.Tags,
 		"owner":         ownerInfo,
 		"version":       found.Version,
 		"is_local":      true,
@@ -519,10 +534,20 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		Revive       *bool     `json:"revive,omitempty"`
 		Autostart    *bool     `json:"autostart,omitempty"`
 		AllowedNodes *[]string `json:"allowed_nodes,omitempty"`
+		Tags         *[]string `json:"tags,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
+	}
+	// Pre-validate tags before any state changes / proxying.
+	if update.Tags != nil {
+		normTags, badTag := normalizeTags(*update.Tags)
+		if badTag != "" {
+			http.Error(w, fmt.Sprintf("invalid tag %q: must match %s", badTag, validTagPattern.String()), 400)
+			return
+		}
+		update.Tags = &normTags
 	}
 
 	// Find workload
@@ -635,6 +660,9 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	if update.AllowedNodes != nil {
 		found.AllowedNodes = *update.AllowedNodes
 	}
+	if update.Tags != nil {
+		found.Tags = *update.Tags
+	}
 
 	// Update version
 	found.Version = time.Now().UnixNano()
@@ -681,6 +709,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		"revive":        found.Revive,
 		"autostart":     found.Autostart,
 		"allowed_nodes": found.AllowedNodes,
+		"tags":          found.Tags,
 		"owner": map[string]string{
 			"id":   a.hwid,
 			"name": a.hostname,

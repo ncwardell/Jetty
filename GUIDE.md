@@ -500,13 +500,32 @@ Every endpoint requires `X-API-Key` (or `?api_key=`) matching one of: AdminKey, 
 | `GET /api/workloads` | GET | List all workloads |
 | `POST /api/workloads` | POST | Deploy new workload |
 | `GET /api/workloads/{name}` | GET | Get workload details |
-| `PATCH /api/workloads/{name}` | PATCH | Update workload |
+| `PATCH /api/workloads/{name}` | PATCH | Update workload (incl. tags) |
 | `DELETE /api/workloads/{name}` | DELETE | Remove workload |
 | `POST /api/workloads/{name}/move` | POST | Move to another node |
 | `POST /api/workloads/{name}/start` | POST | Start workload |
 | `POST /api/workloads/{name}/stop` | POST | Stop workload |
 | `POST /api/workloads/{name}/restart` | POST | Restart workload |
 | `GET /api/workloads/{name}/logs` | GET | Get container logs |
+| `POST /api/workloads/bulk` | POST | Bulk action by tag, names, or all. Body: `{tag\|names\|all, action: start\|stop\|restart\|delete}`. |
+| `GET /api/workloads/export` | GET | Export selected workloads as JSON (`?tag=X` or `?names=a,b`). Returns `{version, workloads, referenced_env_keys}`. |
+| `POST /api/workloads/import` | POST | Restore from a previous export. Body: `{mode: skip\|replace\|fail, reassign_ips, payload}`. Returns a per-workload report. |
+
+**Tags.** Each workload optionally carries a `tags []string`. Tag strings are validated against `^[a-z0-9][a-z0-9_:-]{0,62}$` (lowercase + dash/underscore/colon) so the `env:prod`-style namespacing convention works without us needing a key=value labels system. Tags are normalized (lowercased, deduped, sorted) on every ingest path so equality comparisons are trivial. The dashboard derives a stable color per tag via `hash(tag) → HSL hue`.
+
+**Bulk actions.** Exactly one selector — `tag`, `names`, or `all` — must be set; mixing returns 400. Each workload's action runs in parallel (bounded to 8 concurrent), proxying to the owner node when the workload is remote. Failures don't stop the run; you get a per-workload report:
+
+```json
+{ "selected": ["nginx", "redis"], "results": { "nginx": { "ok": true }, "redis": { "ok": false, "error": "owner unreachable" } } }
+```
+
+**Import collision handling.** Mesh IPs auto-reassign on collision by default (workloads are reached by hostname through the mesh DNS, so a new IP is invisible to other workloads). Name collisions follow the chosen `mode`:
+
+- `skip` (default): leave the existing workload alone, return `status: "skipped"` for that entry.
+- `replace`: delete-then-recreate (same tombstone semantics as `DELETE /api/workloads/{name}`), return `status: "replaced"`.
+- `fail`: validate the entire payload up front; abort the import on any conflict, return 409, no state mutations.
+
+Imports also tell you which `${VAR_NAME}` references the compose YAML carries (`referenced_env_keys`) so the operator knows which secrets to set on the destination cluster before importing.
 
 ### Nodes
 

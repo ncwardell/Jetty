@@ -13,6 +13,10 @@ import (
 // inject a name like "../../etc/cron.d/x" (which would land outside the
 // composeDir when deployWorkload writes the compose file) or one with
 // embedded newlines (which inject extra lines into /etc/hosts).
+//
+// Tags are normalized in place if any are present. Invalid tags drop
+// the whole workload (a malformed tag is a wire-protocol violation,
+// not a per-tag issue).
 func validIngestedWorkload(w *Workload) bool {
 	if w == nil {
 		return false
@@ -24,6 +28,14 @@ func validIngestedWorkload(w *Workload) bool {
 	if net.ParseIP(w.IP) == nil {
 		log.Printf("Sync: rejecting workload %q with invalid IP %q", w.Name, w.IP)
 		return false
+	}
+	if len(w.Tags) > 0 {
+		normTags, badTag := normalizeTags(w.Tags)
+		if badTag != "" {
+			log.Printf("Sync: rejecting workload %q with invalid tag %q", w.Name, badTag)
+			return false
+		}
+		w.Tags = normTags
 	}
 	return true
 }

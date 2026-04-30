@@ -94,8 +94,13 @@ type Workload struct {
 	Revive       bool     `json:"revive"`                  // Auto-failover to another node if owner dies
 	Autostart    bool     `json:"autostart"`               // Auto-start when Jetty starts up
 	AllowedNodes []string `json:"allowed_nodes,omitempty"` // Node whitelist: empty/["*"] = all, otherwise node names/IDs
-	Owner        string   `json:"owner"`                   // Node HWID
-	Version      int64    `json:"version"`                 // Unix timestamp
+	// Tags group workloads for filtering and bulk operations (start
+	// all tagged "media", export all tagged "prod", etc.). Free-form
+	// strings; validated with validTagPattern. Sorted+deduped on
+	// ingest so the wire form is canonical.
+	Tags    []string `json:"tags,omitempty"`
+	Owner   string   `json:"owner"`   // Node HWID
+	Version int64    `json:"version"` // Unix timestamp
 }
 
 // DeletedWorkload represents a tombstone for a deleted workload to propagate deletions

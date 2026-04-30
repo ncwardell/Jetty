@@ -297,6 +297,25 @@ POST   /api/workloads/{name}/move        # Move to another node (blue-green)
 GET    /api/workloads/{name}/logs        # Container logs
 ```
 
+### Tags & bulk operations
+```bash
+# Workloads can carry tags (lowercase, alphanumeric + dash/underscore/colon).
+# Tags appear as colored chips in the dashboard and are the primary pivot
+# for bulk operations and export/import.
+
+POST   /api/workloads/bulk    # {tag|names|all, action: start|stop|restart|delete}
+GET    /api/workloads/export  # ?tag=X or ?names=a,b - JSON dump
+POST   /api/workloads/import  # {mode: skip|replace|fail, reassign_ips, payload}
+```
+
+Example: stop everything tagged `media` across the whole cluster (proxied to each owner):
+```bash
+curl -X POST http://localhost:6880/api/workloads/bulk \
+  -H "X-API-Key: $JETTY_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"tag": "media", "action": "stop"}'
+```
+
 ### Cluster & Nodes
 ```bash
 POST   /api/join              # Join cluster (requires {join_token, id, name, ip, api_key})
