@@ -26,14 +26,16 @@ import (
 //     bound. The kernel claims those IPs as "ours", iptables DNAT then
 //     forwards them to the actual container bridge IP.
 //
-//   - For each healthy peer we maintain one IPIP (or GRE) tunnel between
-//     our WARP IP and theirs. Routes for remote workload IPs point at these
-//     tunnels, so packets to remote workloads get IP-in-IP encapsulated and
-//     handed off to the owning node.
+//   - Cross-node workload traffic uses the userspace tunnel by default
+//     (see tunnel.go). Packets to remote workloads route to the jetty_tun
+//     TUN device; the reader ships them to the owning node over a
+//     WebSocket on the API port. This works through anything that passes
+//     TCP - Cloudflare WARP, residential ISPs, corporate firewalls.
 //
-//   - When neither IPIP nor GRE is available, the userspace tunnel (see
-//     tunnel.go) takes over - traffic for remote workloads goes to a TUN
-//     device whose reader ships packets over WebSockets.
+//   - JETTY_TUNNEL_MODE=ipip (or gre) opts into kernel encapsulation when
+//     the operator knows the network between peers passes raw IP. Higher
+//     throughput, lower CPU. Doesn't survive WARP or most public-internet
+//     paths because raw-IP-protocol forwarding is widely filtered.
 
 // =============================================================================
 // Network Interface (Dummy interface for mesh IP binding)
@@ -60,11 +62,12 @@ import (
 //     source IP of mesh-bound packets from the container's bridge IP to the
 //     host IP so the return path works.
 //
-//  5. detectTunnelMode - picks IPIP, GRE, or userspace for cross-node
-//     workload traffic.
+//  5. JETTY_TUNNEL_MODE - picks userspace (default), IPIP, or GRE for
+//     cross-node workload traffic.
 //
-//  6. initUserspaceTunnel - always started, even if IPIP is available,
-//     because peers without IPIP need a server to ship packets to.
+//  6. initUserspaceTunnel - always started, including when an opt-in
+//     kernel mode is selected, because peers running in userspace mode
+//     need a server to ship packets to.
 //
 // Caveat: rule ordering is fragile. Docker can re-insert FORWARD rules on
 // daemon restart and push ours down the chain. There is no periodic
@@ -116,29 +119,23 @@ func (a *Agent) initNetwork() error {
 	// simplicity in a mesh.
 	a.applyMeshIptablesRules(true /* verbose */)
 
-	// Check which tunnel mode is available for cross-node routing.
-	// Try IPIP first (most efficient), then GRE as fallback. Operators
-	// can override with JETTY_TUNNEL_MODE - some carriers (notably the
-	// Cloudflare WARP Connector) silently drop non-TCP/UDP traffic, so
-	// even when the kernel can create an IPIP interface the packets
-	// never reach the peer. Setting JETTY_TUNNEL_MODE=userspace forces
-	// every cross-node /32 route through jetty_tun (UDP-encapsulated
-	// over the WS tunnel).
+	// Cross-node tunnel mode. Default is the userspace tunnel
+	// (jetty_tun) - it ships packets over a WebSocket on the API port,
+	// so it survives any carrier that passes TCP, including Cloudflare
+	// WARP. Kernel IPIP/GRE are higher-throughput but require the
+	// path between peers to forward raw IP protocols (4 and 47), which
+	// WARP and most ISPs/firewalls don't. Operators with end-to-end
+	// control of the network can opt in via JETTY_TUNNEL_MODE.
 	switch strings.ToLower(getEnv("JETTY_TUNNEL_MODE", "")) {
-	case "userspace", "none":
-		a.tunnelMode = ""
-		log.Printf("Tunnel mode forced to userspace (JETTY_TUNNEL_MODE=userspace)")
 	case "ipip":
 		a.tunnelMode = "ipip"
-		log.Printf("Tunnel mode forced to IPIP (JETTY_TUNNEL_MODE=ipip)")
+		log.Printf("Tunnel mode: IPIP (opt-in; requires the path between peers to forward IP protocol 4)")
 	case "gre":
 		a.tunnelMode = "gre"
-		log.Printf("Tunnel mode forced to GRE (JETTY_TUNNEL_MODE=gre)")
+		log.Printf("Tunnel mode: GRE (opt-in; requires the path between peers to forward IP protocol 47)")
 	default:
-		a.tunnelMode = a.detectTunnelMode()
-	}
-	if a.tunnelMode == "" {
-		log.Printf("Cross-node workload traffic will use userspace tunnel (jetty_tun)")
+		a.tunnelMode = ""
+		log.Printf("Tunnel mode: userspace (jetty_tun)")
 	}
 
 	// ALWAYS start userspace tunnel listener - even if we have IPIP for sending,
