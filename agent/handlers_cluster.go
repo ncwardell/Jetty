@@ -198,6 +198,14 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 			"configured": hasTunnel,
 			"running":    a.isTunnelRunning(),
 		},
+		// a.ip is non-empty whenever the CloudflareWARP interface has
+		// an IPv4 lease (see detectWarpIP). That's the only state that
+		// matters for the dashboard's "WARP Mesh" indicator - if we
+		// have a WARP IP, the mesh is up.
+		"warp": map[string]interface{}{
+			"enabled": a.ip != "",
+			"ip":      a.ip,
+		},
 	}
 
 	w.Header().Set("Content-Type", "application/json")

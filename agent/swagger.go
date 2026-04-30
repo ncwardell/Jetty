@@ -9,6 +9,15 @@ type StatusResponse struct {
 	Workloads   []*Workload  `json:"workloads"`
 	ServiceCIDR string       `json:"service_cidr" example:"10.100.0.0/16"`
 	Tunnel      TunnelStatus `json:"tunnel"`
+	Warp        WarpStatus   `json:"warp"`
+}
+
+// WarpStatus describes whether this node has a live WARP IP. The
+// dashboard's "WARP Mesh" indicator reads `enabled`; the IP is shown
+// alongside when set.
+type WarpStatus struct {
+	Enabled bool   `json:"enabled" example:"true"`
+	IP      string `json:"ip" example:"100.96.0.20"`
 }
 
 // NodeInfo represents this node's information
