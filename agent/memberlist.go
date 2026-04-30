@@ -39,7 +39,7 @@ type NodeMeta struct {
 
 // BroadcastMessage represents a message broadcast to all nodes
 type BroadcastMessage struct {
-	Type    string          `json:"type"`    // "workload_update", "workload_delete", "env_update", "env_delete"
+	Type    string          `json:"type"`    // "workload_update", "workload_delete", "env_update", "env_delete", "env_undelete", "admin_key_rotate"
 	Payload json.RawMessage `json:"payload"` // Type-specific payload
 }
 
@@ -405,6 +405,16 @@ func (a *Agent) handleBroadcast(msg *BroadcastMessage) {
 		}
 		a.handleEnvDelete(&dek)
 
+	case "env_undelete":
+		var u struct {
+			Key string `json:"key"`
+		}
+		if err := json.Unmarshal(msg.Payload, &u); err != nil {
+			log.Printf("Memberlist: failed to unmarshal env undelete: %v", err)
+			return
+		}
+		a.handleEnvUndelete(u.Key)
+
 	case "admin_key_rotate":
 		var ak struct {
 			Key string `json:"key"`
@@ -542,6 +552,27 @@ func (a *Agent) handleEnvUpdate(key, value string) {
 	a.stateMu.Unlock()
 
 	if changed {
+		a.saveState()
+	}
+}
+
+// handleEnvUndelete clears the tombstone for a key that was just
+// re-set on the originating node. Without this, our local tombstone
+// would still be present, the next sync round would re-broadcast it
+// as a deletion, and the value would get wiped cluster-wide. The
+// originating node already cleared its own tombstone before
+// broadcasting; we mirror that.
+func (a *Agent) handleEnvUndelete(key string) {
+	if !ValidateEnvKey(key) {
+		return
+	}
+	a.stateMu.Lock()
+	_, hadTombstone := a.state.DeletedEnvKeys[key]
+	if hadTombstone {
+		delete(a.state.DeletedEnvKeys, key)
+	}
+	a.stateMu.Unlock()
+	if hadTombstone {
 		a.saveState()
 	}
 }
@@ -714,6 +745,31 @@ func (a *Agent) broadcastEnvUpdate(key, value string) {
 		return
 	}
 
+	a.mlDelegate.broadcasts.QueueBroadcast(&simpleBroadcast{msg: data})
+}
+
+// broadcastEnvUndelete tells peers to clear their tombstone for a
+// given env key (typically because the operator just re-set it).
+// Sent BEFORE the matching env_update so peers' tombstone-aware
+// handlers don't bounce the update.
+func (a *Agent) broadcastEnvUndelete(key string) {
+	if a.mlDelegate == nil {
+		return
+	}
+	payload, err := json.Marshal(map[string]string{"key": key})
+	if err != nil {
+		log.Printf("Warning: failed to marshal env undelete: %v", err)
+		return
+	}
+	msg := BroadcastMessage{
+		Type:    "env_undelete",
+		Payload: payload,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("Warning: failed to marshal env undelete envelope: %v", err)
+		return
+	}
 	a.mlDelegate.broadcasts.QueueBroadcast(&simpleBroadcast{msg: data})
 }
 
