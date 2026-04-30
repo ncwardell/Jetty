@@ -484,7 +484,8 @@ func (a *Agent) handleWorkloadUpdate(wl *Workload) {
 
 	a.stateMu.Lock()
 	changed := false
-	if tombstone := a.state.DeletedWorkloads[wl.IP]; tombstone != nil && tombstone.Version > wl.Version {
+	tombstone := a.state.DeletedWorkloads[wl.IP]
+	if tombstone != nil && tombstone.Version > wl.Version {
 		a.stateMu.Unlock()
 		return
 	}
@@ -495,6 +496,16 @@ func (a *Agent) handleWorkloadUpdate(wl *Workload) {
 			go a.removeWorkload(existing)
 		}
 		a.state.Workloads[wl.IP] = wl
+		// Same stale-tombstone retirement as mergeWorkloadState: if
+		// we're accepting a newer workload at this IP, any older
+		// tombstone is stale and must be dropped. Otherwise our local
+		// state.json would carry both entries until GC, /api/sync
+		// responses to peers would include both, and a peer that
+		// hasn't yet received this update could see the tombstone and
+		// stop the workload it just accepted.
+		if tombstone != nil {
+			delete(a.state.DeletedWorkloads, wl.IP)
+		}
 		changed = true
 	}
 	a.stateMu.Unlock()
