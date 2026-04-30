@@ -490,7 +490,7 @@ volumes:
 | `JETTY_JOIN_TOKEN` | **Required when joining.** Single-use token minted by `POST /api/tokens` on an existing node. Burned on first successful join. | - |
 | `JETTY_WARP_CONNECTOR_TOKEN` | WARP connector token. Bootstrap node only — joiners get it from the join response. | - |
 | `JETTY_CF_TOKEN` | Cloudflare Tunnel token. Bootstrap node only — joiners get it from the join response. | - |
-| `JETTY_HOST_SHELL` | Set to `true` to enable the `/api/host/shell` web terminal endpoint (admin-only, dangerous). | `false` |
+| `JETTY_HOST_SHELL` | Set to `true` to enable the `/api/host/shell` web terminal endpoint (admin-only, dangerous). For a *real* host shell — one that sees the host's `/home`, `/etc`, processes — also pass `--pid=host` to `docker run`; without it the endpoint works but returns a shell scoped to the container. | `false` |
 | `JETTY_DATA_DIR` | Where state lives. | `/data` |
 | `JETTY_API_PORT` | API port. | `6880` |
 | `JETTY_SERVICE_CIDR` | Mesh network CIDR for workload IPs. | `10.100.0.0/16` |
@@ -533,9 +533,11 @@ Two WebSocket endpoints give you an interactive shell from the dashboard, both *
 | Endpoint | What it does | Gating |
 |---|---|---|
 | `WS /api/workloads/{name}/exec` | `docker exec`-style PTY into one of the workload's containers (the agent picks the first container in `docker compose -p jetty_<name>`). | Always available. Admin key only. |
-| `WS /api/host/shell` | Interactive shell on the **host**. With `--pid=host` on the docker run, `nsenter`s into PID 1's namespaces so you see the real host's `/home`, `/etc`, processes, etc. Without `--pid=host` it falls back to a shell inside the agent container and prints a banner explaining what you're looking at. | Off by default. Set `JETTY_HOST_SHELL=true` (and recommended: `--pid=host`) to enable. Admin key only. |
+| `WS /api/host/shell` | Interactive shell on the **host**. Two switches both have to be set: `JETTY_HOST_SHELL=true` (env var) unlocks the endpoint, and `--pid=host` (docker run flag) puts the agent in the host's PID namespace so `nsenter -t 1` reaches the host's init. Setting only the env var opens the endpoint but spawns a shell scoped to the container, with a banner explaining the limitation. | Off by default. Both switches are required for a real host shell. Admin key only. |
 
 The dashboard exposes both via a 🖥️ button on workload and node detail pages. Renderer is xterm.js loaded from a CDN.
+
+The Host Shell button works on **any** node card, not just the dashboard's own host. When you click it on a remote node, the local agent dials the peer's `/api/host/shell` (auth via the cluster-wide AdminKey), bridges binary frames, and the terminal subtitle shows `(proxied via <local node>)` so it's obvious the WebSocket is hopping through the dashboard's host. If the target node has `JETTY_HOST_SHELL=false`, you'll get a clean error rather than a silent disconnect.
 
 > **`JETTY_HOST_SHELL=true` is dangerous.** It hands an authenticated admin a root shell on every node where it's enabled. Only turn it on if you're the only operator and you trust the admin-key handling chain (no shared dashboards, no admin key in shell history). The Generate-Token modal in the dashboard has a checkbox that toggles this on the joining node and adds the `--pid=host` flag automatically — leave it off unless you specifically want it.
 

@@ -779,6 +779,15 @@ ws.onmessage = (e) => terminal.write(decodeFrame(e.data));
 
 `WS /api/host/shell` — gated by `JETTY_HOST_SHELL=true` on the node.
 
+Two independent switches both have to be set for a "real" host shell:
+
+| Switch | What it does |
+| --- | --- |
+| `JETTY_HOST_SHELL=true` (env var) | Unlocks the endpoint. Without it, the handler returns `403 host shell disabled` and you can't open a shell at all. |
+| `--pid=host` (docker run flag) | Puts the agent container in the host's PID namespace, so PID 1 inside the container is the host's init. Without it the endpoint still works, but `nsenter` is a no-op and you get a shell scoped to the agent container. |
+
+Setting only `JETTY_HOST_SHELL=true` is a common pitfall — the endpoint opens, but the banner below explains why you're looking at the container's filesystem.
+
 Spawns an interactive shell. Two modes depending on how the docker run was set up:
 
 **With `--pid=host` (recommended).** PID 1 inside the container's `/proc` is the host's init, in a different mount namespace than the agent. `apiHostShell` notices this and runs:
@@ -802,6 +811,8 @@ NOTE: this shell is running INSIDE the jetty container, not on the host.
 Detection is a `readlink /proc/self/ns/mnt` vs `readlink /proc/1/ns/mnt` comparison — guaranteed-different inodes if and only if we're in different mount namespaces.
 
 The Generate-Token modal has a checkbox that injects `JETTY_HOST_SHELL=true` into the joining node's `docker run` and adds `--pid=host`. Leave it off unless you specifically want host-shell access on that node — it can be enabled later by restarting the container with both flags set.
+
+**Cross-node proxy.** The dashboard always serves WebSockets from whichever agent rendered it, so a "Host Shell" button on a remote node card has nowhere to connect on its own. `apiHostShell` accepts an optional `?node=<peer-id>`: when set and not equal to the local hwid, the local agent dials the peer's `/api/host/shell` (authenticating with the cluster-wide `AdminKey`) and bridges binary frames in both directions until either side closes. If the peer rejects the dial — typically `JETTY_HOST_SHELL=false` on the target — the proxy forwards the HTTP status to the browser *before* upgrading the local WS, so the user sees a clean error rather than a silent disconnect. The dashboard's "Host Shell" button passes the target node's id, so it works against any peer in the cluster.
 
 **Why this is dangerous.** Anyone who recovers the AdminKey gets root on every node where `JETTY_HOST_SHELL=true`. The container already runs `--privileged`, so escalation paths exist anyway, but the host shell makes it a one-click drive for any admin-credential leak (dashboard left open on a coworker's laptop, admin key in shell history, etc.).
 
