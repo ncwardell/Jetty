@@ -278,6 +278,11 @@ func (a *Agent) Start() error {
 	// while autostart is still finishing.
 	go a.autostartWorkloads()
 
+	// Reconcile loop catches workloads that didn't come up cleanly on
+	// first try - cold-boot ordering, transient docker errors, image
+	// pull races. Idempotent against healthy workloads.
+	go a.reconcileWorkloadsLoop()
+
 	// Update hosts file
 	a.updateHosts()
 
