@@ -681,12 +681,29 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	a.state.Workloads[newMeshIP] = found
 	a.stateMu.Unlock()
 
-	// Redeploy if needed
+	// Redeploy if needed.
+	//
+	// We deliberately do NOT call removeWorkload here, even though that
+	// would be the "clean" sequence on paper. removeWorkload runs
+	// `docker compose down -v --remove-orphans`, and the `-v` destroys
+	// every named volume in the compose project. Local docker volumes
+	// are where workload state lives - the user's actual database files,
+	// the SQLite n8n flows, the cliproxy auth tokens. Tearing them down
+	// on every PATCH means even a one-character compose tweak (changing
+	// the sync sidecar's command, fixing a typo) wipes user data and
+	// forces a restore-from-cluster-storage round - and if any backup
+	// gap exists, that's irrecoverable data loss.
+	//
+	// `docker compose up -d` against a changed compose file already
+	// handles in-place reconciliation correctly: services whose
+	// config-hash changed get recreated; volumes whose definition is
+	// unchanged are reused. That's exactly the semantic we want.
+	// deployWorkload's existing `up -d --remove-orphans` is sufficient.
+	//
+	// If a redeploy genuinely needs volumes wiped (e.g., the operator
+	// is intentionally resetting a workload), they can DELETE + recreate
+	// via the API, which goes through removeWorkload's `down -v`.
 	if needsRedeploy {
-		// Remove old deployment
-		a.removeWorkload(found)
-
-		// Deploy with new config
 		if err := a.deployWorkload(found); err != nil {
 			// Rollback on failure
 			a.stateMu.Lock()
