@@ -809,16 +809,21 @@ func (a *Agent) computeWorkloadStatus(workloadName string) string {
 		case "restarting":
 			anyRestarting = true
 		default: // exited, dead, paused, created
-			// Skip one-shot init containers that completed cleanly.
-			// `restart: "no"` means the operator declared this is a
-			// run-once helper; exit code 0 means it succeeded. That
-			// pair is the standard pattern for restore-on-boot
-			// sidecars (see web-ui patterns in the deploy docs).
-			if restartPolicy == "no" && exitCode == "0" {
+			// Skip one-shot init containers entirely. `restart: "no"`
+			// declares "this is a run-once helper" - by the time this
+			// status check runs, it has either succeeded (in which
+			// case dependents are up and the workload is healthy) or
+			// it's leftover state from a transient cold-boot failure
+			// (e.g. the CIFS-mount-during-boot timeout pattern, where
+			// the container records ExitCode=128 in inspect even
+			// though logs show the script ran cleanly on a retry).
+			// Either way its exit code isn't a current-state signal.
+			if restartPolicy == "no" {
 				continue
 			}
 			anyStopped = true
 		}
+		_ = exitCode // exit code no longer used in classification
 	}
 
 	switch {
