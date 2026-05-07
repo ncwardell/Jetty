@@ -17,6 +17,58 @@ import (
 // Docker Compose
 // =============================================================================
 
+// reconcileWorkloadsLoop periodically tries to deploy any owned,
+// autostart-enabled workload whose containers aren't running. Two
+// problems it addresses:
+//
+//  1. Cold-boot ordering. autostartWorkloads iterates the workload
+//     map in random order, so a workload that mounts cluster-storage
+//     can fire before cluster-storage itself is up - the CIFS mount
+//     fails, compose up errors out, and the workload stays dead until
+//     someone redeploys it manually. Reconcile retries every 30s.
+//  2. Self-heal. Workloads that crash for any reason (out-of-memory,
+//     image pull failure, transient docker error) get a retry pass
+//     instead of being silently dead.
+//
+// deployWorkload's `compose up -d` is idempotent for already-running
+// projects, so this loop is also safe to run against healthy
+// workloads - it's just a no-op for them.
+func (a *Agent) reconcileWorkloadsLoop() {
+	tick := time.NewTicker(30 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-a.stopCh:
+			return
+		case <-tick.C:
+			a.reconcileWorkloads()
+		}
+	}
+}
+
+func (a *Agent) reconcileWorkloads() {
+	a.stateMu.RLock()
+	var toCheck []*Workload
+	for _, wl := range a.state.Workloads {
+		if wl.Owner == a.hwid && wl.Autostart {
+			toCheck = append(toCheck, wl)
+		}
+	}
+	a.stateMu.RUnlock()
+
+	for _, wl := range toCheck {
+		out, _ := exec.Command("docker", "ps", "-q",
+			"-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			continue // at least one container running, assume healthy
+		}
+		log.Printf("Reconcile: %s has no running containers, retrying deploy", wl.Name)
+		if err := a.deployWorkload(wl); err != nil {
+			log.Printf("Reconcile: deploy of %s failed: %v", wl.Name, err)
+		}
+	}
+}
+
 // autostartWorkloads starts all owned workloads that have autostart enabled
 func (a *Agent) autostartWorkloads() {
 	a.stateMu.RLock()
