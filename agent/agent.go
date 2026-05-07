@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -47,6 +48,7 @@ func New() (*Agent, error) {
 		ipipWarnedPeers:    make(map[string]bool),
 		failoverInProgress: make(map[string]time.Time),
 		peerUnhealthySince: make(map[string]time.Time),
+		workloadMoveLocks:  make(map[string]*sync.Mutex),
 		maroonedLogged:     make(map[string]time.Time),
 		state: &State{
 			Peers:            make(map[string]*Peer),

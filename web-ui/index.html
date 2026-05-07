@@ -2491,7 +2491,7 @@
             </div>
             <div class="modal-footer">
                 <button class="btn" onclick="closeMoveModal()">Cancel</button>
-                <button class="btn btn-primary" onclick="confirmMoveWorkload()">Move</button>
+                <button class="btn btn-primary" id="moveSubmitBtn" onclick="confirmMoveWorkload()">Move</button>
             </div>
         </div>
     </div>
@@ -3452,7 +3452,10 @@
         function getStatusClass(status) {
             switch (status) {
                 case 'running': return 'running';
+                case 'starting': return 'running';
                 case 'stopped': return 'stopped';
+                case 'restarting': return 'error';
+                case 'unhealthy': return 'error';
                 case 'remote': return 'remote';
                 case 'error': return 'error';
                 case 'unknown': return 'unknown';
@@ -3464,7 +3467,10 @@
         function getStatusText(status) {
             switch (status) {
                 case 'running': return 'Running';
+                case 'starting': return 'Starting';
                 case 'stopped': return 'Stopped';
+                case 'restarting': return 'Restarting';
+                case 'unhealthy': return 'Unhealthy';
                 case 'remote': return 'Remote';
                 case 'error': return 'Error';
                 case 'unknown': return 'Unknown';
@@ -4757,11 +4763,24 @@
 
             const select = document.getElementById('moveTargetNode');
             const workload = state.workloads.find(w => w.name === name);
-            const allNodes = [state.node, ...state.peers].filter(n => n && n.id !== workload?.owner?.id);
+            // Filter out:
+            //  - falsy entries
+            //  - nodes missing an id (causes "null" options that the
+            //    backend can't resolve)
+            //  - the workload's current owner (move-to-self is a no-op)
+            const allNodes = [state.node, ...state.peers].filter(n =>
+                n && n.id && n.id !== workload?.owner?.id);
 
-            select.innerHTML = allNodes.map(n =>
-                `<option value="${n.id}">${n.name || n.id.substring(0, 8)}</option>`
-            ).join('');
+            if (allNodes.length === 0) {
+                select.innerHTML = '<option value="">No other healthy nodes</option>';
+                document.getElementById('moveSubmitBtn').disabled = true;
+            } else {
+                select.innerHTML = allNodes.map(n => {
+                    const label = n.name || n.id.substring(0, 8);
+                    return `<option value="${n.id}">${label}</option>`;
+                }).join('');
+                document.getElementById('moveSubmitBtn').disabled = false;
+            }
 
             document.getElementById('moveModal').classList.remove('hidden');
         }
@@ -4769,13 +4788,29 @@
         function closeMoveModal() {
             document.getElementById('moveModal').classList.add('hidden');
             workloadToMove = null;
+            const btn = document.getElementById('moveSubmitBtn');
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Move';
+            }
         }
 
         async function confirmMoveWorkload() {
             const targetNode = document.getElementById('moveTargetNode').value;
             const targetNodeName = document.getElementById('moveTargetNode').selectedOptions[0]?.text || targetNode;
 
-            if (!workloadToMove || !targetNode) return;
+            if (!workloadToMove || !targetNode) {
+                showToast('Pick a target node first', 'error');
+                return;
+            }
+
+            // Disable the button + show progress so the user doesn't
+            // double-click while the move is in flight. Backend now
+            // serializes duplicate moves (see workloadMoveLocks) but
+            // this is a better UX than a frozen-looking modal.
+            const btn = document.getElementById('moveSubmitBtn');
+            btn.disabled = true;
+            btn.textContent = 'Moving…';
 
             try {
                 await apiCall(`/workloads/${workloadToMove}/move`, 'POST', { to: targetNode });
@@ -4786,6 +4821,8 @@
             } catch (error) {
                 showToast(`Move failed: ${error.message}`, 'error');
                 addActivity('error', `Failed to move "${workloadToMove}"`, error.message);
+                btn.disabled = false;
+                btn.textContent = 'Move';
             }
         }
 
@@ -4892,17 +4929,32 @@
             event.currentTarget.classList.remove('drop-target');
         }
 
+        // Track in-flight drag-drop moves so a second drop of the same
+        // workload while the first is still working doesn't spam the
+        // API. The backend's workloadMoveLocks would serialize them
+        // safely, but this avoids the latency penalty entirely.
+        const dropInFlight = new Set();
+
         async function handleDrop(event, targetNodeId) {
             event.preventDefault();
             event.currentTarget.classList.remove('drop-target');
 
             if (!draggedWorkload) return;
+            if (!targetNodeId) {
+                showToast('Drop target has no node id', 'error');
+                return;
+            }
 
             const workload = state.workloads.find(w => w.name === draggedWorkload);
             if (workload?.owner?.id === targetNodeId) {
                 showToast('Workload is already on this node', 'error');
                 return;
             }
+            if (dropInFlight.has(draggedWorkload)) {
+                showToast(`A move for "${draggedWorkload}" is already in progress`, 'error');
+                return;
+            }
+            dropInFlight.add(draggedWorkload);
 
             try {
                 await apiCall(`/workloads/${draggedWorkload}/move`, 'POST', { to: targetNodeId });
@@ -4910,6 +4962,8 @@
                 await refreshStatus();
             } catch (error) {
                 showToast(`Move failed: ${error.message}`, 'error');
+            } finally {
+                dropInFlight.delete(draggedWorkload);
             }
         }
 

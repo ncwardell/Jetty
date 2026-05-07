@@ -770,16 +770,31 @@ func (a *Agent) computeWorkloadStatus(workloadName string) string {
 	)
 
 	for _, id := range ids {
-		inspectOut, err := exec.Command("docker", "inspect", "--format", `{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}`, id).Output()
+		// Pull restart policy + exit code too so we can distinguish a
+		// one-shot init container that completed successfully from a
+		// crashed long-running service. Without this, multi-container
+		// workloads that use the init/main/sync pattern always show
+		// "unhealthy" because init exits 0 and the dashboard counts it
+		// as a stopped service.
+		inspectOut, err := exec.Command("docker", "inspect", "--format",
+			`{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.HostConfig.RestartPolicy.Name}}|{{.State.ExitCode}}`, id).Output()
 		if err != nil {
 			anyStopped = true
 			continue
 		}
-		fields := strings.SplitN(strings.TrimSpace(string(inspectOut)), "|", 2)
+		fields := strings.SplitN(strings.TrimSpace(string(inspectOut)), "|", 4)
 		state := fields[0]
 		health := ""
-		if len(fields) == 2 {
+		restartPolicy := ""
+		exitCode := ""
+		if len(fields) >= 2 {
 			health = fields[1]
+		}
+		if len(fields) >= 3 {
+			restartPolicy = fields[2]
+		}
+		if len(fields) >= 4 {
+			exitCode = fields[3]
 		}
 
 		switch state {
@@ -794,6 +809,14 @@ func (a *Agent) computeWorkloadStatus(workloadName string) string {
 		case "restarting":
 			anyRestarting = true
 		default: // exited, dead, paused, created
+			// Skip one-shot init containers that completed cleanly.
+			// `restart: "no"` means the operator declared this is a
+			// run-once helper; exit code 0 means it succeeded. That
+			// pair is the standard pattern for restore-on-boot
+			// sidecars (see web-ui patterns in the deploy docs).
+			if restartPolicy == "no" && exitCode == "0" {
+				continue
+			}
 			anyStopped = true
 		}
 	}
@@ -1039,7 +1062,27 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Find workload and current owner
+	// Serialize moves of the same workload. A double-clicked dashboard
+	// button used to enqueue duplicate POSTs that all read state at the
+	// same moment ("currentOwner = lumin"), all proceed, and the second
+	// move's DELETE fired AFTER the first completed - by then state
+	// already showed Hetzner as owner, so the source-side delete
+	// proxied to Hetzner and removed the workload entirely. Holding
+	// this lock across the whole handler means duplicate requests wait
+	// for the first to finish, then re-resolve ownership and short-
+	// circuit when they see the workload is already where they wanted.
+	a.workloadMoveLocksMu.Lock()
+	moveLock, ok := a.workloadMoveLocks[name]
+	if !ok {
+		moveLock = &sync.Mutex{}
+		a.workloadMoveLocks[name] = moveLock
+	}
+	a.workloadMoveLocksMu.Unlock()
+	moveLock.Lock()
+	defer moveLock.Unlock()
+
+	// Find workload and current owner (re-read under the move lock so
+	// we observe state as updated by any earlier move that just finished)
 	a.stateMu.RLock()
 	var found *Workload
 	var currentOwner *Peer
@@ -1088,8 +1131,13 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if we already own it (no-op)
-	if found.Owner == a.hwid && targetIsSelf {
+	// Check if the workload is already where the caller wants it. The
+	// older form of this check only handled "moving to self when self
+	// is owner"; with the workload-move serialization above, a queued
+	// duplicate move arriving after the first completed will see the
+	// new owner here and short-circuit, even when neither the request
+	// nor the current owner is this node.
+	if found.Owner == target.ID {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"moved": "no-op", "reason": "already on target node"})
 		return
