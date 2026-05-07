@@ -336,6 +336,17 @@ type Agent struct {
 	peerUnhealthySince   map[string]time.Time
 	peerUnhealthySinceMu sync.Mutex
 
+	// workloadMoveLocks serializes apiMoveWorkload calls for a given
+	// workload name. Without this, double-clicking the dashboard's
+	// Move button enqueues multiple POSTs that race each other -
+	// move N+1 reads stale state, fires its DELETE against the *new*
+	// owner, and silently destroys the workload it was supposed to
+	// duplicate-move. One lock per name; entries are kept rather
+	// than torn down because workload names are bounded and reusing
+	// the same lock across moves of the same name is correct.
+	workloadMoveLocks   map[string]*sync.Mutex
+	workloadMoveLocksMu sync.Mutex
+
 	// hostsBlockHash is the SHA-256 of the JETTY-managed block we last wrote
 	// to /etc/hosts. updateHosts skips the write when the block hasn't changed,
 	// which silences the per-gossip-tick churn on /etc/hosts.
