@@ -66,6 +66,19 @@ func (a *Agent) failoverLoop() {
 }
 
 func (a *Agent) checkFailover() {
+	// Don't claim workloads in the first FailoverStartupGrace seconds
+	// after agent startup. The state we loaded from disk has stale
+	// peer-health flags from the last time we ran (e.g. if the laptop
+	// shut down with Hetzner marked unreachable from a transient blip,
+	// that "false" persists across restart). Even with the per-peer
+	// 30s grace window, claims fire too eagerly when the agent is
+	// fresh because peerUnhealthySince is in-memory and starts
+	// counting from boot. Block claims entirely until memberlist +
+	// checkPeers have had time to converge on actual peer health.
+	if time.Since(a.startTime) < FailoverStartupGrace {
+		return
+	}
+
 	// Clean up stale failover entries (older than 5 minutes - deployment timeout)
 	a.failoverInProgressMu.Lock()
 	for ip, startTime := range a.failoverInProgress {
