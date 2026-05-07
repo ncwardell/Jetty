@@ -877,11 +877,14 @@ func (f *memberlistLogFilter) Write(p []byte) (n int, err error) {
 // memberlistSyncLoop runs periodic tasks alongside memberlist:
 // - Tombstone garbage collection
 // - Periodic state sync (catches missed broadcasts)
+// - Memberlist re-discovery (rejoin peers we lost contact with)
 // - Route updates for remote workloads
 func (a *Agent) memberlistSyncLoop() {
-	syncTicker := time.NewTicker(30 * time.Second) // Full sync every 30s
-	gcTicker := time.NewTicker(10 * time.Minute)   // GC every 10 minutes
+	syncTicker := time.NewTicker(30 * time.Second)   // Full sync every 30s
+	rejoinTicker := time.NewTicker(20 * time.Second) // Rediscovery faster than full sync
+	gcTicker := time.NewTicker(10 * time.Minute)     // GC every 10 minutes
 	defer syncTicker.Stop()
+	defer rejoinTicker.Stop()
 	defer gcTicker.Stop()
 
 	for {
@@ -893,12 +896,56 @@ func (a *Agent) memberlistSyncLoop() {
 			// Periodic full state sync to catch any missed broadcasts
 			a.memberlistPeriodicSync()
 
+		case <-rejoinTicker.C:
+			// Re-discover peers that dropped out of memberlist's
+			// in-memory member set. memberlist's gossip-based
+			// failure detection only talks to currently-known
+			// members - if a node ends up with zero members
+			// (typical after a laptop suspend/resume: the only peer
+			// is marked "left" and never gets re-pinged), the only
+			// way back is an explicit Join. This ticker handles that.
+			a.maybeRejoinMemberlist()
+
 		case <-gcTicker.C:
 			// Garbage collect old tombstones and expired/burned join tokens.
 			a.gcTombstones()
 			a.gcExpiredTokens()
 		}
 	}
+}
+
+// maybeRejoinMemberlist attempts a Join() against any peers we know
+// about but that aren't in memberlist's current member set. Cheap to
+// call repeatedly: Join is a no-op when the named peer is already in
+// the cluster.
+func (a *Agent) maybeRejoinMemberlist() {
+	if a.memberlist == nil {
+		return
+	}
+	known := make(map[string]bool)
+	for _, n := range a.memberlist.Members() {
+		known[n.Name] = true
+	}
+
+	a.stateMu.RLock()
+	var addrs []string
+	for _, peer := range a.state.Peers {
+		if peer.IP == "" || known[peer.ID] {
+			continue
+		}
+		addrs = append(addrs, fmt.Sprintf("%s:%d", peer.IP, MemberlistPort))
+	}
+	a.stateMu.RUnlock()
+
+	if len(addrs) == 0 {
+		return
+	}
+	n, err := a.memberlist.Join(addrs)
+	if err == nil && n > 0 {
+		log.Printf("Memberlist: re-joined %d previously-lost peer(s)", n)
+	}
+	// Errors are common during rejoin (peer briefly unreachable) - log noisy
+	// errors only at debug level by skipping them; the next tick retries.
 }
 
 // memberlistPeriodicSync does a full state sync with a random peer
