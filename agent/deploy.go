@@ -470,8 +470,15 @@ func (a *Agent) setupWorkloadIP(wl *Workload) {
 	if len(ports) > 0 {
 		for _, p := range ports {
 			target := fmt.Sprintf("%s:%d", p.bridgeIP, p.port)
+			// -I (insert at top) rather than -A (append): the OUTPUT chain
+			// starts with Docker's own DOCKER jump for LOCAL-typed
+			// destinations. Mesh IPs are bound to jetty0 and therefore look
+			// LOCAL, so any host-published port from another workload (e.g.
+			// hermes publishing 8080:8080) would have its DOCKER rule hijack
+			// our mesh traffic to whichever container claimed that host port.
+			// Inserting at the top ensures our per-port DNAT always wins.
 			for _, chain := range []string{"PREROUTING", "OUTPUT"} {
-				err := exec.Command("iptables", "-t", "nat", "-A", chain,
+				err := exec.Command("iptables", "-t", "nat", "-I", chain, "1",
 					"-d", wl.IP, "-p", p.proto, "--dport", strconv.Itoa(p.port),
 					"-j", "DNAT", "--to", target).Run()
 				if err != nil {
@@ -493,7 +500,7 @@ func (a *Agent) setupWorkloadIP(wl *Workload) {
 		return
 	}
 	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
-		if err := exec.Command("iptables", "-t", "nat", "-A", chain,
+		if err := exec.Command("iptables", "-t", "nat", "-I", chain, "1",
 			"-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run(); err != nil {
 			log.Printf("Error: %s DNAT for %s: %v", chain, wl.IP, err)
 		}
