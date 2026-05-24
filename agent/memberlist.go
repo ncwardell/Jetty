@@ -896,6 +896,15 @@ func (a *Agent) memberlistSyncLoop() {
 			// Periodic full state sync to catch any missed broadcasts
 			a.memberlistPeriodicSync()
 
+			// Refresh LastSeen for any peer still alive in memberlist.
+			// NotifyJoin/Update/Leave only fire on transitions, so a
+			// healthy peer whose metadata never changes ends up with a
+			// LastSeen frozen at join time - confusing for operators
+			// and useless for staleness alarms. SWIM probes are what
+			// actually decides liveness; this just keeps the human-
+			// readable timestamp current.
+			a.refreshMemberlistLastSeen()
+
 		case <-rejoinTicker.C:
 			// Re-discover peers that dropped out of memberlist's
 			// in-memory member set. memberlist's gossip-based
@@ -1080,4 +1089,27 @@ func (a *Agent) isPeerHealthyInMemberlist(peerID string) bool {
 		}
 	}
 	return false
+}
+
+// refreshMemberlistLastSeen bumps peer.LastSeen for every peer still
+// alive in memberlist. NotifyJoin/Update/Leave only fire on transitions,
+// so a long-lived healthy peer otherwise looks "last seen at startup"
+// forever. memberlist.Members() returns only alive members, so just
+// being in this set means SWIM probes are succeeding right now.
+func (a *Agent) refreshMemberlistLastSeen() {
+	if a.memberlist == nil {
+		return
+	}
+	now := time.Now()
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	for _, node := range a.memberlist.Members() {
+		if node.Name == a.hwid {
+			continue
+		}
+		if peer, ok := a.state.Peers[node.Name]; ok {
+			peer.LastSeen = now
+			peer.Healthy = true
+		}
+	}
 }
