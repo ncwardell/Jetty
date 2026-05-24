@@ -168,7 +168,8 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 
 	// Parse request body
 	var req struct {
-		Image string `json:"image"` // Docker image to pull (e.g., "ghcr.io/ncwardell/jetty:2.1.0")
+		Image string            `json:"image"`         // Docker image to pull (e.g., "ghcr.io/ncwardell/jetty:2.1.0")
+		Env   map[string]string `json:"env,omitempty"` // Optional env overrides applied last (override both preserved env and JETTY_SECRET)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", 400)
@@ -354,6 +355,14 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 	if adminKey != "" {
 		args = append(args, "-e", "JETTY_SECRET="+adminKey)
+	}
+
+	// Apply env overrides from the request last so they win Docker's
+	// last-flag-wins resolution. Lets the UI toggle JETTY_HOST_SHELL
+	// (and any other flag) per-update without losing whatever was
+	// already set on the running container.
+	for k, v := range req.Env {
+		args = append(args, "-e", k+"="+v)
 	}
 
 	// Add restart policy
