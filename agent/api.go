@@ -307,9 +307,14 @@ func (a *Agent) runAPI() {
 	// --- HTTP proxy to a workload by mesh IP (handlers_workloads.go) -
 	r.PathPrefix("/api/proxy/").HandlerFunc(a.apiWorkloadProxy)
 
-	// Dashboard UI (embedded)
+	// Dashboard UI (embedded). The HTML is re-embedded into the binary
+	// on every build, so the only thing that has to change between
+	// releases is the binary itself. Without no-store the browser will
+	// happily serve a months-old cached copy after an upgrade and the
+	// operator chases ghosts wondering why new UI fields are missing.
 	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store, must-revalidate")
 		w.Write(dashboardHTML)
 	}).Methods("GET")
 
