@@ -270,6 +270,7 @@ func (a *Agent) runAPI() {
 	// is additionally gated by JETTY_HOST_SHELL=true.
 	r.HandleFunc("/api/workloads/{name}/exec", a.apiWorkloadExec)
 	r.HandleFunc("/api/host/shell", a.apiHostShell)
+	r.HandleFunc("/api/host/exec", a.apiHostExec).Methods("POST")
 
 	// --- Encrypted env vars (handlers_env.go) ------------------------
 	r.HandleFunc("/api/env", a.apiListEnv).Methods("GET")

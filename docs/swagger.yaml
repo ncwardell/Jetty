@@ -235,6 +235,30 @@ definitions:
         description: populated when managed_by_jetty
         type: string
     type: object
+  agent.HostExecRequest:
+    properties:
+      command:
+        description: shell -c argument; the whole string is one command line
+        type: string
+      timeout:
+        description: seconds; default 30, max 300
+        type: integer
+    type: object
+  agent.HostExecResponse:
+    properties:
+      duration_ms:
+        type: integer
+      exit_code:
+        type: integer
+      node:
+        type: string
+      stderr:
+        type: string
+      stdout:
+        type: string
+      timed_out:
+        type: boolean
+    type: object
   agent.ImportReport:
     properties:
       created:
@@ -867,7 +891,13 @@ paths:
   /host/compose:
     get:
       description: Returns containers grouped by compose project. Standalone containers
-        (no compose project) are grouped under an empty project name.
+        (no compose project) are grouped under an empty project name. Pass ?node=<id|name>
+        to query a peer.
+      parameters:
+      - description: Peer ID or name; defaults to this node
+        in: query
+        name: node
+        type: string
       produces:
       - application/json
       responses:
@@ -883,7 +913,14 @@ paths:
   /host/containers:
     get:
       description: Returns every container on the host, including those not managed
-        by Jetty. The agent's own container is excluded.
+        by Jetty. The agent's own container is excluded. Pass ?node=<id|name> to query
+        a peer instead - useful when the dashboard is loaded via a shared Cloudflare
+        tunnel and lands on whichever node Cloudflare picks.
+      parameters:
+      - description: Peer ID or name; defaults to this node
+        in: query
+        name: node
+        type: string
       produces:
       - application/json
       responses:
@@ -896,6 +933,33 @@ paths:
       summary: List all Docker containers on this node
       tags:
       - host
+  /host/exec:
+    post:
+      consumes:
+      - application/json
+      description: One-shot exec. Requires JETTY_HOST_SHELL=true on the target agent
+        and AdminKey auth. ?node=<id|name> proxies to a peer.
+      parameters:
+      - description: Peer ID or name; defaults to this node
+        in: query
+        name: node
+        type: string
+      - description: Command to run
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/agent.HostExecRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.HostExecResponse'
+      summary: Run one command on the host and return its output
+      tags:
+      - terminal
   /host/shell:
     get:
       description: 'Upgrades to a WebSocket and runs an interactive shell. With --pid=host
