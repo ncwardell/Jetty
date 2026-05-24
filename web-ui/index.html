@@ -2645,6 +2645,13 @@
                     <input type="text" class="form-input" id="updateNodeImage" placeholder="ghcr.io/ncwardell/jetty:latest">
                     <div class="form-hint">The node will pull this image and restart with the new version</div>
                 </div>
+                <div class="form-group" style="margin-top: 12px;">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                        <input type="checkbox" id="updateNodeHostShell">
+                        <span>Enable host shell access (JETTY_HOST_SHELL=true)</span>
+                    </label>
+                    <div class="form-hint" style="margin-left: 24px;">Lets the dashboard open a root shell on this node. Anyone with the admin key gets full host access.</div>
+                </div>
                 <div id="updateNodeStatus" style="margin-top: 12px; display: none;">
                     <div style="display: flex; align-items: center; gap: 8px;">
                         <div class="spinner" style="width: 16px; height: 16px;"></div>
@@ -5762,6 +5769,7 @@
             updateNodeId = nodeId;
             document.getElementById('updateNodeName').textContent = nodeName;
             document.getElementById('updateNodeImage').value = 'ghcr.io/ncwardell/jetty:latest';
+            document.getElementById('updateNodeHostShell').checked = false;
             document.getElementById('updateNodeStatus').style.display = 'none';
             document.getElementById('updateNodeBtn').disabled = false;
             document.getElementById('updateNodeModal').classList.remove('hidden');
@@ -5787,8 +5795,14 @@
             statusText.textContent = 'Pulling image and restarting...';
             updateBtn.disabled = true;
 
+            const env = {};
+            if (document.getElementById('updateNodeHostShell').checked) {
+                env.JETTY_HOST_SHELL = 'true';
+            }
+            const body = { image };
+            if (Object.keys(env).length > 0) body.env = env;
             try {
-                await apiCall(`/nodes/${updateNodeId}/update`, 'POST', { image });
+                await apiCall(`/nodes/${updateNodeId}/update`, 'POST', body);
                 statusText.textContent = 'Update initiated! Node will restart shortly.';
                 showToast('Node update initiated. The node will restart with the new image.', 'success');
 
