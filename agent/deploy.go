@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -401,23 +402,39 @@ func (a *Agent) removeWorkload(wl *Workload) {
 }
 
 func (a *Agent) cleanupWorkloadIP(wl *Workload) {
-	// Get container IP before it's gone
-	out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
-	if len(out) > 0 {
-		containerID := strings.Split(strings.TrimSpace(string(out)), "\n")[0]
-		if containerID != "" {
-			out, _ = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID).Output()
-			containerIP := strings.TrimSpace(string(out))
-			if containerIP != "" {
-				// Remove DNAT rules
-				exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run()
-				exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run()
-			}
-		}
-	}
+	// Remove every DNAT rule referencing this workload's mesh IP. We can't
+	// just `-D` with the same args we added because a single workload now
+	// produces one rule per (container, port) pair, so we don't know the
+	// full set up front. Walking `iptables -S` and deleting every match is
+	// idempotent and survives upgrades from the old single-rule layout.
+	a.removeWorkloadDNAT(wl.IP)
 
 	// Remove mesh IP from interface
 	exec.Command("ip", "addr", "del", wl.IP+"/32", "dev", "jetty0").Run()
+}
+
+// removeWorkloadDNAT deletes every DNAT rule in the nat table that targets
+// the given mesh IP across PREROUTING and OUTPUT.
+func (a *Agent) removeWorkloadDNAT(meshIP string) {
+	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
+		out, err := exec.Command("iptables", "-t", "nat", "-S", chain).Output()
+		if err != nil {
+			continue
+		}
+		needle := "-d " + meshIP + "/32 "
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "-A ") || !strings.Contains(line, needle) {
+				continue
+			}
+			args := strings.Fields(line)
+			if len(args) < 2 {
+				continue
+			}
+			args[0] = "-D"
+			cmd := append([]string{"-t", "nat"}, args...)
+			exec.Command("iptables", cmd...).Run()
+		}
+	}
 }
 
 func (a *Agent) setupWorkloadIP(wl *Workload) {
@@ -427,33 +444,142 @@ func (a *Agent) setupWorkloadIP(wl *Workload) {
 		log.Printf("Note: adding %s to jetty0: %v (may already exist)", wl.IP, err)
 	}
 
-	// Wait for container to be ready with retry logic
-	var containerIP string
+	// Tear down any pre-existing DNAT rules for this mesh IP - on a redeploy
+	// the old rules still point at the previous container's bridge IP, which
+	// may have been recycled. Without this we accumulate stale rules and
+	// the kernel uses whichever it matches first.
+	a.removeWorkloadDNAT(wl.IP)
+
+	// Enumerate every container's published ports and DNAT each one to its
+	// owner container's bridge IP. A workload's compose can publish ports
+	// from multiple services (e.g. cliproxy on :8317 and open-webui on :8080
+	// in the same workload); per-port DNAT lets each service be reachable
+	// on the same mesh IP at its own port.
+	var ports []containerPort
 	maxRetries := 10
 	for i := 0; i < maxRetries; i++ {
-		containerIP = a.getWorkloadContainerIP(wl.Name)
-		if containerIP != "" {
+		ports = a.getWorkloadContainerPorts(wl.Name)
+		if len(ports) > 0 {
 			break
 		}
 		if i < maxRetries-1 {
-			time.Sleep(time.Duration(500*(i+1)) * time.Millisecond) // 500ms, 1s, 1.5s, ...
+			time.Sleep(time.Duration(500*(i+1)) * time.Millisecond)
 		}
 	}
 
+	if len(ports) > 0 {
+		for _, p := range ports {
+			target := fmt.Sprintf("%s:%d", p.bridgeIP, p.port)
+			for _, chain := range []string{"PREROUTING", "OUTPUT"} {
+				err := exec.Command("iptables", "-t", "nat", "-A", chain,
+					"-d", wl.IP, "-p", p.proto, "--dport", strconv.Itoa(p.port),
+					"-j", "DNAT", "--to", target).Run()
+				if err != nil {
+					log.Printf("Error: %s DNAT for %s %s/%d -> %s: %v",
+						chain, wl.IP, p.proto, p.port, target, err)
+				}
+			}
+			log.Printf("Routed: %s:%d/%s -> %s", wl.IP, p.port, p.proto, target)
+		}
+		return
+	}
+
+	// Fallback: no container publishes ports. Pick the first container and
+	// route all traffic to its bridge IP (preserves the original behavior
+	// for worker-only workloads that don't expose anything explicitly).
+	containerIP := a.getWorkloadContainerIP(wl.Name)
 	if containerIP == "" {
 		log.Printf("Error: couldn't get container IP for %s after %d retries", wl.Name, maxRetries)
 		return
 	}
-
-	// Set up DNAT rules
-	if err := exec.Command("iptables", "-t", "nat", "-A", "PREROUTING", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run(); err != nil {
-		log.Printf("Error: PREROUTING DNAT for %s: %v", wl.Name, err)
+	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
+		if err := exec.Command("iptables", "-t", "nat", "-A", chain,
+			"-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run(); err != nil {
+			log.Printf("Error: %s DNAT for %s: %v", chain, wl.IP, err)
+		}
 	}
-	if err := exec.Command("iptables", "-t", "nat", "-A", "OUTPUT", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run(); err != nil {
-		log.Printf("Error: OUTPUT DNAT for %s: %v", wl.Name, err)
+	log.Printf("Routed: %s -> %s (catch-all, no published ports)", wl.IP, containerIP)
+}
+
+// containerPort describes one published port owned by one container in a workload.
+type containerPort struct {
+	bridgeIP string
+	port     int
+	proto    string // "tcp" or "udp"
+}
+
+// getWorkloadContainerPorts returns every published (host:container) port
+// across every container in the workload's compose project, paired with that
+// container's bridge IP. Used to set up per-port DNAT so multi-service
+// workloads can expose more than one port on the same mesh IP.
+func (a *Agent) getWorkloadContainerPorts(name string) []containerPort {
+	out, err := exec.Command("docker", "ps",
+		"-f", "label=com.docker.compose.project=jetty_"+name,
+		"--format", "{{.ID}}\t{{.Ports}}",
+	).Output()
+	if err != nil || len(out) == 0 {
+		return nil
 	}
 
-	log.Printf("Routed: %s -> %s", wl.IP, containerIP)
+	var result []containerPort
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) < 2 || parts[0] == "" {
+			continue
+		}
+		id := parts[0]
+		ports := parts[1]
+
+		ipOut, ipErr := exec.Command("docker", "inspect", "-f",
+			"{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", id).Output()
+		if ipErr != nil {
+			continue
+		}
+		bridgeIP := strings.TrimSpace(string(ipOut))
+		if bridgeIP == "" {
+			continue
+		}
+
+		// Docker ps "Ports" looks like:
+		//   "0.0.0.0:8080->80/tcp, [::]:8080->80/tcp, 9000/tcp"
+		// We want the entries with "->" (published, externally reachable)
+		// and the *container-side* port (right of "->", before "/").
+		// Dedupe v4/v6 duplicates by port/proto.
+		seen := map[string]bool{}
+		for _, p := range strings.Split(ports, ",") {
+			p = strings.TrimSpace(p)
+			arrowIdx := strings.Index(p, "->")
+			if arrowIdx < 0 {
+				continue
+			}
+			rest := p[arrowIdx+2:]
+			slashIdx := strings.Index(rest, "/")
+			if slashIdx < 0 {
+				continue
+			}
+			portStr := rest[:slashIdx]
+			proto := rest[slashIdx+1:]
+			if proto != "tcp" && proto != "udp" {
+				continue
+			}
+			key := portStr + "/" + proto
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			port, err := strconv.Atoi(portStr)
+			if err != nil {
+				continue
+			}
+			result = append(result, containerPort{
+				bridgeIP: bridgeIP,
+				port:     port,
+				proto:    proto,
+			})
+		}
+	}
+	return result
 }
 
 // getWorkloadContainerIP returns the container IP for a workload, or empty string if not found.
