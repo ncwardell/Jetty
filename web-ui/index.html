@@ -4426,7 +4426,7 @@
         // ---- Containers page ----------------------------------------------
         // Surfaces every Docker container on a node, not just Jetty workloads.
         // Backed by GET /api/host/compose (already grouped by project) and a
-        // node selector that fans out via /api/proxy/{ip}/api/host/compose.
+        // node selector that fans out via /api/host/compose?node=<id|name>.
 
         // In-memory state for the current containers view. Re-rendered on
         // search/filter/refresh without re-fetching unless the node changes.
@@ -4458,12 +4458,12 @@
             sel.appendChild(localOpt);
 
             (state.peers || []).forEach(p => {
-                if (!p.ip) return;
+                if (!p.id && !p.name) return;
                 const opt = document.createElement('option');
-                // We proxy by IP because /api/host/* is per-node and the
-                // proxy endpoint speaks IPs.
-                opt.value = `proxy:${p.ip}`;
-                opt.textContent = `${p.name} (${p.ip})`;
+                // /api/host/* supports ?node=<id|name> via proxyHostRequestIfRemote.
+                // Use id so renames don't break selection.
+                opt.value = `node:${p.id || p.name}`;
+                opt.textContent = `${p.name}${p.ip ? ' (' + p.ip + ')' : ''}`;
                 sel.appendChild(opt);
             });
 
@@ -4485,10 +4485,11 @@
                 let projects;
                 if (nodeChoice === 'local' || !nodeChoice) {
                     projects = await apiCall('/host/compose');
-                } else if (nodeChoice.startsWith('proxy:')) {
-                    const ip = nodeChoice.slice('proxy:'.length);
-                    // /api/proxy/{ip}{rest} is the existing fan-out endpoint.
-                    projects = await apiCall(`/proxy/${ip}/api/host/compose`);
+                } else if (nodeChoice.startsWith('node:')) {
+                    const nodeId = nodeChoice.slice('node:'.length);
+                    // /api/host/compose?node=<id|name> proxies to the named peer
+                    // via proxyHostRequestIfRemote (handlers_host.go).
+                    projects = await apiCall(`/host/compose?node=${encodeURIComponent(nodeId)}`);
                 } else {
                     projects = await apiCall('/host/compose');
                 }
