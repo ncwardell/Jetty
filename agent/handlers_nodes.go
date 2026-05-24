@@ -360,8 +360,14 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	// Apply env overrides from the request last so they win Docker's
 	// last-flag-wins resolution. Lets the UI toggle JETTY_HOST_SHELL
 	// (and any other flag) per-update without losing whatever was
-	// already set on the running container.
+	// already set on the running container. Skip malformed entries
+	// (empty key, '=' in key, NUL bytes) so we never produce a busted
+	// -e arg that aborts docker create halfway through.
 	for k, v := range req.Env {
+		if k == "" || strings.ContainsAny(k, "=\x00") || strings.ContainsAny(v, "\x00") {
+			log.Printf("Update: skipping malformed env entry %q", k)
+			continue
+		}
 		args = append(args, "-e", k+"="+v)
 	}
 
