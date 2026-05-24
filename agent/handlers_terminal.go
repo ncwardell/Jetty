@@ -1,8 +1,11 @@
 package agent
 
 import (
+	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
@@ -388,6 +392,174 @@ func hostNamespacesAvailable() bool {
 		return false
 	}
 	return ourMnt != pid1Mnt
+}
+
+// HostExecRequest is the body shape for POST /api/host/exec.
+type HostExecRequest struct {
+	Command string `json:"command"`           // shell -c argument; the whole string is one command line
+	Timeout int    `json:"timeout,omitempty"` // seconds; default 30, max 300
+}
+
+// HostExecResponse is what the endpoint returns.
+type HostExecResponse struct {
+	ExitCode   int    `json:"exit_code"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	DurationMs int64  `json:"duration_ms"`
+	Node       string `json:"node"`
+	TimedOut   bool   `json:"timed_out,omitempty"`
+}
+
+// apiHostExec runs a one-shot command on the host and returns its output.
+// This is the synchronous, tool-friendly counterpart to /api/host/shell:
+// no WebSocket, no PTY, no interactive prompts - perfect for an LLM agent
+// or a script that just wants `ls /` to come back as a string.
+//
+// Gating mirrors /api/host/shell - JETTY_HOST_SHELL=true must be set on
+// the agent. Without --pid=host on the docker run, the command executes
+// inside the agent container rather than on the host's filesystem; the
+// response includes "container_namespace": true so callers can warn.
+//
+// @Summary Run one command on the host and return its output
+// @Description One-shot exec. Requires JETTY_HOST_SHELL=true on the target agent and AdminKey auth. ?node=<id|name> proxies to a peer.
+// @Tags terminal
+// @Accept json
+// @Produce json
+// @Param node query string false "Peer ID or name; defaults to this node"
+// @Param request body HostExecRequest true "Command to run"
+// @Success 200 {object} HostExecResponse
+// @Router /host/exec [post]
+func (a *Agent) apiHostExec(w http.ResponseWriter, r *http.Request) {
+	// Same auth shape as the WS host shell: AdminKey only (not peer keys).
+	if !a.adminAuthorize(r) {
+		http.Error(w, "unauthorized: admin key required for host exec", http.StatusUnauthorized)
+		return
+	}
+
+	// Cross-node proxy: ?node=<id|name> forwards to a peer. Same pattern
+	// as proxyHostRequestIfRemote in handlers_host.go.
+	if nodeID := r.URL.Query().Get("node"); nodeID != "" && nodeID != "self" && nodeID != a.hwid && nodeID != a.hostname {
+		a.proxyHostExec(w, r, nodeID)
+		return
+	}
+
+	if !a.hostShellEnabled {
+		http.Error(w, "host exec disabled - set JETTY_HOST_SHELL=true on the agent to enable", http.StatusForbidden)
+		return
+	}
+
+	var req HostExecRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Command) == "" {
+		http.Error(w, "command is required", http.StatusBadRequest)
+		return
+	}
+	timeout := req.Timeout
+	if timeout <= 0 {
+		timeout = 30
+	}
+	if timeout > 300 {
+		timeout = 300
+	}
+
+	// Build the actual exec. With --pid=host we nsenter into PID 1's
+	// namespaces; otherwise we run the command directly inside the agent
+	// container. Same logic as apiHostShell - just synchronous.
+	var argv []string
+	if hostNamespacesAvailable() {
+		argv = []string{"/usr/bin/nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "/bin/sh", "-c", req.Command}
+	} else {
+		argv = []string{"/bin/sh", "-c", req.Command}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeout)*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Env = append(cmd.Env,
+		"TERM=dumb",
+		"HOME=/root",
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	)
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	start := time.Now()
+	err := cmd.Run()
+	dur := time.Since(start)
+
+	resp := HostExecResponse{
+		Stdout:     stdoutBuf.String(),
+		Stderr:     stderrBuf.String(),
+		DurationMs: dur.Milliseconds(),
+		Node:       a.hostname,
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		resp.TimedOut = true
+		resp.ExitCode = 124 // GNU coreutils convention
+	} else if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			resp.ExitCode = exitErr.ExitCode()
+		} else {
+			// Process didn't start at all (e.g. nsenter missing). Surface
+			// as a 500 rather than a "completed with rc=1" lie.
+			http.Error(w, fmt.Sprintf("exec failed to start: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	log.Printf("Host exec: by %s (%dms exit=%d, %d stdout / %d stderr bytes)",
+		r.RemoteAddr, resp.DurationMs, resp.ExitCode, len(resp.Stdout), len(resp.Stderr))
+	writeJSON(w, resp)
+}
+
+// proxyHostExec forwards a POST /api/host/exec to a peer when ?node=<id> targets one.
+func (a *Agent) proxyHostExec(w http.ResponseWriter, r *http.Request, nodeID string) {
+	a.stateMu.RLock()
+	var target *Peer
+	for _, p := range a.state.Peers {
+		if p.ID == nodeID || p.Name == nodeID {
+			target = p
+			break
+		}
+	}
+	admin := a.state.AdminKey
+	a.stateMu.RUnlock()
+
+	if target == nil {
+		http.Error(w, "node not found: "+nodeID, http.StatusNotFound)
+		return
+	}
+	if admin == "" {
+		http.Error(w, "admin key not configured", http.StatusUnauthorized)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	url := a.getPeerAPIURL(target, "/api/host/exec")
+	proxyReq, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "build proxy request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	proxyReq.Header.Set("X-API-Key", admin)
+	proxyReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(proxyReq)
+	if err != nil {
+		http.Error(w, "reach node: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 // proxyHostShell bridges a browser's WebSocket to a peer's

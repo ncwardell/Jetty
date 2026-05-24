@@ -269,6 +269,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 			NetworkMode string   `json:"NetworkMode"`
 			Privileged  bool     `json:"Privileged"`
 			CapAdd      []string `json:"CapAdd"`
+			PidMode     string   `json:"PidMode"`
 		} `json:"HostConfig"`
 		Config struct {
 			Env []string `json:"Env"`
@@ -369,6 +370,28 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		args = append(args, "-e", k+"="+v)
+	}
+
+	// --pid=host is required for the host-shell endpoint to actually see
+	// the host's process namespace (otherwise it sees only the agent
+	// container's processes). The UI promises this when the operator
+	// ticks "Enable host shell access". Carry it forward if it was
+	// already set on the running container, OR if this update enables
+	// JETTY_HOST_SHELL=true via the request env, OR if the preserved env
+	// from the running container already has it set to true. Same
+	// reasoning for --privileged: host shell access without privileged
+	// can't actually do much (no mount, no kernel introspection).
+	wantHostShell := strings.EqualFold(req.Env["JETTY_HOST_SHELL"], "true")
+	if !wantHostShell {
+		for _, e := range container.Config.Env {
+			if strings.EqualFold(e, "JETTY_HOST_SHELL=true") {
+				wantHostShell = true
+				break
+			}
+		}
+	}
+	if wantHostShell || container.HostConfig.PidMode == "host" {
+		args = append(args, "--pid=host")
 	}
 
 	// Add restart policy

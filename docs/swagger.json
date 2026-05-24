@@ -323,7 +323,7 @@
         },
         "/host/compose": {
             "get": {
-                "description": "Returns containers grouped by compose project. Standalone containers (no compose project) are grouped under an empty project name.",
+                "description": "Returns containers grouped by compose project. Standalone containers (no compose project) are grouped under an empty project name. Pass ?node=\u003cid|name\u003e to query a peer.",
                 "produces": [
                     "application/json"
                 ],
@@ -331,6 +331,14 @@
                     "host"
                 ],
                 "summary": "List Docker compose projects on this node",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Peer ID or name; defaults to this node",
+                        "name": "node",
+                        "in": "query"
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -346,7 +354,7 @@
         },
         "/host/containers": {
             "get": {
-                "description": "Returns every container on the host, including those not managed by Jetty. The agent's own container is excluded.",
+                "description": "Returns every container on the host, including those not managed by Jetty. The agent's own container is excluded. Pass ?node=\u003cid|name\u003e to query a peer instead - useful when the dashboard is loaded via a shared Cloudflare tunnel and lands on whichever node Cloudflare picks.",
                 "produces": [
                     "application/json"
                 ],
@@ -354,6 +362,14 @@
                     "host"
                 ],
                 "summary": "List all Docker containers on this node",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Peer ID or name; defaults to this node",
+                        "name": "node",
+                        "in": "query"
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -362,6 +378,46 @@
                             "items": {
                                 "$ref": "#/definitions/agent.HostContainer"
                             }
+                        }
+                    }
+                }
+            }
+        },
+        "/host/exec": {
+            "post": {
+                "description": "One-shot exec. Requires JETTY_HOST_SHELL=true on the target agent and AdminKey auth. ?node=\u003cid|name\u003e proxies to a peer.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "terminal"
+                ],
+                "summary": "Run one command on the host and return its output",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Peer ID or name; defaults to this node",
+                        "name": "node",
+                        "in": "query"
+                    },
+                    {
+                        "description": "Command to run",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/agent.HostExecRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/agent.HostExecResponse"
                         }
                     }
                 }
@@ -1739,6 +1795,42 @@
                 "workload_name": {
                     "description": "populated when managed_by_jetty",
                     "type": "string"
+                }
+            }
+        },
+        "agent.HostExecRequest": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "description": "shell -c argument; the whole string is one command line",
+                    "type": "string"
+                },
+                "timeout": {
+                    "description": "seconds; default 30, max 300",
+                    "type": "integer"
+                }
+            }
+        },
+        "agent.HostExecResponse": {
+            "type": "object",
+            "properties": {
+                "duration_ms": {
+                    "type": "integer"
+                },
+                "exit_code": {
+                    "type": "integer"
+                },
+                "node": {
+                    "type": "string"
+                },
+                "stderr": {
+                    "type": "string"
+                },
+                "stdout": {
+                    "type": "string"
+                },
+                "timed_out": {
+                    "type": "boolean"
                 }
             }
         },
