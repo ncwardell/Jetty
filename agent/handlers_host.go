@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"io"
 	"net/http"
 	"os/exec"
 	"sort"
@@ -155,12 +156,16 @@ func (a *Agent) listHostContainers() ([]HostContainer, error) {
 
 // apiHostContainers godoc
 // @Summary List all Docker containers on this node
-// @Description Returns every container on the host, including those not managed by Jetty. The agent's own container is excluded.
+// @Description Returns every container on the host, including those not managed by Jetty. The agent's own container is excluded. Pass ?node=<id|name> to query a peer instead - useful when the dashboard is loaded via a shared Cloudflare tunnel and lands on whichever node Cloudflare picks.
 // @Tags host
 // @Produce json
+// @Param node query string false "Peer ID or name; defaults to this node"
 // @Success 200 {array} HostContainer
 // @Router /host/containers [get]
 func (a *Agent) apiHostContainers(w http.ResponseWriter, r *http.Request) {
+	if a.proxyHostRequestIfRemote(w, r, "/api/host/containers") {
+		return
+	}
 	containers, err := a.listHostContainers()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list containers: "+err.Error())
@@ -171,12 +176,16 @@ func (a *Agent) apiHostContainers(w http.ResponseWriter, r *http.Request) {
 
 // apiHostCompose godoc
 // @Summary List Docker compose projects on this node
-// @Description Returns containers grouped by compose project. Standalone containers (no compose project) are grouped under an empty project name.
+// @Description Returns containers grouped by compose project. Standalone containers (no compose project) are grouped under an empty project name. Pass ?node=<id|name> to query a peer.
 // @Tags host
 // @Produce json
+// @Param node query string false "Peer ID or name; defaults to this node"
 // @Success 200 {array} HostComposeProject
 // @Router /host/compose [get]
 func (a *Agent) apiHostCompose(w http.ResponseWriter, r *http.Request) {
+	if a.proxyHostRequestIfRemote(w, r, "/api/host/compose") {
+		return
+	}
 	containers, err := a.listHostContainers()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list containers: "+err.Error())
@@ -213,4 +222,49 @@ func (a *Agent) apiHostCompose(w http.ResponseWriter, r *http.Request) {
 	})
 
 	writeJSON(w, out)
+}
+
+// proxyHostRequestIfRemote handles ?node=<id|name> on host endpoints.
+// Returns true when the request was handled by proxying to a peer (so
+// the caller should stop); returns false for local requests (caller
+// continues with normal local processing). The dashboard hits a single
+// shared Cloudflare tunnel that lands on whichever node Cloudflare
+// picks - without per-node addressing, every refresh shows a different
+// node's containers. ?node=self is a no-op alias for the local node.
+func (a *Agent) proxyHostRequestIfRemote(w http.ResponseWriter, r *http.Request, path string) bool {
+	nodeID := r.URL.Query().Get("node")
+	if nodeID == "" || nodeID == "self" || nodeID == a.hwid || nodeID == a.hostname {
+		return false
+	}
+
+	a.stateMu.RLock()
+	var target *Peer
+	for _, p := range a.state.Peers {
+		if p.ID == nodeID || p.Name == nodeID {
+			target = p
+			break
+		}
+	}
+	a.stateMu.RUnlock()
+	if target == nil {
+		writeError(w, http.StatusNotFound, "node not found: "+nodeID)
+		return true
+	}
+
+	url := a.getPeerAPIURL(target, path)
+	req, err := a.peerRequest("GET", url, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "build proxy request: "+err.Error())
+		return true
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "reach node: "+err.Error())
+		return true
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+	return true
 }
