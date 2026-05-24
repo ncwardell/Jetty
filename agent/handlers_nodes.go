@@ -320,6 +320,27 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		args = append(args, "--cap-add", cap)
 	}
 
+	// Preserve operator-set env vars across the update. Without this,
+	// every self-update silently drops things like JETTY_HOST_SHELL,
+	// JETTY_TUNNEL_DOMAIN, JETTY_WARP_CONNECTOR_TOKEN - and the next
+	// boot quietly loses those features. Skip vars Docker injects
+	// itself (PATH, HOSTNAME, HOME, TERM) and JETTY_SECRET which we
+	// set explicitly below from state.
+	dockerInjected := map[string]bool{
+		"PATH": true, "HOSTNAME": true, "HOME": true, "TERM": true,
+		"JETTY_SECRET": true,
+	}
+	for _, e := range container.Config.Env {
+		i := strings.IndexByte(e, '=')
+		if i <= 0 {
+			continue
+		}
+		if dockerInjected[e[:i]] {
+			continue
+		}
+		args = append(args, "-e", e)
+	}
+
 	// Pass the cluster admin key to the new container so JETTY_SECRET
 	// is non-empty after restart. Use the persisted state value (not
 	// a.clusterSecret env), because joiners receive AdminKey via
