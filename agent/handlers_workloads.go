@@ -69,16 +69,17 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type WorkloadResponse struct {
-		Name         string            `json:"name"`
-		IP           string            `json:"ip"`
-		Compose      string            `json:"compose"`
-		Revive       bool              `json:"revive"`
-		Autostart    bool              `json:"autostart"`
-		AllowedNodes []string          `json:"allowed_nodes,omitempty"`
-		Tags         []string          `json:"tags,omitempty"`
-		Owner        map[string]string `json:"owner"`
-		Version      int64             `json:"version"`
-		Status       string            `json:"status"`
+		Name         string                   `json:"name"`
+		IP           string                   `json:"ip"`
+		Compose      string                   `json:"compose"`
+		Revive       bool                     `json:"revive"`
+		Autostart    bool                     `json:"autostart"`
+		AllowedNodes []string                 `json:"allowed_nodes,omitempty"`
+		Tags         []string                 `json:"tags,omitempty"`
+		Owner        map[string]string        `json:"owner"`
+		Version      int64                    `json:"version"`
+		Status       string                   `json:"status"`
+		Containers   []map[string]interface{} `json:"containers"`
 	}
 
 	// Collect workload data - we'll fetch remote statuses after releasing the lock
@@ -138,9 +139,14 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 	}
 	a.stateMu.RUnlock()
 
-	// Fetch remote workload statuses in parallel with 2 second timeout
+	// Fetch remote workload statuses in parallel with 2 second timeout.
+	// Persist the full containers array (not just a status string) so that
+	// tools listing the cluster get rich per-container state for remote
+	// workloads too. Without this, half the rows came back containers=null
+	// and operators had to fan out N more requests to learn anything.
 	statusClient := &http.Client{Timeout: 2 * time.Second}
 	statuses := make(map[string]string)
+	remoteContainers := make(map[string][]map[string]interface{})
 	var statusMu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -153,6 +159,7 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 			go func(wl *Workload, peer *Peer) {
 				defer wg.Done()
 				status := "remote" // Default fallback
+				var ctrs []map[string]interface{}
 
 				url := a.getPeerAPIURL(peer, "/api/workloads/"+wl.Name)
 				if url != "" {
@@ -164,18 +171,19 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 							if resp.StatusCode == 200 {
 								var data map[string]interface{}
 								if json.NewDecoder(resp.Body).Decode(&data) == nil {
-									// Check containers array for running status
-									if containers, ok := data["containers"].([]interface{}); ok && len(containers) > 0 {
+									if containers, ok := data["containers"].([]interface{}); ok {
 										hasRunning := false
 										for _, c := range containers {
 											if cm, ok := c.(map[string]interface{}); ok {
+												ctrs = append(ctrs, cm)
 												if running, ok := cm["running"].(bool); ok && running {
 													hasRunning = true
-													break
 												}
 											}
 										}
-										if hasRunning {
+										if len(ctrs) == 0 {
+											status = "stopped"
+										} else if hasRunning {
 											status = "running"
 										} else {
 											status = "stopped"
@@ -191,6 +199,7 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 
 				statusMu.Lock()
 				statuses[wl.Name] = status
+				remoteContainers[wl.Name] = ctrs
 				statusMu.Unlock()
 			}(info.wl, info.ownerPeer)
 		} else {
@@ -202,6 +211,12 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 	// Build final workloads list
 	workloads := make([]WorkloadResponse, 0, len(workloadInfos))
 	for _, info := range workloadInfos {
+		var ctrs []map[string]interface{}
+		if info.isLocal {
+			ctrs = a.getContainerInfo(info.wl.Name)
+		} else {
+			ctrs = remoteContainers[info.wl.Name]
+		}
 		workloads = append(workloads, WorkloadResponse{
 			Name:         info.wl.Name,
 			IP:           info.wl.IP,
@@ -213,6 +228,7 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 			Owner:        info.ownerInfo,
 			Version:      info.wl.Version,
 			Status:       statuses[info.wl.Name],
+			Containers:   ctrs,
 		})
 	}
 
