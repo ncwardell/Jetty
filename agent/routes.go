@@ -248,7 +248,20 @@ func (a *Agent) updateWorkloadRoutes() {
 			err = exec.Command("ip", "route", "add", wlIP+"/32", "dev", tunName).Run()
 			routeDesc = "tunnel " + tunName
 		} else if a.tunDevice != nil {
-			err = exec.Command("ip", "route", "add", wlIP+"/32", "dev", "jetty_tun").Run()
+			// `src <warpIP>` pins the source address the kernel picks for
+			// packets via this route. Without it, jetty_tun has no IPv4
+			// address so the kernel falls back to the default route's
+			// source (eth0's public IP). Packets still leave correctly,
+			// but the *response* from the peer's workload container is
+			// addressed to a non-mesh IP - the peer's kernel routes that
+			// reply via its public default route instead of back through
+			// the tunnel, and the connection silently fails. Pinning src
+			// to our mesh IP keeps the whole round-trip on the mesh.
+			args := []string{"route", "add", wlIP + "/32", "dev", "jetty_tun"}
+			if a.ip != "" {
+				args = append(args, "src", a.ip)
+			}
+			err = exec.Command("ip", args...).Run()
 			routeDesc = "userspace tunnel to " + info.ownerIP
 		} else {
 			// No transport available. Don't install a route - it would silently
