@@ -599,6 +599,22 @@ func (a *Agent) getWorkloadContainerPorts(name string) []containerPort {
 // a Jetty workload (it's how external traffic reaches it). Fall back to first
 // container if no service publishes ports (rare; e.g. a worker-only workload).
 func (a *Agent) getWorkloadContainerIP(name string) string {
+	return a.getWorkloadContainerIPForPort(name, 0)
+}
+
+// getWorkloadContainerIPForPort returns the docker network IP of the container in
+// workload `name` that publishes `port`. Multi-container compose workloads (e.g.
+// jetty_cliproxy with open-webui:8080 on one container and cli-proxy:1455 on
+// another) require per-port routing: the receiving node's iptables PREROUTING
+// chain has correct per-port DNAT rules, but the userspace WS tunnel proxy
+// bypasses iptables and dials a single IP. Picking the wrong container IP for a
+// given port lands the SYN on a host with no listener -> RST -> "connection
+// refused" for users.
+//
+// Pass port=0 to get the legacy behaviour (first container with any host
+// publication), useful for callers that don't know the port (e.g. non-TCP
+// proxies). For TCP SYN translation, always pass the destination port.
+func (a *Agent) getWorkloadContainerIPForPort(name string, port uint16) string {
 	out, err := exec.Command("docker", "ps",
 		"-f", "label=com.docker.compose.project=jetty_"+name,
 		"--format", "{{.ID}}\t{{.Ports}}",
@@ -607,7 +623,14 @@ func (a *Agent) getWorkloadContainerIP(name string) string {
 		return ""
 	}
 
-	var containerID, fallbackID string
+	portMarker := ""
+	if port != 0 {
+		// docker ps Ports format: "0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp".
+		// Match "->PORT/" to pin the container side of the publication.
+		portMarker = fmt.Sprintf("->%d/", port)
+	}
+
+	var containerID, publishedID, fallbackID string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		parts := strings.SplitN(line, "\t", 2)
 		if len(parts) < 1 || parts[0] == "" {
@@ -623,12 +646,18 @@ func (a *Agent) getWorkloadContainerIP(name string) string {
 		}
 		// "->" indicates a host port publication (e.g. "0.0.0.0:80->80/tcp").
 		// Internal-only EXPOSE doesn't contain "->".
-		if strings.Contains(ports, "->") {
+		if strings.Contains(ports, "->") && publishedID == "" {
+			publishedID = id
+		}
+		if portMarker != "" && strings.Contains(ports, portMarker) {
 			containerID = id
 			break
 		}
 	}
 
+	if containerID == "" {
+		containerID = publishedID
+	}
 	if containerID == "" {
 		containerID = fallbackID
 	}

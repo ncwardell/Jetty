@@ -527,11 +527,14 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 		a.stateMu.RUnlock()
 
 		if exists && wl.Owner == a.hwid {
-			// This is our workload, get the actual container IP
-			containerIP := a.getWorkloadContainerIP(wl.Name)
+			// This is our workload, get the actual container IP for THIS port.
+			// Multi-container workloads (e.g. cliproxy with open-webui:8080 +
+			// cli-proxy:1455) require per-port lookup — picking "any" container
+			// IP routes :8080 traffic to the cli-proxy sidecar with no listener.
+			containerIP := a.getWorkloadContainerIPForPort(wl.Name, dstPort)
 			if containerIP != "" {
 				targetAddr = fmt.Sprintf("%s:%d", containerIP, dstPort)
-				log.Printf("WS tunnel proxy: translated %s -> %s", dstIP, containerIP)
+				log.Printf("WS tunnel proxy: translated %s:%d -> %s", dstIP, dstPort, containerIP)
 			}
 		}
 
