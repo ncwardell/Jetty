@@ -233,19 +233,27 @@ func (a *Agent) updateWorkloadRoutes() {
 		}
 	}
 
-	// Add new routes / update changed owners.
+	// Add or refresh routes. Uses `ip route replace` (not `add`) so the
+	// kernel state converges to what we want regardless of whether a
+	// matching route is already installed. This makes the reconciler
+	// self-healing: if a route was wiped out-of-band (TUN flap, manual
+	// `ip route del`, container restart that recreated the link without
+	// the agent restarting), the next reconcile re-installs it instead
+	// of trusting a.workloadRoutes as authoritative.
+	//
+	// Without this, an entry surviving in a.workloadRoutes whose kernel
+	// counterpart had been removed would never be re-added: the function
+	// would short-circuit on the in-memory match and skip the kernel
+	// write entirely. We observed this exact failure mode on a peer that
+	// had been up for days with no IPv4 mesh routes in `ip route show`
+	// despite a.workloadRoutes being populated.
 	for wlIP, info := range desiredRoutes {
-		if existingOwner, ok := a.workloadRoutes[wlIP]; ok && existingOwner == info.ownerID {
-			// Route already correct
-			continue
-		}
-
 		var err error
 		var routeDesc string
 
 		if a.tunnelMode != "" {
 			tunName := a.getTunnelName(info.ownerID)
-			err = exec.Command("ip", "route", "add", wlIP+"/32", "dev", tunName).Run()
+			err = exec.Command("ip", "route", "replace", wlIP+"/32", "dev", tunName).Run()
 			routeDesc = "tunnel " + tunName
 		} else if a.tunDevice != nil {
 			// `src <warpIP>` pins the source address the kernel picks for
@@ -257,7 +265,7 @@ func (a *Agent) updateWorkloadRoutes() {
 			// reply via its public default route instead of back through
 			// the tunnel, and the connection silently fails. Pinning src
 			// to our mesh IP keeps the whole round-trip on the mesh.
-			args := []string{"route", "add", wlIP + "/32", "dev", "jetty_tun"}
+			args := []string{"route", "replace", wlIP + "/32", "dev", "jetty_tun"}
 			if a.ip != "" {
 				args = append(args, "src", a.ip)
 			}
@@ -275,10 +283,14 @@ func (a *Agent) updateWorkloadRoutes() {
 		}
 
 		if err == nil {
+			// Only log on owner change or first install. Steady-state
+			// replaces are silent to avoid log spam every reconcile.
+			if existingOwner, ok := a.workloadRoutes[wlIP]; !ok || existingOwner != info.ownerID {
+				log.Printf("Added route for %s via %s", wlIP, routeDesc)
+			}
 			a.workloadRoutes[wlIP] = info.ownerID
-			log.Printf("Added route for %s via %s", wlIP, routeDesc)
 		} else {
-			log.Printf("Warning: failed to add route for %s via %s: %v", wlIP, routeDesc, err)
+			log.Printf("Warning: failed to replace route for %s via %s: %v", wlIP, routeDesc, err)
 		}
 	}
 }
