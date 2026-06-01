@@ -212,6 +212,13 @@ func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
 	e.agent.ensurePeerTunnel(meta.ID, meta.IP)
 
 	e.agent.saveState()
+
+	// Kick a hosts+routes reconcile so workloads owned by the newly-joined
+	// peer become reachable immediately. Without this, the next route
+	// install waits up to 30s for memberlistPeriodicSync, and that itself
+	// can early-return if the peer's API isn't ready yet - leading to
+	// minutes of broken cross-node routing after a peer flap.
+	e.agent.updateHosts()
 }
 
 // NotifyLeave is called when a node leaves the cluster. We don't wait
