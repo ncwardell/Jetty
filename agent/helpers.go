@@ -32,6 +32,30 @@ var validPeerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 // Valid environment variable key pattern
 var envKeyPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
+// validateRegistryAuth checks the shape of a workload's optional registry
+// credential. nil is valid (no private-registry auth - default behavior).
+// We validate shape only, not that the referenced env key exists: operators
+// may attach registry_auth before adding the secret, and pull-time surfaces
+// a clear "token_ref not found" error if it's still missing.
+func validateRegistryAuth(ra *RegistryAuth) error {
+	if ra == nil {
+		return nil
+	}
+	if ra.Registry == "" {
+		return fmt.Errorf("registry_auth.registry required (e.g. \"ghcr.io\")")
+	}
+	if strings.ContainsAny(ra.Registry, " \t\r\n/") {
+		return fmt.Errorf("registry_auth.registry %q is not a valid registry host", ra.Registry)
+	}
+	if ra.TokenRef == "" {
+		return fmt.Errorf("registry_auth.token_ref required (name of an env-store key holding the token)")
+	}
+	if !envKeyPattern.MatchString(ra.TokenRef) {
+		return fmt.Errorf("registry_auth.token_ref %q must be a valid env key (alphanumeric/underscore, not starting with a digit)", ra.TokenRef)
+	}
+	return nil
+}
+
 // validTagPattern accepts lowercase alphanumerics + dash + underscore
 // (and the colon character so users can do prefix tags like "env:prod"
 // if they want, without us needing a full key=value labels system).

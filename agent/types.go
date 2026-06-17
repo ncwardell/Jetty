@@ -113,9 +113,27 @@ type Workload struct {
 	// all tagged "media", export all tagged "prod", etc.). Free-form
 	// strings; validated with validTagPattern. Sorted+deduped on
 	// ingest so the wire form is canonical.
-	Tags    []string `json:"tags,omitempty"`
-	Owner   string   `json:"owner"`   // Node HWID
-	Version int64    `json:"version"` // Unix timestamp
+	Tags []string `json:"tags,omitempty"`
+	// RegistryAuth optionally authenticates this workload's image pull
+	// against a private registry. The token itself is never stored here -
+	// TokenRef names a key in the encrypted env store whose value is the
+	// registry password/PAT. When nil, pulls run with no Jetty-managed
+	// credentials (public images, or whatever the host docker config
+	// already provides) - identical to pre-feature behavior.
+	RegistryAuth *RegistryAuth `json:"registry_auth,omitempty"`
+	Owner        string        `json:"owner"`   // Node HWID
+	Version      int64         `json:"version"` // Unix timestamp
+}
+
+// RegistryAuth tells Jetty how to authenticate an image pull for a workload.
+// The secret value lives in the encrypted, cluster-synced env store; this
+// struct only carries a *reference* to it (TokenRef) so the workload record
+// itself - which syncs across the cluster and renders in the dashboard in
+// the clear - never contains a credential.
+type RegistryAuth struct {
+	Registry string `json:"registry"`           // Registry host, e.g. "ghcr.io"
+	Username string `json:"username,omitempty"` // Registry username; defaults to "x-access-token" for PATs
+	TokenRef string `json:"token_ref"`          // Env-store key holding the token/PAT
 }
 
 // DeletedWorkload represents a tombstone for a deleted workload to propagate deletions

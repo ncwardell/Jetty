@@ -48,20 +48,22 @@ type WorkloadRequest struct {
 	Compose      string   `json:"compose" example:"services:\n  web:\n    image: nginx"`
 	ComposeAmd64 string   `json:"compose_amd64,omitempty" example:"services:\n  web:\n    image: nginx:amd64"`
 	ComposeArm64 string   `json:"compose_arm64,omitempty" example:"services:\n  web:\n    image: nginx:arm64"`
-	Revive       bool     `json:"revive" example:"true"`
-	Autostart    bool     `json:"autostart" example:"true"`
-	AllowedNodes []string `json:"allowed_nodes,omitempty" example:"node1,node2"`
+	Revive       bool          `json:"revive" example:"true"`
+	Autostart    bool          `json:"autostart" example:"true"`
+	AllowedNodes []string      `json:"allowed_nodes,omitempty" example:"node1,node2"`
+	RegistryAuth *RegistryAuth `json:"registry_auth,omitempty"`
 }
 
 // WorkloadUpdateRequest represents a request to update a workload
 type WorkloadUpdateRequest struct {
-	Compose      *string   `json:"compose,omitempty"`
-	ComposeAmd64 *string   `json:"compose_amd64,omitempty"`
-	ComposeArm64 *string   `json:"compose_arm64,omitempty"`
-	IP           *string   `json:"ip,omitempty"`
-	Revive       *bool     `json:"revive,omitempty"`
-	Autostart    *bool     `json:"autostart,omitempty"`
-	AllowedNodes *[]string `json:"allowed_nodes,omitempty"`
+	Compose      *string       `json:"compose,omitempty"`
+	ComposeAmd64 *string       `json:"compose_amd64,omitempty"`
+	ComposeArm64 *string       `json:"compose_arm64,omitempty"`
+	IP           *string       `json:"ip,omitempty"`
+	Revive       *bool         `json:"revive,omitempty"`
+	Autostart    *bool         `json:"autostart,omitempty"`
+	AllowedNodes *[]string     `json:"allowed_nodes,omitempty"`
+	RegistryAuth *RegistryAuth `json:"registry_auth,omitempty"`
 }
 
 // WorkloadResponse represents a workload with enriched owner info
