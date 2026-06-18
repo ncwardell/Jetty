@@ -282,6 +282,14 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		wl.Tags = normTags
 	}
 
+	// Validate registry_auth shape (the referenced token need not exist yet -
+	// the operator may add the env secret after; pull-time surfaces a clear
+	// error if it's still missing then).
+	if err := validateRegistryAuth(wl.RegistryAuth); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
 	// Check if this node is allowed to run this workload
 	if !a.isThisNodeAllowed(&wl) {
 		// Find an allowed node and proxy the deployment
@@ -561,10 +569,21 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		Autostart    *bool     `json:"autostart,omitempty"`
 		AllowedNodes *[]string `json:"allowed_nodes,omitempty"`
 		Tags         *[]string `json:"tags,omitempty"`
+		// RegistryAuth is a double pointer so the handler can distinguish
+		// "field omitted" (nil) from "field explicitly set to null" (non-nil
+		// pointer to a nil *RegistryAuth), which clears the credential.
+		RegistryAuth **RegistryAuth `json:"registry_auth,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
+	}
+	// Validate registry_auth shape when provided (and non-null).
+	if update.RegistryAuth != nil {
+		if err := validateRegistryAuth(*update.RegistryAuth); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
 	}
 	// Pre-validate tags before any state changes / proxying.
 	if update.Tags != nil {
@@ -688,6 +707,12 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 	if update.Tags != nil {
 		found.Tags = *update.Tags
+	}
+	// registry_auth: explicit null clears it; an object replaces it. Redeploy
+	// so the next pull uses (or stops using) the credential.
+	if update.RegistryAuth != nil {
+		found.RegistryAuth = *update.RegistryAuth
+		needsRedeploy = true
 	}
 
 	// Update version

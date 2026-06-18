@@ -2198,6 +2198,23 @@
                 }
             }
         },
+        "agent.RegistryAuth": {
+            "type": "object",
+            "properties": {
+                "registry": {
+                    "description": "Registry host, e.g. \"ghcr.io\"",
+                    "type": "string"
+                },
+                "token_ref": {
+                    "description": "Env-store key holding the token/PAT",
+                    "type": "string"
+                },
+                "username": {
+                    "description": "Registry username; defaults to \"x-access-token\" for PATs",
+                    "type": "string"
+                }
+            }
+        },
         "agent.RevokeTokenResponse": {
             "type": "object",
             "properties": {
@@ -2347,6 +2364,14 @@
                     "description": "Node HWID",
                     "type": "string"
                 },
+                "registry_auth": {
+                    "description": "RegistryAuth optionally authenticates this workload's image pull\nagainst a private registry. The token itself is never stored here -\nTokenRef names a key in the encrypted env store whose value is the\nregistry password/PAT. When nil, pulls run with no Jetty-managed\ncredentials (public images, or whatever the host docker config\nalready provides) - identical to pre-feature behavior.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/agent.RegistryAuth"
+                        }
+                    ]
+                },
                 "revive": {
                     "description": "Auto-failover to another node if owner dies",
                     "type": "boolean"
@@ -2400,6 +2425,9 @@
                 "name": {
                     "type": "string",
                     "example": "nginx"
+                },
+                "registry_auth": {
+                    "$ref": "#/definitions/agent.RegistryAuth"
                 },
                 "revive": {
                     "type": "boolean",
