@@ -2,6 +2,8 @@ package agent
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -704,6 +706,78 @@ func (a *Agent) composeCmd(name string, args ...string) (string, error) {
 		}
 	}
 
+	// If this workload defines registry_auth, materialize a throwaway
+	// DOCKER_CONFIG dir holding just its credential and point this command
+	// at it. Per-workload isolation means two workloads can pull from the
+	// same registry host (e.g. ghcr.io) under different accounts without
+	// colliding in a shared config.json. Reuses envData so we don't decrypt
+	// twice. No-op (and DOCKER_CONFIG untouched) when registry_auth is unset.
+	if wl := a.workloadByName(name); wl != nil && wl.RegistryAuth != nil {
+		if cfgDir, cfgErr := writeRegistryConfig(wl.RegistryAuth, envData); cfgErr != nil {
+			log.Printf("Warning: registry auth for %s: %v", name, cfgErr)
+		} else {
+			defer os.RemoveAll(cfgDir)
+			cmd.Env = append(cmd.Env, "DOCKER_CONFIG="+cfgDir)
+		}
+	}
+
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// workloadByName returns the workload with the given name, or nil. Workloads
+// are keyed by mesh IP in state, so this is a linear scan - fine at the scale
+// of a single node's workload count.
+func (a *Agent) workloadByName(name string) *Workload {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	for _, wl := range a.state.Workloads {
+		if wl.Name == name {
+			return wl
+		}
+	}
+	return nil
+}
+
+// writeRegistryConfig resolves a workload's RegistryAuth into a temporary
+// DOCKER_CONFIG directory containing a config.json with the registry
+// credential, and returns the directory path. The caller owns the directory
+// and must remove it. envData is the already-decrypted env store; the token
+// is looked up by RegistryAuth.TokenRef.
+//
+// The config.json (which holds the base64 user:token, reversibly) only exists
+// on disk for the duration of the docker command, with 0600 perms.
+func writeRegistryConfig(ra *RegistryAuth, envData map[string]string) (string, error) {
+	if ra.Registry == "" || ra.TokenRef == "" {
+		return "", fmt.Errorf("registry_auth requires registry and token_ref")
+	}
+	token, ok := envData[ra.TokenRef]
+	if !ok {
+		return "", fmt.Errorf("token_ref %q not found in env store", ra.TokenRef)
+	}
+	user := ra.Username
+	if user == "" {
+		// GHCR and most registries accept any non-empty username alongside a
+		// PAT; "x-access-token" is GitHub's documented convention.
+		user = "x-access-token"
+	}
+	auth := base64.StdEncoding.EncodeToString([]byte(user + ":" + token))
+	cfg := map[string]any{
+		"auths": map[string]any{
+			ra.Registry: map[string]any{"auth": auth},
+		},
+	}
+	blob, err := json.Marshal(cfg)
+	if err != nil {
+		return "", err
+	}
+	dir, err := os.MkdirTemp("", "jetty-dockercfg-")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), blob, 0600); err != nil {
+		os.RemoveAll(dir)
+		return "", err
+	}
+	return dir, nil
 }

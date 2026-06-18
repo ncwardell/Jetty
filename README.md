@@ -278,6 +278,11 @@ curl -X POST http://localhost:6880/api/workloads \
 
 Full Swagger docs at [`/swagger/index.html`](https://nodes.secretcult.network/swagger/index.html)
 
+> **Driving Jetty from an AI agent (or just want every nuance in one place)?**
+> See [`docs/AGENT_GUIDE.md`](docs/AGENT_GUIDE.md) — a self-contained operations
+> reference covering auth, the full endpoint surface, private-registry pulls,
+> the networking model, failover, and footguns.
+
 ### Status & Health
 ```bash
 GET  /api/status           # Full cluster status (nodes + workloads)
@@ -420,6 +425,7 @@ No split-brain. No consensus. Just math.
   "revive": true,
   "autostart": true,
   "allowed_nodes": ["node1", "node2"],
+  "registry_auth": { "registry": "ghcr.io", "username": "bot", "token_ref": "GHCR_TOKEN" },
   "owner": {
     "id": "abc123...",
     "name": "node1",
@@ -439,10 +445,45 @@ No split-brain. No consensus. Just math.
 | `revive` | `true` = failover to another node if owner dies. |
 | `autostart` | `true` = start when Jetty starts. |
 | `allowed_nodes` | Only these nodes can run this workload. Empty = any node. |
+| `registry_auth` | Optional. Auth for pulling a private image — `{registry, username?, token_ref}`. `token_ref` names an **env-store key** (not the token itself). See below. |
 | `owner` | Who's currently running it. Don't set this manually. |
 | `version` | Unix timestamp. Higher wins in conflicts. |
 
 > **Multi-Arch Note:** If a workload only has `compose_arm64` (no default `compose`), it can only run on ARM64 nodes. Failover will skip incompatible architectures.
+
+---
+
+## 🔐 Private Registry Images
+
+Pulling from a private registry (private GHCR, Docker Hub, GitLab, etc.)? Store
+the token **once** in the encrypted env store, then reference it by name from any
+workload. The token never lives in the workload itself.
+
+```bash
+# 1. Store the token (encrypted, synced to every node)
+curl -X POST http://localhost:6880/api/env \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"env": {"GHCR_TOKEN": "ghp_xxxxxxxxxxxx"}}'
+
+# 2. Reference it from the workload
+curl -X POST http://localhost:6880/api/workloads \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{
+    "name": "api",
+    "revive": true,
+    "registry_auth": { "registry": "ghcr.io", "token_ref": "GHCR_TOKEN" },
+    "compose": "services:\n  api:\n    image: ghcr.io/myorg/api:latest"
+  }'
+```
+
+- **One credential covers a whole account/org** — registry auth is per-host, not
+  per-repo. A single `read:packages` PAT pulls every private repo in the org.
+- **`username` defaults to `x-access-token`** (GitHub's PAT convention), so for
+  GHCR you usually only need `registry` + `token_ref`.
+- **Multiple accounts?** Store one env key each (`GHCR_FOO`, `GHCR_BAR`) and
+  point each workload's `token_ref` at the right one. Per-workload Docker config
+  isolation means two workloads can hit `ghcr.io` under different accounts.
+- Without `registry_auth`, pulls behave exactly as before (public images).
 
 ---
 
