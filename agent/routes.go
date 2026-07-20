@@ -185,20 +185,29 @@ func (a *Agent) updateWorkloadRoutes() {
 		return
 	}
 
-	// IPIP/GRE: maintain tunnels to all healthy peers.
+	// IPIP/GRE: maintain tunnels to all known peers.
 	// Userspace: keep peer-IP cache up-to-date so the TUN reader knows where
 	// to ship packets.
+	// Ensure/refresh the transport to EVERY known peer, healthy or not - only
+	// gate on having a known WARP IP. In tunnel mode the peer health check
+	// runs *through* this tunnel, so gating tunnel setup on health creates a
+	// deadlock: a peer whose path broke (e.g. it moved networks and its
+	// underlay changed) can never recover, because the tunnel that health
+	// depends on is only rebuilt for already-healthy peers. Keeping the
+	// tunnel/peer-addr current for unhealthy peers lets the health check - and
+	// therefore routing - heal on its own. (Route *installation* below still
+	// only targets healthy peers, so we never point a route at a dead node.)
 	if a.tunnelMode != "" {
 		for _, peer := range a.state.Peers {
-			if peer.IP != "" && peer.Healthy {
+			if peer.IP != "" {
 				if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
-					log.Printf("Warning: failed to create tunnel to %s: %v", peer.Name, err)
+					log.Printf("Warning: failed to ensure tunnel to %s: %v", peer.Name, err)
 				}
 			}
 		}
 	} else if a.tunDevice != nil {
 		for _, peer := range a.state.Peers {
-			if peer.IP != "" && peer.Healthy {
+			if peer.IP != "" {
 				a.updateTunPeerAddr(peer.ID, peer.IP)
 			}
 		}
