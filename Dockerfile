@@ -3,8 +3,13 @@
 ARG BUILDPLATFORM=linux/amd64
 FROM --platform=${BUILDPLATFORM} golang:1.25-bookworm AS builder
 ARG VERSION=dev
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+# NOTE: do NOT give TARGETOS/TARGETARCH defaults. BuildKit auto-injects the
+# real target platform (from --platform / buildx) ONLY when these are declared
+# without a default. A default like "amd64" disables that injection, so every
+# platform build compiles GOARCH=amd64 — producing an amd64 binary inside the
+# arm64 image (manifest says arm64, binary is x86-64 → "Exec format error" on ARM).
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download

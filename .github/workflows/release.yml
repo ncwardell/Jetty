@@ -48,7 +48,12 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
+            # This workflow only runs on version-tag pushes and manual dispatch -
+            # i.e. every run is an intentional release - so always refresh
+            # `latest`. The old `enable={{is_default_branch}}` gate is FALSE on
+            # tag builds, so `latest` never got republished and went stale
+            # (and, worse, single-arch). Publish it on every release build.
+            type=raw,value=latest
             type=raw,value=${{ github.event.inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Determine version

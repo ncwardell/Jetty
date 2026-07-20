@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -160,7 +161,31 @@ func (a *Agent) apiDeleteToken(w http.ResponseWriter, r *http.Request) {
 
 	a.stateMu.Lock()
 	_, existed := a.state.JoinTokens[id]
-	delete(a.state.JoinTokens, id)
+	if existed {
+		delete(a.state.JoinTokens, id)
+	} else if strings.HasSuffix(id, "...") {
+		// apiListTokens redacts *unused* token IDs to an 8-char prefix + "..."
+		// so the secret isn't exposed in the listing. Accept that displayed
+		// form here too - otherwise a pending token can never be revoked from
+		// the dashboard (the UI only ever has the redacted id), only via its
+		// full secret value. Match by prefix, but only act on a UNIQUE hit so
+		// an ambiguous prefix can't nuke the wrong token.
+		prefix := strings.TrimSuffix(id, "...")
+		if len(prefix) >= 6 {
+			matches := 0
+			var matchID string
+			for tid := range a.state.JoinTokens {
+				if strings.HasPrefix(tid, prefix) {
+					matchID = tid
+					matches++
+				}
+			}
+			if matches == 1 {
+				delete(a.state.JoinTokens, matchID)
+				existed = true
+			}
+		}
+	}
 	a.stateMu.Unlock()
 	if existed {
 		a.saveState()

@@ -50,6 +50,7 @@ func New() (*Agent, error) {
 		peerUnhealthySince: make(map[string]time.Time),
 		workloadMoveLocks:  make(map[string]*sync.Mutex),
 		maroonedLogged:     make(map[string]time.Time),
+		healTimes:          make(map[string]time.Time),
 		state: &State{
 			Peers:            make(map[string]*Peer),
 			Workloads:        make(map[string]*Workload),

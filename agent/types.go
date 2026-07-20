@@ -328,6 +328,12 @@ type Agent struct {
 	workloadRoutes   map[string]string // workload IP -> owner WARP IP (for remote workloads)
 	workloadRoutesMu sync.Mutex
 
+	// Container autoheal: last time we restarted each running-but-unhealthy
+	// container, so a container that keeps coming up unhealthy isn't
+	// restart-looped faster than healContainerCooldown.
+	healTimes   map[string]time.Time
+	healTimesMu sync.Mutex
+
 	// Tunnel support for cross-node routing
 	tunnelMode        string          // "ipip", "gre", or "" (none available)
 	ipipWarnedPeers   map[string]bool // Peers we've already warned about tunnel failure
