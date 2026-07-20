@@ -63,11 +63,87 @@ func (a *Agent) reconcileWorkloads() {
 		out, _ := exec.Command("docker", "ps", "-q",
 			"-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
 		if len(strings.TrimSpace(string(out))) > 0 {
-			continue // at least one container running, assume healthy
+			continue // at least one container running - liveness handled by heal pass below
 		}
 		log.Printf("Reconcile: %s has no running containers, retrying deploy", wl.Name)
 		if err := a.deployWorkload(wl); err != nil {
 			log.Printf("Reconcile: deploy of %s failed: %v", wl.Name, err)
+		}
+	}
+
+	// Built-in container autoheal: restart running-but-unhealthy containers.
+	a.healUnhealthyContainers()
+}
+
+// healContainerCooldown bounds how often autoheal restarts the same container,
+// so one that keeps coming up unhealthy isn't thrashed. Longer than a typical
+// healthcheck start_period so a restart gets a fair chance to recover.
+const healContainerCooldown = 120 * time.Second
+
+// healUnhealthyContainers restarts running-but-*unhealthy* containers of the
+// workloads we own. reconcileWorkloads only handles "no container running" (it
+// treats any running container as fine); this covers the gap where a container
+// is up but its Docker healthcheck is failing - e.g. an app whose inner process
+// died (OOM, crash) while the container/supervisor stays alive. This is the
+// built-in equivalent of an external autoheal sidecar, so operators don't need
+// to run one alongside Jetty.
+func (a *Agent) healUnhealthyContainers() {
+	a.stateMu.RLock()
+	owned := make([]string, 0, len(a.state.Workloads))
+	for _, wl := range a.state.Workloads {
+		if wl.Owner == a.hwid {
+			owned = append(owned, wl.Name)
+		}
+	}
+	a.stateMu.RUnlock()
+
+	for _, name := range owned {
+		out, _ := exec.Command("docker", "ps",
+			"-f", "label=com.docker.compose.project=jetty_"+name,
+			"-f", "health=unhealthy",
+			"--format", "{{.ID}} {{.Names}}").Output()
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			fields := strings.Fields(line)
+			cid := fields[0]
+			cname := cid
+			if len(fields) > 1 {
+				cname = fields[1]
+			}
+			if !a.claimHeal(cid) {
+				continue // healed recently; give it time to come back
+			}
+			log.Printf("Autoheal: restarting unhealthy container %s (workload %s)", cname, name)
+			if rout, err := exec.Command("docker", "restart", cid).CombinedOutput(); err != nil {
+				log.Printf("Autoheal: restart of %s failed: %v (%s)", cname, err, strings.TrimSpace(string(rout)))
+			}
+		}
+	}
+	a.gcHealTimes()
+}
+
+// claimHeal returns true if cid hasn't been auto-healed within the cooldown,
+// recording the heal time when it does.
+func (a *Agent) claimHeal(cid string) bool {
+	a.healTimesMu.Lock()
+	defer a.healTimesMu.Unlock()
+	if last, ok := a.healTimes[cid]; ok && time.Since(last) < healContainerCooldown {
+		return false
+	}
+	a.healTimes[cid] = time.Now()
+	return true
+}
+
+// gcHealTimes drops stale cooldown entries so the map doesn't grow unbounded.
+func (a *Agent) gcHealTimes() {
+	a.healTimesMu.Lock()
+	defer a.healTimesMu.Unlock()
+	for cid, t := range a.healTimes {
+		if time.Since(t) > 2*healContainerCooldown {
+			delete(a.healTimes, cid)
 		}
 	}
 }

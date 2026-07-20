@@ -101,38 +101,55 @@ func (a *Agent) ipMonitorLoop() {
 	tick := time.NewTicker(IPMonitorInterval)
 	defer tick.Stop()
 
+	// warpDown tracks whether WARP was observed down on the previous tick, so
+	// we can force a full re-ensure when it comes back - even if the WARP IP
+	// is unchanged. A reconnect (e.g. after the node moves networks) can leave
+	// stale kernel tunnel encapsulation and dead pooled connections behind
+	// that an IP-change-only check would never clear.
+	warpDown := false
+
 	for {
 		select {
 		case <-a.stopCh:
 			return
 		case <-tick.C:
 			newIP := a.getWarpIP()
-			if newIP == "" || newIP == a.ip {
+			if newIP == "" {
+				warpDown = true
 				continue
 			}
 
-			oldIP := a.ip
-			a.ip = newIP
-			log.Printf("WARP IP changed: %s -> %s", oldIP, newIP)
+			ipChanged := newIP != a.ip
+			reconnected := warpDown
+			warpDown = false
+			if !ipChanged && !reconnected {
+				continue
+			}
 
-			// Drop any pooled HTTP connections - they were established
-			// over the previous WARP socket and the peer-side endpoint
-			// is now unreachable through them. Without this, the next
-			// checkPeers / syncWorkloads round hangs against a stale
-			// keepalive until the timeout fires.
+			// Drop any pooled HTTP connections - they were established over the
+			// previous WARP socket and the peer-side endpoint is now
+			// unreachable through them. Without this, the next checkPeers /
+			// syncWorkloads round hangs against a stale keepalive until the
+			// timeout fires.
 			httpClient.CloseIdleConnections()
 			peerClient.CloseIdleConnections()
 			unhealthyPeerClient.CloseIdleConnections()
 
-			// Notify memberlist of IP change (if using memberlist)
-			a.updateMemberlistIP(newIP)
+			if ipChanged {
+				oldIP := a.ip
+				a.ip = newIP
+				log.Printf("WARP IP changed: %s -> %s", oldIP, newIP)
+				// Notify memberlist + re-announce so peers rebuild toward us.
+				a.updateMemberlistIP(newIP)
+				go a.announceOurIP()
+			} else {
+				log.Printf("WARP reconnected (IP unchanged %s); re-ensuring tunnels/routes", newIP)
+			}
 
-			// Re-announce our new IP to all peers (for HTTP-based gossip fallback)
-			go a.announceOurIP()
-
-			// Recreate IPIP/GRE tunnels with the new local IP. The tunnels embed
-			// our local WARP IP in the encapsulation header, so a stale tunnel
-			// produces packets with a stale outer source.
+			// Recreate IPIP/GRE tunnels. They embed our local WARP IP in the
+			// encapsulation header, and a reconnect can leave the kernel tunnel
+			// pointing at a stale path, so re-ensure on both IP change and
+			// same-IP reconnect.
 			a.stateMu.Lock()
 			a.updateWorkloadRoutes()
 			a.stateMu.Unlock()
