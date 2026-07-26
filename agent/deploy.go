@@ -680,35 +680,59 @@ func (a *Agent) getWorkloadContainerIP(name string) string {
 	return a.getWorkloadContainerIPForPort(name, 0)
 }
 
-// getWorkloadContainerIPForPort returns the docker network IP of the container in
-// workload `name` that publishes `port`. Multi-container compose workloads (e.g.
-// jetty_cliproxy with open-webui:8080 on one container and cli-proxy:1455 on
-// another) require per-port routing: the receiving node's iptables PREROUTING
-// chain has correct per-port DNAT rules, but the userspace WS tunnel proxy
-// bypasses iptables and dials a single IP. Picking the wrong container IP for a
-// given port lands the SYN on a host with no listener -> RST -> "connection
-// refused" for users.
-//
-// Pass port=0 to get the legacy behaviour (first container with any host
-// publication), useful for callers that don't know the port (e.g. non-TCP
-// proxies). For TCP SYN translation, always pass the destination port.
+// getWorkloadContainerIPForPort returns the docker network IP of the container
+// in workload `name` that publishes host port `port`. Kept as a wrapper for
+// callers that only need the IP; the tunnel proxy uses
+// getWorkloadContainerTargetForPort to also learn the container-side port.
 func (a *Agent) getWorkloadContainerIPForPort(name string, port uint16) string {
+	ip, _ := a.getWorkloadContainerTargetForPort(name, port)
+	return ip
+}
+
+// getWorkloadContainerTargetForPort resolves where tunneled traffic for
+// (workload, host port) should actually be dialed: the bridge IP of the
+// container that PUBLISHES that host port, plus the CONTAINER-SIDE port of
+// the mapping.
+//
+// docker ps "Ports" looks like "0.0.0.0:8222->80/tcp, [::]:8222->80/tcp":
+// the number left of "->" is the HOST port, right of "->" is the container
+// port. Two historical bugs lived here, both fatal for asymmetric mappings
+// like vaultwarden's 8222:80:
+//
+//  1. the per-port container match used "->PORT/" - that matches the
+//     CONTAINER side, so a lookup for host port 8222 never matched
+//     "...:8222->80/tcp" and fell back to "first published container";
+//  2. callers then dialed containerIP:HOSTport (8222) - but the container
+//     listens on its container port (80) - producing an instant
+//     connection-refused that the tunnel converted into RST+ACK back to
+//     the caller. (Kernel DNAT translates the port correctly, which is
+//     why the same workload responds fine to local traffic.)
+//
+// Symmetric mappings (8080:8080) dodged both bugs, which is how this
+// survived until the first asymmetric workload crossed the tunnel.
+//
+// Returns ("", 0) when nothing matches at all. When the host port has no
+// published mapping (port==0 or unpublished), falls back to the first
+// container with any publication (then first container), returning
+// containerPort==0 - callers should dial the original destination port in
+// that case, preserving legacy behaviour.
+func (a *Agent) getWorkloadContainerTargetForPort(name string, port uint16) (string, uint16) {
 	out, err := exec.Command("docker", "ps",
 		"-f", "label=com.docker.compose.project=jetty_"+name,
 		"--format", "{{.ID}}\t{{.Ports}}",
 	).Output()
 	if err != nil || len(out) == 0 {
-		return ""
+		return "", 0
 	}
 
-	portMarker := ""
+	hostMarker := ""
 	if port != 0 {
-		// docker ps Ports format: "0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp".
-		// Match "->PORT/" to pin the container side of the publication.
-		portMarker = fmt.Sprintf("->%d/", port)
+		// Match the HOST side of a publication: "...:8222->..."
+		hostMarker = fmt.Sprintf(":%d->", port)
 	}
 
 	var containerID, publishedID, fallbackID string
+	var containerPort uint16
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		parts := strings.SplitN(line, "\t", 2)
 		if len(parts) < 1 || parts[0] == "" {
@@ -727,27 +751,49 @@ func (a *Agent) getWorkloadContainerIPForPort(name string, port uint16) string {
 		if strings.Contains(ports, "->") && publishedID == "" {
 			publishedID = id
 		}
-		if portMarker != "" && strings.Contains(ports, portMarker) {
-			containerID = id
+		if hostMarker == "" {
+			continue
+		}
+		// Find the mapping entry for this host port and extract the
+		// container-side port from it.
+		for _, entry := range strings.Split(ports, ",") {
+			entry = strings.TrimSpace(entry)
+			idx := strings.Index(entry, hostMarker)
+			if idx < 0 {
+				continue
+			}
+			rest := entry[idx+len(hostMarker):]
+			slash := strings.Index(rest, "/")
+			if slash < 0 {
+				continue
+			}
+			if cp, perr := strconv.Atoi(rest[:slash]); perr == nil && cp > 0 && cp <= 65535 {
+				containerID = id
+				containerPort = uint16(cp)
+			}
+			break
+		}
+		if containerID != "" {
 			break
 		}
 	}
 
 	if containerID == "" {
 		containerID = publishedID
+		containerPort = 0 // unknown mapping - caller keeps original dst port
 	}
 	if containerID == "" {
 		containerID = fallbackID
 	}
 	if containerID == "" {
-		return ""
+		return "", 0
 	}
 
 	out, err = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID).Output()
 	if err != nil {
-		return ""
+		return "", 0
 	}
-	return strings.TrimSpace(string(out))
+	return strings.TrimSpace(string(out)), containerPort
 }
 
 func (a *Agent) composeCmd(name string, args ...string) (string, error) {
