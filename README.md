@@ -532,6 +532,8 @@ volumes:
 | `JETTY_WARP_CONNECTOR_TOKEN` | **Per-node** Cloudflare Mesh node token (create one node per machine: Zero Trust → Networking → Mesh → Add a node). Env always overrides saved state. Joiners without one fall back to the cluster-shared token, but shared tokens make Cloudflare treat nodes as active-passive replicas of ONE identity (passive replicas drop traffic) — always prefer per-node. | - |
 | `JETTY_CF_TOKEN` | Cloudflare Tunnel token. Bootstrap node only — joiners get it from the join response. | - |
 | `JETTY_HOST_SHELL` | Set to `true` to enable the `/api/host/shell` web terminal endpoint (admin-only, dangerous). For a *real* host shell — one that sees the host's `/home`, `/etc`, processes — also pass `--pid=host` to `docker run`; without it the endpoint works but returns a shell scoped to the container. | `false` |
+| `JETTY_IMAGE_PRUNE` | Auto-prune stranded Docker images daily (dangling images, unused images older than the cutoff, old build cache). Self-updates and moving-tag re-pulls otherwise leak the previous image forever. Set to `false` to disable. | `true` |
+| `JETTY_IMAGE_PRUNE_UNTIL` | Age cutoff for pruning unused *tagged* images and build cache (Go duration). Images newer than this are kept (protects fresh pre-pulls). | `168h` |
 | `JETTY_DATA_DIR` | Where state lives. | `/data` |
 | `JETTY_API_PORT` | API port. | `6880` |
 | `JETTY_SERVICE_CIDR` | Mesh network CIDR for workload IPs. | `10.100.0.0/16` |

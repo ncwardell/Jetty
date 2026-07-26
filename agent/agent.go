@@ -329,6 +329,10 @@ func (a *Agent) Start() error {
 	// cluster's workload set. Cheap when the set hasn't changed.
 	go a.hostsOverrideReconcileLoop()
 
+	// Reclaim disk from stranded Docker images (self-updates and moving-tag
+	// re-pulls leave the old image behind forever). See prune.go.
+	go a.imagePruneLoop()
+
 	mode := "warp (" + a.ip + ")"
 	if a.tunnelDomain != "" {
 		mode += " + tunnel (" + a.tunnelDomain + ")"
