@@ -1882,7 +1882,7 @@
                                     <span class="network-item-status active"></span>
                                     <span class="network-item-title">Service Network</span>
                                 </div>
-                                <div class="network-item-value">10.100.0.0/16</div>
+                                <div class="network-item-value" id="serviceCidr">10.100.0.0/16</div>
                             </div>
                             <div class="network-item">
                                 <div class="network-item-header">
@@ -2645,6 +2645,13 @@
                     <input type="text" class="form-input" id="updateNodeImage" placeholder="ghcr.io/ncwardell/jetty:latest">
                     <div class="form-hint">The node will pull this image and restart with the new version</div>
                 </div>
+                <div class="form-group" style="margin-top: 12px;">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                        <input type="checkbox" id="updateNodeHostShell">
+                        <span>Enable host shell access (JETTY_HOST_SHELL=true)</span>
+                    </label>
+                    <div class="form-hint" style="margin-left: 24px;">Lets the dashboard open a root shell on this node. Anyone with the admin key gets full host access.</div>
+                </div>
                 <div id="updateNodeStatus" style="margin-top: 12px; display: none;">
                     <div style="display: flex; align-items: center; gap: 8px;">
                         <div class="spinner" style="width: 16px; height: 16px;"></div>
@@ -3059,6 +3066,12 @@
                 warpStatus.classList.remove('active');
                 warpStatus.classList.add('inactive');
                 warpIP.textContent = 'Not connected';
+            }
+
+            // Service network CIDR (live from cluster, not hardcoded)
+            const cidrEl = document.getElementById('serviceCidr');
+            if (cidrEl && state.serviceCidr) {
+                cidrEl.textContent = state.serviceCidr;
             }
 
             // Tunnel status
@@ -3615,7 +3628,13 @@
 
             if (state.connected) {
                 dot.classList.add('connected');
-                text.textContent = state.node ? state.node.name : 'Connected';
+                if (state.node) {
+                    const ver = state.node.version ? ` v${escapeHtml(state.node.version)}` : '';
+                    const arch = state.node.arch ? ` · ${escapeHtml(state.node.arch)}` : '';
+                    text.innerHTML = `${escapeHtml(state.node.name)}<span style="color: var(--text-muted); font-size: 12px;">${ver}${arch}</span>`;
+                } else {
+                    text.textContent = 'Connected';
+                }
                 tunnelStatus.style.display = 'flex';
                 refreshControls.style.display = 'flex';
                 updateTunnelStatus();
@@ -3693,6 +3712,7 @@
             state.workloads = (status.workloads || []).sort((a, b) => a.name.localeCompare(b.name));
             state.tunnel = status.tunnel || { configured: false, running: false };
             state.warp = status.warp || { enabled: false, ip: '' };
+            state.serviceCidr = status.service_cidr || '';
 
             updateUI();
             return status;
@@ -3887,7 +3907,8 @@
                             <tr>
                                 <th>Node</th>
                                 <th>Status</th>
-                                <th>WARP IP</th>
+                                <th>Mesh IP</th>
+                                <th>Version</th>
                                 <th>Last Seen</th>
                                 <th>Workloads</th>
                             </tr>
@@ -3906,6 +3927,7 @@
                                         </td>
                                         <td><span class="status-badge ${healthClass}">${healthText}</span></td>
                                         <td><code>${node.ip || 'N/A'}</code></td>
+                                        <td>${node.version ? `v${escapeHtml(node.version)}` : '<span style="color: var(--text-muted)">—</span>'}${node.arch ? ` <span style="color: var(--text-muted); font-size: 11px;">${escapeHtml(node.arch)}</span>` : ''}</td>
                                         <td><span data-timestamp="${node.last_seen || ''}">${formatRelativeTime(node.last_seen)}</span></td>
                                         <td>${nodeWorkloads.length}</td>
                                     </tr>
@@ -3975,8 +3997,8 @@
                             </div>
                         </div>
                         <div class="node-details">
-                            <p><strong>WARP IP:</strong> ${node.ip || 'N/A'}</p>
-                            <p><strong>Arch:</strong> ${node.arch || 'N/A'}${node.version ? ` <span style="color: var(--text-muted)">v${node.version}</span>` : ''}</p>
+                            <p><strong>Mesh IP:</strong> ${node.ip || 'N/A'}</p>
+                            <p><strong>Version:</strong> ${node.version ? `v${escapeHtml(node.version)}` : 'N/A'}${node.arch ? ` <span style="color: var(--text-muted)">${escapeHtml(node.arch)}</span>` : ''}</p>
                             <p><strong>Last Seen:</strong> <span data-timestamp="${node.last_seen || ''}">${formatRelativeTime(node.last_seen)}</span></p>
                             ${node.tunnel_host || node.tunnelHost ? `<p><strong>Tunnel:</strong> ${node.tunnel_host || node.tunnelHost}</p>` : ''}
                         </div>
@@ -4419,7 +4441,7 @@
         // ---- Containers page ----------------------------------------------
         // Surfaces every Docker container on a node, not just Jetty workloads.
         // Backed by GET /api/host/compose (already grouped by project) and a
-        // node selector that fans out via /api/proxy/{ip}/api/host/compose.
+        // node selector that fans out via /api/host/compose?node=<id|name>.
 
         // In-memory state for the current containers view. Re-rendered on
         // search/filter/refresh without re-fetching unless the node changes.
@@ -4451,12 +4473,12 @@
             sel.appendChild(localOpt);
 
             (state.peers || []).forEach(p => {
-                if (!p.ip) return;
+                if (!p.id && !p.name) return;
                 const opt = document.createElement('option');
-                // We proxy by IP because /api/host/* is per-node and the
-                // proxy endpoint speaks IPs.
-                opt.value = `proxy:${p.ip}`;
-                opt.textContent = `${p.name} (${p.ip})`;
+                // /api/host/* supports ?node=<id|name> via proxyHostRequestIfRemote.
+                // Use id so renames don't break selection.
+                opt.value = `node:${p.id || p.name}`;
+                opt.textContent = `${p.name}${p.ip ? ' (' + p.ip + ')' : ''}`;
                 sel.appendChild(opt);
             });
 
@@ -4478,10 +4500,11 @@
                 let projects;
                 if (nodeChoice === 'local' || !nodeChoice) {
                     projects = await apiCall('/host/compose');
-                } else if (nodeChoice.startsWith('proxy:')) {
-                    const ip = nodeChoice.slice('proxy:'.length);
-                    // /api/proxy/{ip}{rest} is the existing fan-out endpoint.
-                    projects = await apiCall(`/proxy/${ip}/api/host/compose`);
+                } else if (nodeChoice.startsWith('node:')) {
+                    const nodeId = nodeChoice.slice('node:'.length);
+                    // /api/host/compose?node=<id|name> proxies to the named peer
+                    // via proxyHostRequestIfRemote (handlers_host.go).
+                    projects = await apiCall(`/host/compose?node=${encodeURIComponent(nodeId)}`);
                 } else {
                     projects = await apiCall('/host/compose');
                 }
@@ -5105,7 +5128,7 @@
                             <span class="detail-value"><code>${nodeHealth.id}</code></span>
                         </div>
                         <div class="detail-row">
-                            <span class="detail-label">WARP IP</span>
+                            <span class="detail-label">Mesh IP</span>
                             <span class="detail-value"><code>${nodeHealth.ip || 'N/A'}</code></span>
                         </div>
                         ${nodeHealth.public_ip ? `
@@ -5124,11 +5147,11 @@
                         </div>
                         <div class="detail-row">
                             <span class="detail-label">Architecture</span>
-                            <span class="detail-value"><code>${nodeHealth.arch || node?.arch || 'N/A'}</code></span>
+                            <span class="detail-value"><code>${escapeHtml(nodeHealth.arch || node?.arch || 'N/A')}</code></span>
                         </div>
                         <div class="detail-row">
                             <span class="detail-label">Version</span>
-                            <span class="detail-value"><code>${nodeHealth.version || node?.version || 'N/A'}</code></span>
+                            <span class="detail-value"><code>${escapeHtml(nodeHealth.version || node?.version || 'N/A')}</code></span>
                         </div>
                         ${sys.uptime ? `
                         <div class="detail-row">
@@ -5762,6 +5785,7 @@
             updateNodeId = nodeId;
             document.getElementById('updateNodeName').textContent = nodeName;
             document.getElementById('updateNodeImage').value = 'ghcr.io/ncwardell/jetty:latest';
+            document.getElementById('updateNodeHostShell').checked = false;
             document.getElementById('updateNodeStatus').style.display = 'none';
             document.getElementById('updateNodeBtn').disabled = false;
             document.getElementById('updateNodeModal').classList.remove('hidden');
@@ -5787,8 +5811,14 @@
             statusText.textContent = 'Pulling image and restarting...';
             updateBtn.disabled = true;
 
+            const env = {};
+            if (document.getElementById('updateNodeHostShell').checked) {
+                env.JETTY_HOST_SHELL = 'true';
+            }
+            const body = { image };
+            if (Object.keys(env).length > 0) body.env = env;
             try {
-                await apiCall(`/nodes/${updateNodeId}/update`, 'POST', { image });
+                await apiCall(`/nodes/${updateNodeId}/update`, 'POST', body);
                 statusText.textContent = 'Update initiated! Node will restart shortly.';
                 showToast('Node update initiated. The node will restart with the new image.', 'success');
 

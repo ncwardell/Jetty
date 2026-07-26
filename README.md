@@ -125,7 +125,7 @@ Before deploying, configure your WARP Connector in the Zero Trust Dashboard:
 
 1. Go to **Networks** → **Tunnels** → Select your WARP Connector
 2. Under **Traffic routing**, set the mode to **"Include IPs and domains"**
-3. Add the WARP CIDR: `100.96.0.0/16`
+3. Add the WARP CIDR: `100.96.0.0/12` (the full Cloudflare Mesh client range - node IPs are assigned from anywhere in it)
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -136,7 +136,7 @@ Before deploying, configure your WARP Connector in the Zero Trust Dashboard:
 │                                                     │
 │  Included IPs:                                      │
 │  ┌─────────────────────────────────────────────┐    │
-│  │ 100.96.0.0/16                               │    │
+│  │ 100.96.0.0/12                               │    │
 │  └─────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────┘
 ```
@@ -529,7 +529,7 @@ volumes:
 | `JETTY_SECRET` | **Admin / dashboard key.** Required on the first (bootstrap) node — gets persisted to state and propagated to joiners. Optional on joiners (they receive it via `/api/join`). | - |
 | `JETTY_JOIN` | URL to join an existing cluster. | - |
 | `JETTY_JOIN_TOKEN` | **Required when joining.** Single-use token minted by `POST /api/tokens` on an existing node. Burned on first successful join. | - |
-| `JETTY_WARP_CONNECTOR_TOKEN` | WARP connector token. Bootstrap node only — joiners get it from the join response. | - |
+| `JETTY_WARP_CONNECTOR_TOKEN` | **Per-node** Cloudflare Mesh node token (create one node per machine: Zero Trust → Networking → Mesh → Add a node). Env always overrides saved state. Joiners without one fall back to the cluster-shared token, but shared tokens make Cloudflare treat nodes as active-passive replicas of ONE identity (passive replicas drop traffic) — always prefer per-node. | - |
 | `JETTY_CF_TOKEN` | Cloudflare Tunnel token. Bootstrap node only — joiners get it from the join response. | - |
 | `JETTY_HOST_SHELL` | Set to `true` to enable the `/api/host/shell` web terminal endpoint (admin-only, dangerous). For a *real* host shell — one that sees the host's `/home`, `/etc`, processes — also pass `--pid=host` to `docker run`; without it the endpoint works but returns a shell scoped to the container. | `false` |
 | `JETTY_DATA_DIR` | Where state lives. | `/data` |

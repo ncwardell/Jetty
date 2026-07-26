@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,11 +54,15 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 
 	nodeFilter := r.URL.Query().Get("node")
 
-	// Get list of peers
+	// Get list of peers. Copy VALUES, not pointers: the goroutines below
+	// read peer fields after this lock is released, while gossip/
+	// memberlist writers mutate the same Peer structs in place under
+	// stateMu - sharing pointers here is a data race.
 	a.stateMu.RLock()
 	peers := make([]*Peer, 0, len(a.state.Peers))
 	for _, p := range a.state.Peers {
-		peers = append(peers, p)
+		snapshot := *p
+		peers = append(peers, &snapshot)
 	}
 	a.stateMu.RUnlock()
 
@@ -68,6 +73,8 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 		PublicIP  string                 `json:"public_ip,omitempty"`
 		Healthy   bool                   `json:"healthy"`
 		Status    string                 `json:"status"`
+		Version   string                 `json:"version,omitempty"`
+		Arch      string                 `json:"arch,omitempty"`
 		Workloads []string               `json:"workloads"`
 		System    map[string]interface{} `json:"system,omitempty"`
 		Error     string                 `json:"error,omitempty"`
@@ -115,6 +122,8 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 			PublicIP:  a.publicIP,
 			Healthy:   true,
 			Status:    getHealthStatus(),
+			Version:   Version,
+			Arch:      runtime.GOARCH,
 			Workloads: localWorkloads,
 			System:    a.getSystemStats(),
 		}
@@ -137,6 +146,10 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 				Name:    p.Name,
 				IP:      p.IP,
 				Healthy: p.Healthy,
+				// Seed from the peer table; overwritten below if the
+				// peer's own health response reports fresher values.
+				Version: p.Version,
+				Arch:    p.Arch,
 			}
 
 			// Use shorter timeout for unhealthy peers
@@ -222,6 +235,12 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 					}
 					if sys, ok := node["system"].(map[string]interface{}); ok {
 						health.System = sys
+					}
+					if v, ok := node["version"].(string); ok && v != "" {
+						health.Version = v
+					}
+					if ar, ok := node["arch"].(string); ok && ar != "" {
+						health.Arch = ar
 					}
 				}
 			}

@@ -79,6 +79,9 @@ func validIngestedPeer(p *Peer) bool {
 		log.Printf("Sync: rejecting peer %q with invalid IP %q", p.ID, p.IP)
 		return false
 	}
+	// Version/arch are peer-supplied and rendered by the dashboard -
+	// blank them if unsafe rather than rejecting the whole peer.
+	sanitizePeerMeta(p.ID, &p.Version, &p.Arch)
 	return true
 }
 
