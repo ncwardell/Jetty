@@ -1882,7 +1882,7 @@
                                     <span class="network-item-status active"></span>
                                     <span class="network-item-title">Service Network</span>
                                 </div>
-                                <div class="network-item-value">10.100.0.0/16</div>
+                                <div class="network-item-value" id="serviceCidr">10.100.0.0/16</div>
                             </div>
                             <div class="network-item">
                                 <div class="network-item-header">
@@ -3068,6 +3068,12 @@
                 warpIP.textContent = 'Not connected';
             }
 
+            // Service network CIDR (live from cluster, not hardcoded)
+            const cidrEl = document.getElementById('serviceCidr');
+            if (cidrEl && state.serviceCidr) {
+                cidrEl.textContent = state.serviceCidr;
+            }
+
             // Tunnel status
             if (state.tunnel?.running) {
                 tunnelStatusDot.classList.add('active');
@@ -3622,7 +3628,13 @@
 
             if (state.connected) {
                 dot.classList.add('connected');
-                text.textContent = state.node ? state.node.name : 'Connected';
+                if (state.node) {
+                    const ver = state.node.version ? ` v${escapeHtml(state.node.version)}` : '';
+                    const arch = state.node.arch ? ` · ${escapeHtml(state.node.arch)}` : '';
+                    text.innerHTML = `${escapeHtml(state.node.name)}<span style="color: var(--text-muted); font-size: 12px;">${ver}${arch}</span>`;
+                } else {
+                    text.textContent = 'Connected';
+                }
                 tunnelStatus.style.display = 'flex';
                 refreshControls.style.display = 'flex';
                 updateTunnelStatus();
@@ -3700,6 +3712,7 @@
             state.workloads = (status.workloads || []).sort((a, b) => a.name.localeCompare(b.name));
             state.tunnel = status.tunnel || { configured: false, running: false };
             state.warp = status.warp || { enabled: false, ip: '' };
+            state.serviceCidr = status.service_cidr || '';
 
             updateUI();
             return status;
@@ -3894,7 +3907,8 @@
                             <tr>
                                 <th>Node</th>
                                 <th>Status</th>
-                                <th>WARP IP</th>
+                                <th>Mesh IP</th>
+                                <th>Version</th>
                                 <th>Last Seen</th>
                                 <th>Workloads</th>
                             </tr>
@@ -3913,6 +3927,7 @@
                                         </td>
                                         <td><span class="status-badge ${healthClass}">${healthText}</span></td>
                                         <td><code>${node.ip || 'N/A'}</code></td>
+                                        <td>${node.version ? `v${escapeHtml(node.version)}` : '<span style="color: var(--text-muted)">—</span>'}${node.arch ? ` <span style="color: var(--text-muted); font-size: 11px;">${escapeHtml(node.arch)}</span>` : ''}</td>
                                         <td><span data-timestamp="${node.last_seen || ''}">${formatRelativeTime(node.last_seen)}</span></td>
                                         <td>${nodeWorkloads.length}</td>
                                     </tr>
@@ -3982,8 +3997,8 @@
                             </div>
                         </div>
                         <div class="node-details">
-                            <p><strong>WARP IP:</strong> ${node.ip || 'N/A'}</p>
-                            <p><strong>Arch:</strong> ${node.arch || 'N/A'}${node.version ? ` <span style="color: var(--text-muted)">v${node.version}</span>` : ''}</p>
+                            <p><strong>Mesh IP:</strong> ${node.ip || 'N/A'}</p>
+                            <p><strong>Version:</strong> ${node.version ? `v${escapeHtml(node.version)}` : 'N/A'}${node.arch ? ` <span style="color: var(--text-muted)">${escapeHtml(node.arch)}</span>` : ''}</p>
                             <p><strong>Last Seen:</strong> <span data-timestamp="${node.last_seen || ''}">${formatRelativeTime(node.last_seen)}</span></p>
                             ${node.tunnel_host || node.tunnelHost ? `<p><strong>Tunnel:</strong> ${node.tunnel_host || node.tunnelHost}</p>` : ''}
                         </div>
@@ -5113,7 +5128,7 @@
                             <span class="detail-value"><code>${nodeHealth.id}</code></span>
                         </div>
                         <div class="detail-row">
-                            <span class="detail-label">WARP IP</span>
+                            <span class="detail-label">Mesh IP</span>
                             <span class="detail-value"><code>${nodeHealth.ip || 'N/A'}</code></span>
                         </div>
                         ${nodeHealth.public_ip ? `
@@ -5132,11 +5147,11 @@
                         </div>
                         <div class="detail-row">
                             <span class="detail-label">Architecture</span>
-                            <span class="detail-value"><code>${nodeHealth.arch || node?.arch || 'N/A'}</code></span>
+                            <span class="detail-value"><code>${escapeHtml(nodeHealth.arch || node?.arch || 'N/A')}</code></span>
                         </div>
                         <div class="detail-row">
                             <span class="detail-label">Version</span>
-                            <span class="detail-value"><code>${nodeHealth.version || node?.version || 'N/A'}</code></span>
+                            <span class="detail-value"><code>${escapeHtml(nodeHealth.version || node?.version || 'N/A')}</code></span>
                         </div>
                         ${sys.uptime ? `
                         <div class="detail-row">

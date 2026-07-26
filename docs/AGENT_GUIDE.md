@@ -376,7 +376,7 @@ Set on the `docker run`/compose of the **agent** container itself (not workloads
 | `JETTY_TUNNEL_DOMAIN` | — | Cluster's Cloudflare tunnel domain. |
 | `JETTY_TUNNEL_HOST` | — | This node's tunnel subdomain. |
 | `JETTY_CF_TOKEN` | — | Cloudflare tunnel token (usually delivered via join). |
-| `JETTY_WARP_CONNECTOR_TOKEN` | — | WARP connector token (usually delivered via join). |
+| `JETTY_WARP_CONNECTOR_TOKEN` | — | Per-node Cloudflare Mesh node token. One per machine — a shared token makes Cloudflare register nodes as active-passive replicas of one identity (mesh breaks). Env overrides state; join-delivered shared token is only a fallback. |
 | `JETTY_HOST_SHELL` | `false` | Enables `/api/host/exec` + `/api/host/shell`. Dangerous (host RCE for any AdminKey holder); requires `--pid=host`. |
 
 The agent container must run `--privileged --net host` with

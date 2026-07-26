@@ -140,7 +140,7 @@ sudo JETTY_SECRET=my-cluster-password ./jetty
 | `JETTY_JOIN_TOKEN` | (none) | **Required when joining.** Single-use token minted by `POST /api/tokens` on an existing node. Burned on first successful join. |
 | `JETTY_CF_TOKEN` | (none) | Cloudflare tunnel token. Bootstrap-only — joiners receive it. |
 | `JETTY_TUNNEL_DOMAIN` | (none) | Your Cloudflare tunnel domain (e.g., `cluster.example.com`). |
-| `JETTY_WARP_CONNECTOR_TOKEN` | (none) | WARP Connector token for Zero Trust networking. Bootstrap-only — joiners receive it. |
+| `JETTY_WARP_CONNECTOR_TOKEN` | (none) | **Per-node** Cloudflare Mesh node token (one per machine — shared tokens collapse nodes into active-passive replicas since the 2026-04 Mesh migration). Env overrides saved state; joiners without one fall back to the cluster-shared token. |
 | `JETTY_HOST_SHELL` | `false` | Set to `true` to enable `/api/host/shell`. Admin-only endpoint that gives an interactive root shell on the host. |
 | `JETTY_PUBLIC_IP` | (auto) | Override public IP detection (useful in containers). |
 | `JETTY_DATA_DIR` | `/data` | Directory for state and compose files. |

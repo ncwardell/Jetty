@@ -187,6 +187,7 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 			"name":      a.hostname,
 			"ip":        a.ip,
 			"arch":      runtime.GOARCH,
+			"version":   Version,
 			"healthy":   true, // Self is always healthy if we're responding
 			"last_seen": time.Now(),
 			"is_self":   true,
@@ -309,6 +310,16 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	}
 	// Preserve the existing APIKey so the merge doesn't blank it out.
 	req.Peer.APIKey = oldAPIKey
+	// Same for version/arch: older agents announce without them, and a
+	// wholesale store would erase what we learned at join time.
+	if oldPeer != nil {
+		if req.Peer.Version == "" {
+			req.Peer.Version = oldPeer.Version
+		}
+		if req.Peer.Arch == "" {
+			req.Peer.Arch = oldPeer.Arch
+		}
+	}
 	ipChanged := oldIP != "" && oldIP != req.Peer.IP
 	a.state.Peers[req.Peer.ID] = &req.Peer
 	a.stateMu.Unlock()

@@ -144,9 +144,20 @@ func (a *Agent) joinCluster() error {
 	if result.CFToken != "" {
 		a.state.CFToken = result.CFToken
 	}
-	if result.WarpToken != "" {
+	// Adopt the cluster's WARP token only if this node doesn't already
+	// have its own. Since Cloudflare's 2026-04 Mesh migration, a token
+	// shared across machines registers them as active-passive replicas
+	// of ONE mesh node (passive replicas drop all traffic) - so each
+	// node should register with its own per-node token
+	// (JETTY_WARP_CONNECTOR_TOKEN). The shared token remains a fallback
+	// for clusters that predate per-node provisioning.
+	if result.WarpToken != "" && a.state.WarpToken == "" {
+		log.Printf("WARP token: adopting cluster-shared token from join response. " +
+			"Prefer a per-node token (JETTY_WARP_CONNECTOR_TOKEN) - shared tokens " +
+			"make Cloudflare Mesh treat nodes as replicas of one identity.")
 		a.state.WarpToken = result.WarpToken
 	}
+	ownWarpToken := a.state.WarpToken
 	if result.AdminKey != "" {
 		a.state.AdminKey = result.AdminKey
 	}
@@ -162,9 +173,11 @@ func (a *Agent) joinCluster() error {
 
 	a.saveState()
 
-	// Configure WARP at runtime if we received a token and WARP isn't connected yet
-	if result.WarpToken != "" && a.ip == "" {
-		if err := a.configureWarpRuntime(result.WarpToken); err != nil {
+	// Configure WARP at runtime if we have a token and WARP isn't
+	// connected yet. ownWarpToken prefers this node's per-node token
+	// over the cluster-shared one from the join response.
+	if ownWarpToken != "" && a.ip == "" {
+		if err := a.configureWarpRuntime(ownWarpToken); err != nil {
 			log.Printf("Warning: failed to configure WARP at runtime: %v", err)
 		}
 	}
@@ -260,6 +273,9 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 
 	// Create peer. Store the joiner-supplied APIKey so future inbound
 	// requests from this peer authenticate via apiKeyMiddleware.
+	// Version/arch are joiner-supplied display metadata - blank unsafe
+	// values (the dashboard interpolates them into HTML).
+	sanitizePeerMeta(req.ID, &req.Version, &req.Arch)
 	peer := &Peer{
 		ID:       req.ID,
 		Name:     req.Name,

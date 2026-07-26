@@ -286,7 +286,7 @@ if a.tunnelMode != "" {                        // IPIP/GRE
 
 The "last resort" branch (direct WARP route) requires WARP itself to know
 how to forward `10.100.x.x` traffic to the right peer. By default WARP only
-routes `100.96.0.0/16` (the WARP CIDR), so this branch typically does not
+routes `100.96.0.0/12` (the WARP CIDR), so this branch typically does not
 work end-to-end without additional Cloudflare-side configuration. It's
 effectively a dead path; the userspace tunnel is the practical fallback.
 
@@ -460,7 +460,7 @@ end-to-end against Cloudflare itself.
 `getPeerAPIURL` and friends construct `http://<peerWARPip>:6880/...` URLs
 without checking that the peer's API is reachable from this node. If WARP
 routing is misconfigured (e.g., the operator forgot to set "Include IPs and
-domains: 100.96.0.0/16" in the Zero Trust dashboard), nothing will work
+domains: 100.96.0.0/12" in the Zero Trust dashboard), nothing will work
 and the only signal is timeouts in the logs.
 
 ### 6. FORWARD rule ordering is fragile

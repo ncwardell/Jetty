@@ -32,6 +32,26 @@ var validPeerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 // Valid environment variable key pattern
 var envKeyPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
+// Valid peer version/arch pattern. These are display-only metadata
+// ("0.0.2", "dev", "amd64") but they are peer-supplied and the dashboard
+// interpolates them into HTML - so restrict to a charset that cannot
+// carry markup. Empty is allowed (older agents don't send them).
+var validVersionArchPattern = regexp.MustCompile(`^[a-zA-Z0-9._+-]{0,64}$`)
+
+// sanitizePeerMeta blanks peer-supplied version/arch fields that do not
+// match the safe charset. Sanitize-not-reject: a peer with a weird build
+// string should stay in the cluster, just without the unsafe metadata.
+func sanitizePeerMeta(id string, version, arch *string) {
+	if !validVersionArchPattern.MatchString(*version) {
+		log.Printf("Sync: blanking invalid version %q from peer %q", *version, id)
+		*version = ""
+	}
+	if !validVersionArchPattern.MatchString(*arch) {
+		log.Printf("Sync: blanking invalid arch %q from peer %q", *arch, id)
+		*arch = ""
+	}
+}
+
 // validateRegistryAuth checks the shape of a workload's optional registry
 // credential. nil is valid (no private-registry auth - default behavior).
 // We validate shape only, not that the referenced env key exists: operators

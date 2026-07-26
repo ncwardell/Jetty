@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -248,6 +249,11 @@ func (a *Agent) announceOurIP() {
 		IP:       a.ip,
 		Healthy:  true,
 		LastSeen: time.Now(),
+		// Carry version/arch: apiPeerAnnounce stores the announced
+		// record wholesale, so omitting these would blank them
+		// cluster-wide on every IP announcement.
+		Version: Version,
+		Arch:    runtime.GOARCH,
 	}
 
 	log.Printf("Announcing our IP (%s) to cluster...", a.ip)
