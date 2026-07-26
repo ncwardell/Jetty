@@ -70,6 +70,13 @@ func hostsField(s string) string {
 // Also calls updateWorkloadRoutes at the end so route state stays in sync
 // with the host names we just published.
 func (a *Agent) updateHosts() {
+	// Serialize the whole function: stateMu.RLock below is SHARED, so
+	// concurrent callers (e.g. per-workload bulk-action goroutines) would
+	// otherwise race on hostsBlockHash and interleave the read-modify-write
+	// of /etc/hosts.
+	a.hostsMu.Lock()
+	defer a.hostsMu.Unlock()
+
 	a.stateMu.RLock()
 	defer a.stateMu.RUnlock()
 
@@ -173,7 +180,7 @@ func (a *Agent) updateHosts() {
 //   3. Last resort - direct WARP routing:
 //        ip route add <wlIP>/32 via <peerWARPip> dev CloudflareWARP
 //      This requires WARP to know how to forward 10.100.x.x to the peer,
-//      which by default it doesn't (WARP only routes 100.96.0.0/16). This
+//      which by default it doesn't (WARP only routes 100.96.0.0/12). This
 //      branch is effectively a dead path; left in place as a "if you've
 //      configured WARP yourself" escape hatch.
 //

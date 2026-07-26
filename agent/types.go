@@ -375,6 +375,12 @@ type Agent struct {
 	// hostsBlockHash is the SHA-256 of the JETTY-managed block we last wrote
 	// to /etc/hosts. updateHosts skips the write when the block hasn't changed,
 	// which silences the per-gossip-tick churn on /etc/hosts.
+	//
+	// hostsMu serializes updateHosts callers. The function only takes
+	// stateMu.RLock (shared), so without this, concurrent callers (e.g.
+	// per-workload bulk-action goroutines) race on hostsBlockHash and can
+	// interleave the read-modify-write of /etc/hosts itself.
+	hostsMu        sync.Mutex
 	hostsBlockHash [32]byte
 
 	// maroonedLogged tracks when we last warned about a marooned workload

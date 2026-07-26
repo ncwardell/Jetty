@@ -58,6 +58,9 @@ func (a *Agent) loadState() {
 
 	// Preserve env var CF token if set
 	envCFToken := a.state.CFToken
+	// Preserve env var WARP token if set (seeded from
+	// JETTY_WARP_CONNECTOR_TOKEN in NewAgent, before loadState runs)
+	envWarpToken := a.state.WarpToken
 
 	if err := json.Unmarshal(data, a.state); err != nil {
 		backup := fmt.Sprintf("%s.corrupt-%d", statePath, time.Now().Unix())
@@ -73,6 +76,17 @@ func (a *Agent) loadState() {
 	// Env var takes precedence over saved state
 	if envCFToken != "" && a.state.CFToken == "" {
 		a.state.CFToken = envCFToken
+	}
+	// The WARP connector token identifies THIS node in Cloudflare Mesh.
+	// Since Cloudflare's 2026-04 Mesh migration, a token shared across
+	// machines collapses them into active-passive replicas of ONE node
+	// (passive replicas drop traffic) - so each node must register with
+	// its own token. An operator-supplied env token is this node's own
+	// identity and must beat whatever was saved (e.g. a cluster-shared
+	// token received in an old join response).
+	if envWarpToken != "" && a.state.WarpToken != envWarpToken {
+		log.Printf("WARP token: using JETTY_WARP_CONNECTOR_TOKEN from environment (overrides saved state)")
+		a.state.WarpToken = envWarpToken
 	}
 
 	// Initialize maps if nil (for backwards compatibility or corrupted state)

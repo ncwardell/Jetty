@@ -339,6 +339,9 @@ func validIngestedNodeMeta(meta *NodeMeta) bool {
 		log.Printf("Memberlist: rejecting node %q with invalid IP %q", meta.ID, meta.IP)
 		return false
 	}
+	// Version/arch flow into peer records the dashboard renders -
+	// blank unsafe values rather than rejecting the node.
+	sanitizePeerMeta(meta.ID, &meta.Version, &meta.Arch)
 	return true
 }
 
