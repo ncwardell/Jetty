@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"io"
-	"log"
 	"net/http"
 )
 
@@ -135,9 +134,9 @@ func (a *Agent) apiSetTunnel(w http.ResponseWriter, r *http.Request) {
 
 	if scope == "cluster" {
 		a.broadcastTunnelToken(req.Token)
-		log.Printf("Cloudflare tunnel configured (cluster-wide)")
+		logInfof("Cloudflare tunnel configured (cluster-wide)")
 	} else {
-		log.Printf("Cloudflare tunnel re-enabled on this node")
+		logInfof("Cloudflare tunnel re-enabled on this node")
 	}
 
 	writeJSON(w, map[string]interface{}{
@@ -182,9 +181,9 @@ func (a *Agent) apiDeleteTunnel(w http.ResponseWriter, r *http.Request) {
 
 	if scope == "cluster" {
 		a.broadcastTunnelToken("")
-		log.Printf("Cloudflare tunnel removed cluster-wide")
+		logInfof("Cloudflare tunnel removed cluster-wide")
 	} else {
-		log.Printf("Cloudflare tunnel disabled on this node (cluster token retained)")
+		logInfof("Cloudflare tunnel disabled on this node (cluster token retained)")
 	}
 
 	writeJSON(w, map[string]interface{}{

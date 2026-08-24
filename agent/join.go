@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"runtime"
 	"strings"
@@ -63,7 +62,7 @@ func (a *Agent) joinCluster() error {
 			return fmt.Errorf("refusing to join over plaintext http://: the join token would be sent in cleartext to %s. Use https:// (e.g. via your Cloudflare tunnel domain).", host)
 		}
 	}
-	log.Printf("Joining cluster via %s", joinEndpoint)
+	logInfof("Joining cluster via %s", joinEndpoint)
 
 	// Generate our own SelfAPIKey before contacting the cluster. The
 	// joiner picks this; the cluster registers it as our Peer.APIKey.
@@ -119,12 +118,12 @@ func (a *Agent) joinCluster() error {
 	resp.Body.Close()
 
 	if result.ServiceCIDR != "" && result.ServiceCIDR != a.serviceCIDR {
-		log.Printf("Adopting cluster service CIDR: %s", result.ServiceCIDR)
+		logInfof("Adopting cluster service CIDR: %s", result.ServiceCIDR)
 		a.serviceCIDR = result.ServiceCIDR
 	}
 	if result.TunnelDomain != "" && a.tunnelDomain == "" {
 		a.tunnelDomain = result.TunnelDomain
-		log.Printf("Adopting cluster tunnel domain: %s", a.tunnelDomain)
+		logInfof("Adopting cluster tunnel domain: %s", a.tunnelDomain)
 	}
 
 	a.stateMu.Lock()
@@ -152,7 +151,7 @@ func (a *Agent) joinCluster() error {
 	// (JETTY_WARP_CONNECTOR_TOKEN). The shared token remains a fallback
 	// for clusters that predate per-node provisioning.
 	if result.WarpToken != "" && a.state.WarpToken == "" {
-		log.Printf("WARP token: adopting cluster-shared token from join response. " +
+		logInfof("WARP token: adopting cluster-shared token from join response. " +
 			"Prefer a per-node token (JETTY_WARP_CONNECTOR_TOKEN) - shared tokens " +
 			"make Cloudflare Mesh treat nodes as replicas of one identity.")
 		a.state.WarpToken = result.WarpToken
@@ -178,18 +177,18 @@ func (a *Agent) joinCluster() error {
 	// over the cluster-shared one from the join response.
 	if ownWarpToken != "" && a.ip == "" {
 		if err := a.configureWarpRuntime(ownWarpToken); err != nil {
-			log.Printf("Warning: failed to configure WARP at runtime: %v", err)
+			logWarnf("failed to configure WARP at runtime: %v", err)
 		}
 	}
 
 	// Start cloudflared if we received a token
 	if result.CFToken != "" {
 		if err := a.startCloudflared(); err != nil {
-			log.Printf("Warning: failed to start cloudflared: %v", err)
+			logWarnf("failed to start cloudflared: %v", err)
 		}
 	}
 
-	log.Printf("Joined: %d peers, %d workloads, tunnel=%v, warp=%v",
+	logInfof("Joined: %d peers, %d workloads, tunnel=%v, warp=%v",
 		len(result.Peers), len(result.Workloads), result.CFToken != "", result.WarpToken != "")
 	return nil
 }
@@ -245,7 +244,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	log.Printf("token: consumed %s for joiner %s (note=%q)", redactTokenID(tok.ID), shortID(req.ID, 12), tok.Note)
+	logInfof("token: consumed %s for joiner %s (note=%q)", redactTokenID(tok.ID), shortID(req.ID, 12), tok.Note)
 
 	// Check for mesh IP collision before creating peer
 	a.stateMu.RLock()
@@ -333,7 +332,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	// Create IPIP tunnel to this peer (for receiving their traffic)
 	if peer.IP != "" {
 		if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
-			log.Printf("Warning: failed to create tunnel to %s: %v", peer.Name, err)
+			logWarnf("failed to create tunnel to %s: %v", peer.Name, err)
 		}
 	}
 
@@ -380,5 +379,5 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 
-	log.Printf("Peer joined: %s (%s)", peer.Name, peer.IP)
+	logInfof("Peer joined: %s (%s)", peer.Name, peer.IP)
 }

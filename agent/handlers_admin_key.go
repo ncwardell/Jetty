@@ -2,7 +2,6 @@ package agent
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"strings"
 )
@@ -78,7 +77,7 @@ func (a *Agent) apiRotateAdminKey(w http.ResponseWriter, r *http.Request) {
 	// Broadcast to peers so they all flip to the new key together.
 	a.broadcastAdminKey(newKey)
 
-	log.Printf("AdminKey rotated by %s (gossiping to peers)", r.RemoteAddr)
+	logInfof("AdminKey rotated by %s (gossiping to peers)", r.RemoteAddr)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":  "rotated",

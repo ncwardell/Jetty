@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -180,7 +179,7 @@ func (a *Agent) apiBulkWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
-	log.Printf("Bulk %s: %d workloads", req.Action, len(selected))
+	logInfof("Bulk %s: %d workloads", req.Action, len(selected))
 }
 
 // applyBulkAction runs the action against a single workload, either

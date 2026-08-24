@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -32,12 +31,12 @@ func (a *Agent) saveState() {
 	// 0600: state.json contains plaintext cluster tokens (WARP/CF) and
 	// encrypted-but-still-sensitive env data. Must not be world-readable.
 	if err := os.WriteFile(tempPath, data, 0600); err != nil {
-		log.Printf("Failed to write state: %v", err)
+		logErrorf("Failed to write state: %v", err)
 		return
 	}
 
 	if err := os.Rename(tempPath, statePath); err != nil {
-		log.Printf("Failed to rename state file: %v", err)
+		logErrorf("Failed to rename state file: %v", err)
 		os.Remove(tempPath) // Clean up temp file
 	}
 }
@@ -65,9 +64,9 @@ func (a *Agent) loadState() {
 	if err := json.Unmarshal(data, a.state); err != nil {
 		backup := fmt.Sprintf("%s.corrupt-%d", statePath, time.Now().Unix())
 		if renameErr := os.Rename(statePath, backup); renameErr != nil {
-			log.Printf("CRITICAL: state.json is corrupt (%v) and could not be moved aside (%v) - refusing to overwrite. Inspect %s manually.", err, renameErr, statePath)
+			logInfof("CRITICAL: state.json is corrupt (%v) and could not be moved aside (%v) - refusing to overwrite. Inspect %s manually.", err, renameErr, statePath)
 		} else {
-			log.Printf("CRITICAL: state.json was corrupt (%v) - moved to %s, booting with empty state", err, backup)
+			logInfof("CRITICAL: state.json was corrupt (%v) - moved to %s, booting with empty state", err, backup)
 		}
 		// Reset to a fresh state so we don't keep partially-decoded fields.
 		a.state = NewState()
@@ -85,14 +84,14 @@ func (a *Agent) loadState() {
 	// identity and must beat whatever was saved (e.g. a cluster-shared
 	// token received in an old join response).
 	if envWarpToken != "" && a.state.WarpToken != envWarpToken {
-		log.Printf("WARP token: using JETTY_WARP_CONNECTOR_TOKEN from environment (overrides saved state)")
+		logInfof("WARP token: using JETTY_WARP_CONNECTOR_TOKEN from environment (overrides saved state)")
 		a.state.WarpToken = envWarpToken
 	}
 
 	// Initialize maps if nil (for backwards compatibility or corrupted state)
 	a.ensureStateMapsInitialized()
 
-	log.Printf("Loaded: %d peers, %d workloads, %d env vars", len(a.state.Peers), len(a.state.Workloads), len(a.state.EnvData))
+	logInfof("Loaded: %d peers, %d workloads, %d env vars", len(a.state.Peers), len(a.state.Workloads), len(a.state.EnvData))
 }
 
 // ensureStateMapsInitialized ensures all state maps are non-nil.

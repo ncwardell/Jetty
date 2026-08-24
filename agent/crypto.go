@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"log"
 	"strings"
 
 	"golang.org/x/crypto/argon2"
@@ -182,7 +181,7 @@ func (a *Agent) migrateLegacyEnvData() {
 
 	oldKey, err := a.legacyKey()
 	if err != nil {
-		log.Printf("env migration: cannot derive legacy key (%v) - leaving env_data alone; you may need to re-enter env vars", err)
+		logInfof("env migration: cannot derive legacy key (%v) - leaving env_data alone; you may need to re-enter env vars", err)
 		return
 	}
 
@@ -190,7 +189,7 @@ func (a *Agent) migrateLegacyEnvData() {
 	// Generate the new key first so encryption below uses it.
 	if err := a.ensureEncryptionKey(); err != nil {
 		a.stateMu.Unlock()
-		log.Printf("env migration: failed to generate new encryption key: %v", err)
+		logErrorf("env migration: failed to generate new encryption key: %v", err)
 		return
 	}
 	newKey := append([]byte(nil), a.state.EncryptionKey...)
@@ -205,13 +204,13 @@ func (a *Agent) migrateLegacyEnvData() {
 	for k, v := range encrypted {
 		plaintext, err := decryptWithKey(oldKey, v)
 		if err != nil {
-			log.Printf("env migration: skipping %s (legacy decrypt failed: %v)", k, err)
+			logErrorf("env migration: skipping %s (legacy decrypt failed: %v)", k, err)
 			rewritten[k] = v // keep as-is so caller still sees something
 			continue
 		}
 		newCt, err := encryptWithKey(newKey, plaintext)
 		if err != nil {
-			log.Printf("env migration: re-encrypt failed for %s: %v", k, err)
+			logInfof("env migration: re-encrypt failed for %s: %v", k, err)
 			rewritten[k] = v
 			continue
 		}
@@ -225,7 +224,7 @@ func (a *Agent) migrateLegacyEnvData() {
 	}
 	a.stateMu.Unlock()
 	a.saveState()
-	log.Printf("env migration: re-encrypted %d/%d env vars under new EncryptionKey", migrated, len(encrypted))
+	logInfof("env migration: re-encrypted %d/%d env vars under new EncryptionKey", migrated, len(encrypted))
 }
 
 // bootstrapKeys generates this node's per-cluster credentials on first
@@ -254,11 +253,11 @@ func (a *Agent) bootstrapKeys() {
 	if a.state.SelfAPIKey == "" {
 		key, err := generateAPIKey()
 		if err != nil {
-			log.Printf("bootstrap: failed to generate SelfAPIKey: %v", err)
+			logErrorf("bootstrap: failed to generate SelfAPIKey: %v", err)
 		} else {
 			a.state.SelfAPIKey = key
 			dirty = true
-			log.Printf("bootstrap: generated SelfAPIKey")
+			logInfof("bootstrap: generated SelfAPIKey")
 		}
 	}
 
@@ -267,17 +266,17 @@ func (a *Agent) bootstrapKeys() {
 	if a.state.AdminKey == "" && a.clusterSecret != "" && len(a.state.Peers) == 0 && a.joinURL == "" {
 		a.state.AdminKey = a.clusterSecret
 		dirty = true
-		log.Printf("bootstrap: AdminKey initialized from JETTY_SECRET")
+		logInfof("bootstrap: AdminKey initialized from JETTY_SECRET")
 	}
 
 	// EncryptionKey: same constraint - generated only on the first
 	// node. Joiners receive it via /api/join.
 	if len(a.state.EncryptionKey) != encryptionKeySize && len(a.state.Peers) == 0 && a.joinURL == "" {
 		if err := a.ensureEncryptionKey(); err != nil {
-			log.Printf("bootstrap: failed to generate EncryptionKey: %v", err)
+			logErrorf("bootstrap: failed to generate EncryptionKey: %v", err)
 		} else {
 			dirty = true
-			log.Printf("bootstrap: generated EncryptionKey")
+			logInfof("bootstrap: generated EncryptionKey")
 		}
 	}
 	a.stateMu.Unlock()

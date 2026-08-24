@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -43,11 +42,11 @@ var validVersionArchPattern = regexp.MustCompile(`^[a-zA-Z0-9._+-]{0,64}$`)
 // string should stay in the cluster, just without the unsafe metadata.
 func sanitizePeerMeta(id string, version, arch *string) {
 	if !validVersionArchPattern.MatchString(*version) {
-		log.Printf("Sync: blanking invalid version %q from peer %q", *version, id)
+		logInfof("Sync: blanking invalid version %q from peer %q", *version, id)
 		*version = ""
 	}
 	if !validVersionArchPattern.MatchString(*arch) {
-		log.Printf("Sync: blanking invalid arch %q from peer %q", *arch, id)
+		logInfof("Sync: blanking invalid arch %q from peer %q", *arch, id)
 		*arch = ""
 	}
 }
@@ -214,7 +213,7 @@ func getEnvInt(key string, defaultValue int) int {
 	if v := os.Getenv(key); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			log.Printf("Warning: invalid integer value for %s: %q, using default %d", key, v, defaultValue)
+			logWarnf("invalid integer value for %s: %q, using default %d", key, v, defaultValue)
 			return defaultValue
 		}
 		return n

@@ -2,7 +2,6 @@ package agent
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"sort"
@@ -83,7 +82,7 @@ func (a *Agent) checkFailover() {
 	a.failoverInProgressMu.Lock()
 	for ip, startTime := range a.failoverInProgress {
 		if time.Since(startTime) > 5*time.Minute {
-			log.Printf("Failover for workload IP %s timed out, allowing retry", ip)
+			logInfof("Failover for workload IP %s timed out, allowing retry", ip)
 			delete(a.failoverInProgress, ip)
 		}
 	}
@@ -186,7 +185,7 @@ func (a *Agent) checkFailover() {
 
 		// Owner is dead - should we claim?
 		if a.shouldClaim(wl) {
-			log.Printf("Claiming orphaned workload: %s", wl.Name)
+			logInfof("Claiming orphaned workload: %s", wl.Name)
 
 			// Mark failover in progress before releasing state lock
 			a.failoverInProgressMu.Lock()
@@ -229,12 +228,12 @@ func (a *Agent) checkFailover() {
 				a.announceClaim(w)
 				time.Sleep(FailoverClaimSettle)
 				if !a.claimStillHeld(w.IP, claimVersion) {
-					log.Printf("Abandoning claim on %s: a peer's claim superseded ours during settle", w.Name)
+					logInfof("Abandoning claim on %s: a peer's claim superseded ours during settle", w.Name)
 					return
 				}
 
 				if err := a.deployWorkload(w); err != nil {
-					log.Printf("Failover deploy failed for %s: %v - reverting ownership", w.Name, err)
+					logInfof("Failover deploy failed for %s: %v - reverting ownership", w.Name, err)
 					// Rollback ownership on failure so another node can try
 					a.stateMu.Lock()
 					if existing := a.state.Workloads[w.IP]; existing != nil && existing.Owner == a.hwid {
@@ -349,7 +348,7 @@ func (a *Agent) warnMarooned(wl *Workload) {
 	if len(archHas) > 0 {
 		reasons = append(reasons, fmt.Sprintf("compose=%v", archHas))
 	}
-	log.Printf("Workload %s (%s) is MAROONED: owner is dead and no other node is compatible (%s)",
+	logInfof("Workload %s (%s) is MAROONED: owner is dead and no other node is compatible (%s)",
 		wl.Name, wl.IP, strings.Join(reasons, ", "))
 }
 
@@ -365,7 +364,7 @@ func (a *Agent) warnPartitioned(wl *Workload) {
 		return
 	}
 	a.maroonedLogged[wl.IP] = time.Now()
-	log.Printf("Failover: refusing to claim %s (owned by %s) - this node has no public-internet connectivity, so we may be the partitioned side. Will retry when connectivity returns.",
+	logInfof("Failover: refusing to claim %s (owned by %s) - this node has no public-internet connectivity, so we may be the partitioned side. Will retry when connectivity returns.",
 		wl.Name, shortID(wl.Owner, 12))
 }
 

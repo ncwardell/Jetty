@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -35,15 +35,18 @@ import (
 // @Security ApiKeyAuth
 
 func main() {
-	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	// First thing, so nothing logs before the level and format are settled.
+	agent.InitLogging()
 
 	a, err := agent.New()
 	if err != nil {
-		log.Fatalf("Failed to create agent: %v", err)
+		slog.Error("failed to create agent", "err", err)
+		os.Exit(1)
 	}
 
 	if err := a.Start(); err != nil {
-		log.Fatalf("Failed to start agent: %v", err)
+		slog.Error("failed to start agent", "err", err)
+		os.Exit(1)
 	}
 
 	// Wait for shutdown signal
@@ -51,6 +54,6 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
-	log.Println("Shutting down...")
+	slog.Info("shutting down")
 	a.Stop()
 }

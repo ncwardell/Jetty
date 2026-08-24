@@ -538,6 +538,8 @@ volumes:
 | `JETTY_IMAGE_PRUNE_UNTIL` | Age cutoff for pruning unused *tagged* images and build cache (Go duration). Images newer than this are kept (protects fresh pre-pulls). | `168h` |
 | `JETTY_DATA_DIR` | Where state lives. | `/data` |
 | `JETTY_API_PORT` | API port. | `6880` |
+| `JETTY_LOG_LEVEL` | `debug`, `info`, `warn`, or `error`. `debug` also turns on source file:line. An unrecognised value falls back to `info` rather than failing startup. | `info` |
+| `JETTY_LOG_FORMAT` | `text` (logfmt — readable in `docker logs`) or `json` (for shipping to a log collector). | `text` |
 | `JETTY_SERVICE_CIDR` | Mesh network CIDR for workload IPs. | `10.100.0.0/16` |
 | `JETTY_TUNNEL_DOMAIN` | Cloudflare tunnel domain (e.g., `cluster.example.com`). | - |
 | `JETTY_TUNNEL_HOST` | This node's specific subdomain. | - |

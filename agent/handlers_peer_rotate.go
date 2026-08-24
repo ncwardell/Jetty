@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -62,7 +61,7 @@ func (a *Agent) apiRotatePeerKey(w http.ResponseWriter, r *http.Request) {
 			// Don't return the new key itself - the operator never
 			// needs to see it; only the agent and its peers do.
 		})
-		log.Printf("Self APIKey rotated by admin from %s; new key has %d chars", r.RemoteAddr, len(newKey))
+		logInfof("Self APIKey rotated by admin from %s; new key has %d chars", r.RemoteAddr, len(newKey))
 		return
 	}
 

@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -166,13 +165,13 @@ func (a *Agent) writeBackup(w http.ResponseWriter, passphrase, filename string) 
 	// Encrypted path: build tar.gz in-memory, wrap, write.
 	var buf bytes.Buffer
 	if err := a.streamBackupTarGz(&buf); err != nil {
-		log.Printf("Backup: build failed: %v", err)
+		logErrorf("Backup: build failed: %v", err)
 		writeError(w, http.StatusInternalServerError, "backup build failed: "+err.Error())
 		return
 	}
 	wrapped, err := encryptBackup(buf.Bytes(), passphrase)
 	if err != nil {
-		log.Printf("Backup: encrypt failed: %v", err)
+		logErrorf("Backup: encrypt failed: %v", err)
 		writeError(w, http.StatusInternalServerError, "backup encrypt failed: "+err.Error())
 		return
 	}
@@ -192,18 +191,18 @@ func (a *Agent) streamBackupTarGz(dst io.Writer) error {
 	defer tw.Close()
 
 	if err := writeFileToTar(tw, filepath.Join(a.dataDir, "state.json"), "state.json"); err != nil {
-		log.Printf("Backup: failed to add state.json: %v", err)
+		logErrorf("Backup: failed to add state.json: %v", err)
 	}
 	if err := writeFileToTar(tw, filepath.Join(a.dataDir, "hwid"), "hwid"); err != nil {
-		log.Printf("Backup: failed to add hwid: %v", err)
+		logErrorf("Backup: failed to add hwid: %v", err)
 	}
 	if err := writeDirToTar(tw, a.composeDir, "compose"); err != nil {
-		log.Printf("Backup: failed to add compose dir: %v", err)
+		logErrorf("Backup: failed to add compose dir: %v", err)
 	}
 	warpDir := filepath.Join(a.dataDir, "warp")
 	if _, err := os.Stat(warpDir); err == nil {
 		if err := writeDirToTar(tw, warpDir, "warp"); err != nil {
-			log.Printf("Backup: failed to add warp dir: %v", err)
+			logErrorf("Backup: failed to add warp dir: %v", err)
 		}
 	}
 	return nil

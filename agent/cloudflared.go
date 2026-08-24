@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -35,7 +34,7 @@ func (f *cloudflaredLogFilter) Write(p []byte) (n int, err error) {
 		strings.Contains(line, "Unregistered") ||
 		strings.Contains(line, "connected") ||
 		strings.Contains(line, "Starting tunnel") {
-		log.Printf("[%s] %s", f.prefix, line)
+		logInfof("[%s] %s", f.prefix, line)
 	}
 
 	return len(p), nil
@@ -65,7 +64,7 @@ func (a *Agent) startCloudflared() error {
 		// Node-local opt-out. Checked here rather than at the call sites so
 		// restarts, token syncs, and the monitor's restart loop all honour
 		// it - otherwise the connector resurrects itself.
-		log.Printf("Cloudflare tunnel not started: disabled on this node")
+		logInfof("Cloudflare tunnel not started: disabled on this node")
 		return nil
 	}
 
@@ -85,7 +84,7 @@ func (a *Agent) startCloudflared() error {
 		return err
 	}
 
-	log.Printf("Cloudflare tunnel started (pid: %d)", a.cfCmd.Process.Pid)
+	logInfof("Cloudflare tunnel started (pid: %d)", a.cfCmd.Process.Pid)
 
 	// Monitor process and restart on failure
 	goSafe("monitorCloudflared", a.monitorCloudflared)
@@ -117,7 +116,7 @@ func (a *Agent) stopCloudflared() {
 		case <-time.After(5 * time.Second):
 			a.cfCmd.Process.Kill()
 		}
-		log.Printf("Cloudflare tunnel stopped")
+		logInfof("Cloudflare tunnel stopped")
 	}
 	a.cfCmd = nil
 }
@@ -160,14 +159,14 @@ func (a *Agent) monitorCloudflared() {
 
 		// Check if we've exceeded max failures
 		if failures >= CloudflaredMaxFailures {
-			log.Printf("Cloudflare tunnel failed %d times consecutively, giving up. Check your JETTY_CF_TOKEN.", failures)
+			logInfof("Cloudflare tunnel failed %d times consecutively, giving up. Check your JETTY_CF_TOKEN.", failures)
 			return
 		}
 
 		if err != nil {
-			log.Printf("Cloudflare tunnel exited: %v (attempt %d/%d), restarting in %v...", err, failures, CloudflaredMaxFailures, backoff)
+			logInfof("Cloudflare tunnel exited: %v (attempt %d/%d), restarting in %v...", err, failures, CloudflaredMaxFailures, backoff)
 		} else {
-			log.Printf("Cloudflare tunnel exited (attempt %d/%d), restarting in %v...", failures, CloudflaredMaxFailures, backoff)
+			logInfof("Cloudflare tunnel exited (attempt %d/%d), restarting in %v...", failures, CloudflaredMaxFailures, backoff)
 		}
 
 		time.Sleep(backoff)
@@ -207,11 +206,11 @@ func (a *Agent) monitorCloudflared() {
 		a.cfCmd.Stderr = logFilter
 
 		if err := a.cfCmd.Start(); err != nil {
-			log.Printf("Cloudflare tunnel restart failed: %v", err)
+			logErrorf("Cloudflare tunnel restart failed: %v", err)
 			a.cfMu.Unlock()
 			return
 		}
-		log.Printf("Cloudflare tunnel restarted (pid: %d)", a.cfCmd.Process.Pid)
+		logInfof("Cloudflare tunnel restarted (pid: %d)", a.cfCmd.Process.Pid)
 		a.cfMu.Unlock()
 	}
 }

@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -111,7 +110,7 @@ func (a *Agent) apiSetBackupSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(&out)
-	log.Printf("Backup schedule updated: every %dm, retention=%d, encrypted=%v",
+	logInfof("Backup schedule updated: every %dm, retention=%d, encrypted=%v",
 		req.IntervalMinutes, req.Retention, req.Passphrase != "")
 }
 
@@ -132,7 +131,7 @@ func (a *Agent) apiDeleteBackupSchedule(w http.ResponseWriter, r *http.Request) 
 	a.saveState()
 	a.broadcastState()
 	w.WriteHeader(http.StatusNoContent)
-	log.Printf("Backup schedule disabled")
+	logInfof("Backup schedule disabled")
 }
 
 // shouldRunScheduledBackup decides whether THIS node should write
@@ -194,12 +193,12 @@ func (a *Agent) runScheduledBackup() {
 	// Apply retention.
 	if sched.Retention > 0 {
 		if err := a.pruneBackups(backupsDir, sched.Retention); err != nil {
-			log.Printf("Backup retention: %v", err)
+			logInfof("Backup retention: %v", err)
 		}
 	}
 
 	a.recordBackupRunResult("ok", path)
-	log.Printf("Scheduled backup written: %s (%d bytes)", path, rec.Body.Len())
+	logInfof("Scheduled backup written: %s (%d bytes)", path, rec.Body.Len())
 }
 
 func (a *Agent) recordBackupRunResult(status, path string) {
@@ -245,7 +244,7 @@ func (a *Agent) pruneBackups(dir string, keep int) error {
 	sort.Slice(files, func(i, j int) bool { return files[i].mod.After(files[j].mod) })
 	for _, f := range files[keep:] {
 		if err := os.Remove(filepath.Join(dir, f.name)); err != nil {
-			log.Printf("retention: remove %s: %v", f.name, err)
+			logInfof("retention: remove %s: %v", f.name, err)
 		}
 	}
 	return nil

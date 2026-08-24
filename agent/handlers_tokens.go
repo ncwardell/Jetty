@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -91,7 +90,7 @@ func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.Unlock()
 	a.saveState()
 
-	log.Printf("token: minted (expires %s, note=%q)", tok.ExpiresAt.Format(time.RFC3339), tok.Note)
+	logInfof("token: minted (expires %s, note=%q)", tok.ExpiresAt.Format(time.RFC3339), tok.Note)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"token":      tokenID,
@@ -189,7 +188,7 @@ func (a *Agent) apiDeleteToken(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.Unlock()
 	if existed {
 		a.saveState()
-		log.Printf("token: revoked id=%s", redactTokenID(id))
+		logInfof("token: revoked id=%s", redactTokenID(id))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
