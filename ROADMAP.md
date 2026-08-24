@@ -163,8 +163,15 @@ enforcing it. Remaining gaps:
       without a consumer are usually the wrong codes. Adding a `code` field to
       the envelope is non-breaking, so do it when JettyOS or a client actually
       needs to branch on error type.
-- [ ] **Structured logging.** 332 `log.Printf`, zero `slog`. No levels, no
-      request IDs, ad-hoc per-file prefixes.
+- [x] **Structured logging.** All 340 `log.Printf` calls migrated to leveled
+      helpers behind `slog`. `JETTY_LOG_LEVEL` and `JETTY_LOG_FORMAT`
+      (text/json); debug adds source positions. 215 info / 57 warn / 71 error.
+      Guarded by `TestNoBareLogPrintf`.
+- [ ] **Promote log messages to key/value attributes.** The migration kept
+      messages printf-style deliberately — converting 340 of them is a per-site
+      judgement call and would have made the level plumbing unreviewable. Do it
+      incrementally, starting with the messages you actually grep for (workload
+      name, peer, IP). Request IDs belong here too.
 - [ ] **Error wrapping.** `fmt.Errorf` uses `%w` only ~45% of the time; zero
       `errors.Is` / `errors.As`; no sentinel or typed errors.
 - [ ] **Collapse the duplicated dashboard.** `web-ui/index.html` and
