@@ -1,6 +1,13 @@
 # Binary
 jetty
 
+# Test/coverage artifacts
+coverage.out
+
+# Local scratch (not part of the project)
+graphify-out/
+hetzner
+
 # IDE
 .idea/
 .vscode/

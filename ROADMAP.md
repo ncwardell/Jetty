@@ -1,0 +1,235 @@
+# Jetty Roadmap
+
+A living document. The ordering is deliberate: each phase makes the next one
+safe to attempt. Phase 0 exists because without a build gate, every later
+change is unverifiable.
+
+Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
+
+---
+
+## Guiding principles
+
+**Separate observations from decisions.** Gossip is anti-entropy replication,
+not consensus. It converges; it does not agree. Facts each node observes
+independently (health, RTT, load, capability) are correct to gossip at any
+scale. Decisions with exactly one right answer (who *owns* a workload, which IP
+is allocated) need agreement — last-write-wins on those produces split-brain.
+
+**Prefer delegation to agreement.** DNS scales to the entire internet with no
+consensus protocol: it partitions authority so there is nothing to agree about.
+Before making nodes agree on something, ask whether authority can be
+partitioned instead.
+
+**Third-party services are providers, not assumptions.** Cloudflare should stay
+fully supported — it is genuinely excellent, and WARP solves NAT traversal for
+free. The goal is that it is *selectable*, not *load-bearing*. The test:
+can the agent boot and serve internal traffic with `JETTY_CF_TOKEN` unset?
+
+**Don't reimplement transport protocols.** Every hand-rolled TCP feature is a
+bug with a long tail.
+
+---
+
+## Phase 0 — Unblock and gate
+
+Nothing else is safe until CI exists.
+
+- [x] Fix `agent/tunnel.go` build break — declare `defaultPeerWindow` /
+      `windowProbeInterval`, wire the four missing `closeFlow()` teardown calls
+- [x] Fix `go vet` IPv6 findings — `net.JoinHostPort` instead of `"%s:%d"`
+      before `net.Dial`
+- [x] `gofmt` the tree (17 of 39 files were unformatted)
+- [x] `.github/workflows/ci.yml` — gofmt, vet, build, `test -race -cover`,
+      govulncheck, dashboard-embed drift check
+- [x] `Makefile` so local `make check` is the same gate CI runs
+- [x] `LICENSE` (MIT was claimed in `main.go` with no file present)
+- [x] `.gitignore` scratch dirs
+- [ ] Delete superseded branch `claude/debug-cloudflared-workload-5NRBz` — its
+      only surviving idea already landed in `network.go` (idempotent, with a
+      re-apply ticker), done better
+- [ ] **Rotate leaked credentials** found in local session transcripts:
+      Anthropic OAuth token, Cloudflare tunnel JWT, a plaintext password
+
+---
+
+## Phase 1 — Rock-solid primitives
+
+### 1a. Routing (tactical, then strategic)
+
+The userspace tunnel advertised a hardcoded `0xFFFF` window it could not
+honour, ignored the peer's advertised window, and discarded incoming ACKs.
+Bulk flows overran the receiver, the kernel dropped over-window segments,
+nothing retransmitted, and the flow deadlocked permanently. Observed as CIFS
+mount hangs and 10–15s stalls on ~21% of public requests.
+
+- [x] Flow control (`initFlow` / `noteAck` / `awaitWindow` / `closeFlow`)
+- [ ] Verify under load: sustained CIFS transfer, and public request latency
+      distribution with both nodes as Cloudflare tunnel connectors
+- [ ] **Migrate to gVisor netstack.** Deletes ~600 lines of hand-rolled TCP,
+      the whole bug class, the TUN device, and the `NET_ADMIN` requirement.
+      `tunnel.go` is currently 1,069 lines of raw packet parsing at 0% coverage.
+
+### 1b. Correctness
+
+- [ ] **Per-node tunnel control.** `DELETE /api/tunnel` on one node gossips
+      cluster-wide and kills every connector — observed taking all public sites
+      down with Cloudflare 530/1033. The CF token is cluster-shared state with
+      no per-node scope.
+- [ ] **Ownership consensus.** `wl.Owner = a.hwid` (`failover.go`) is a
+      unilateral write to a contended field settled by highest-version-wins.
+      Two nodes can both claim a workload and both start the container. This is
+      a correctness bug at three nodes, not a scale bug.
+- [ ] **Panic recovery.** Zero `recover()` calls exist. A panic in the
+      memberlist delegate, tunnel read loop, or any background ticker takes down
+      the entire agent.
+- [ ] **Multi-node convergence test.** `sync_test.go` is good but tests single
+      merges. Nothing partitions three agents and asserts they heal to identical
+      state with a single owner per workload.
+- [ ] Collapse the three overlapping sync paths (memberlist broadcast + 30s
+      full sync + 10s HTTP pull) to one. Three paths that can disagree is not
+      redundancy.
+
+### 1c. Test coverage
+
+Currently **18.8%**, and the gaps are precisely the dangerous subsystems:
+
+| Area | Coverage | Note |
+|---|---|---|
+| `tunnel.go` | 0% | 19 functions, raw packet parsing |
+| `handlers_workloads.go` | 0% | 1,749 lines, the largest source file |
+| `apiUpdateNode` | 0% | 350 lines — self-update; a bug here bricks a node |
+| `memberlist.go` | 5.7% | 41 functions |
+| `sync.go` | 26.2% | merge logic is the best-tested part of the repo |
+
+---
+
+## Phase 2 — Security
+
+The existing posture is genuinely strong and should not regress: 108
+`exec.Command` sites with **zero shell injection**, systematic input validation
+applied on the gossip *ingest* path and not just the API, Argon2id secret
+envelopes, constant-time key comparison, no secrets in logs with tests
+enforcing it. Remaining gaps:
+
+- [ ] **Fail-open auth.** With no keys configured, every route serves
+      unauthenticated — an open, root-capable Docker orchestrator. Require an
+      explicit `JETTY_ALLOW_INSECURE=true`.
+- [ ] **No rate limiting anywhere**, including the public unauthenticated
+      `/api/join`.
+- [ ] **`?api_key=` query fallback** leaks bearer credentials into proxy logs,
+      and combined with CORS reflecting any `Origin` with
+      `Allow-Credentials: true`, is cross-origin exploitable. Restrict to the
+      WebSocket endpoints that genuinely cannot set headers.
+- [ ] **No TLS.** Plaintext admin keys on `:6880` with `--net host`. Either
+      terminate TLS or document loudly that the port must never be reachable.
+- [ ] Dependabot, Trivy image scan, pin base images by digest, drop `root` in
+      the Dockerfile where possible
+- [ ] Plan migration off `songgao/water` — unmaintained since March 2020 and
+      load-bearing for the entire TUN path
+
+---
+
+## Phase 3 — Standardization
+
+- [ ] **JSON error envelope.** 172 `http.Error` plain-text responses vs 40 JSON
+      success bodies, and no error helper exists. Clients get JSON on success
+      and `text/plain` on failure with no error-code contract. This is the most
+      visible "not a product" API smell and it blocks decent UI error states.
+- [ ] **Structured logging.** 332 `log.Printf`, zero `slog`. No levels, no
+      request IDs, ad-hoc per-file prefixes.
+- [ ] **Error wrapping.** `fmt.Errorf` uses `%w` only ~45% of the time; zero
+      `errors.Is` / `errors.As`; no sentinel or typed errors.
+- [ ] **Collapse the duplicated dashboard.** `web-ui/index.html` and
+      `agent/dashboard.html` are byte-identical 253KB files kept in sync by a
+      `go:generate cp` that only runs inside `docker build` — a local `go build`
+      embeds whatever happens to be on disk. `go:embed` cannot traverse `..`,
+      which is why the copy exists. Fix: move the source to `agent/web/`, embed
+      it directly, delete `web-ui/`. CI drift check is the stopgap until then.
+- [ ] **Swagger drift.** 48 routes registered, 32 documented. Add regeneration
+      to `go:generate` plus a CI check that `docs/` is clean afterward. The 7
+      internal gossip routes (`/api/sync`, `/api/peer-announce`,
+      `/api/heartbeat`, `/api/tunnel/sync`, `/api/tunnel/ws`) belong in
+      `ARCHITECTURE.md`, not the public spec.
+- [ ] **Docs gaps:** no `ARCHITECTURE.md`, no `CONTRIBUTING.md`, no development
+      setup, no release process, no troubleshooting guide. `LOGIC.md` is stale.
+      `docs/networking.md` is accurate and thorough — use it as the model.
+- [ ] **Decompose the big files:** `handlers_workloads.go` (1,749 lines, 14
+      handlers), `apiUpdateNode` (350 lines inline in one handler). Move
+      `newClusterTransport` (164 lines) and `tunnelConn.WriteMessage` (191
+      lines) out of `types.go` — ~355 of its 460 lines are behaviour, not types.
+- [ ] Config struct with startup validation; document all ~20 `JETTY_*` vars in
+      one place (they are currently split between Go and `docker-entrypoint.sh`)
+
+---
+
+## Phase 4 — Release discipline
+
+The repo has **zero git tags**. The release workflow's only automatic trigger
+is `push: tags: v*`, so it has never fired — every published image came from a
+manual dispatch defaulting to version `dev`. Meanwhile `agent.go` hardcodes
+`2.0.0` and `main.go` declares `2.0`.
+
+- [ ] Tag a real release; single-source the version
+- [ ] `release-please` or `git-cliff` — commits already follow Conventional
+      Commits, so a changelog and GitHub Releases are nearly free
+- [ ] Re-enable SBOM and provenance (currently `provenance: false`)
+- [ ] Post-build job that pulls each arch image and asserts the binary
+      architecture matches the manifest — this is the exact regression an
+      earlier commit fixed, still untested
+
+---
+
+## Phase 5 — Product & UX
+
+- [ ] Vendor xterm.js — it loads from a CDN, so offline/airgapped clusters get
+      a broken terminal
+- [ ] Real UI error states (needs the Phase 3 error envelope first)
+- [ ] Frontend tests — there are currently none
+- [ ] `Workload.Hostname` in cluster state. Route config currently lives in the
+      Cloudflare dashboard: data you don't own, can't back up, can't gossip,
+      can't test. Cheap now, expensive once hostnames accumulate.
+- [ ] Entry-node role: any publicly reachable node terminates TLS, reads
+      SNI/Host, looks up the gossiped route table, and dials the workload over
+      the mesh — the workload need not be local. Reachability must be *probed*
+      by a peer, not inferred from having a public IP (CGNAT lies).
+- [ ] DNS resolver per node, served from gossiped state, replacing
+      `/etc/hosts` + `extra_hosts`. Today adding a workload anywhere requires
+      container recreation elsewhere to make it resolvable. Split-horizon also
+      fixes hairpinning on public names.
+- [ ] RTT on `Peer` as an EWMA — `checkPeers` already samples it every 5s and
+      throws it away. Unlocks replica selection, relay selection, and geo
+      policy. Latency beats GeoIP; geography is a lossy proxy for the thing you
+      actually care about.
+- [ ] Workload replicas (`Owner string` → `Owners []string`). Note this gates
+      geo-routing entirely: routing policy needs a choice to make, and today
+      every mesh IP has exactly one correct destination.
+
+---
+
+## Known scaling limits
+
+Not urgent, but these are the walls, in the order they arrive (~50–100 nodes):
+
+1. **O(n²) tunnel mesh** — every node builds a tunnel to every healthy peer
+2. **Full-state sync** — the 30s sync ships the entire workload set, no deltas
+3. **`/etc/hosts`** — contains every workload in the cluster, on every node
+
+Gossip itself is not the bottleneck; SWIM handles 10k-node pools comfortably.
+
+---
+
+## Deliberately not doing (yet)
+
+- **Replacing WARP.** It solves NAT traversal, stable addressing, and transport
+  encryption in one dependency. Replacing it means STUN + UDP hole punching
+  (~85–90% of NAT pairs; symmetric-to-symmetric essentially never) plus a relay
+  fallback for the rest, plus Noise for encryption. Real work with a real payoff
+  — but Phase 1 correctness matters more.
+- **Crypto-addressed IPv6** (`address = hash(pubkey)`). Removes the allocation
+  authority, makes source addresses unspoofable, and is the prerequisite for
+  cross-cluster peering. Requires IPv6 — 16 bits of host space in a `/16` hits
+  birthday collisions around 256 workloads. Big change, do it last.
+- **Replicated storage.** Failover moves ownership, not volumes, so "no
+  downtime" currently holds only for stateless workloads. This is a second
+  product of comparable difficulty and needs a deliberate decision, not drift.
