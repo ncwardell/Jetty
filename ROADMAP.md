@@ -102,6 +102,13 @@ mount hangs and 10–15s stalls on ~21% of public requests.
 - [ ] Collapse the three overlapping sync paths (memberlist broadcast + 30s
       full sync + 10s HTTP pull) to one. Three paths that can disagree is not
       redundancy.
+- [ ] **`NodeMeta` truncation corrupts gossip.** memberlist caps node metadata
+      at 512 bytes; on overflow `jettyDelegate.NodeMeta` does
+      `return d.meta[:limit]`, slicing JSON mid-string and publishing a payload
+      every peer fails to parse — with only a log line to say so. It should
+      drop optional fields to fit, or refuse to publish, rather than ship
+      corrupt data. Latent today, and a live hazard the moment anything is
+      added to `NodeMeta` (see JettyOS enablers).
 
 ### 1c. Test coverage
 
@@ -220,6 +227,52 @@ manual dispatch defaulting to version `dev`. Meanwhile `agent.go` hardcodes
       every mesh IP has exactly one correct destination.
 
 ---
+
+## JettyOS enablers
+
+Prerequisites in Jetty for the desktop project (`docs/JETTYOS.md`). Listed
+separately because the sequencing is driven by that project — but note how much
+of it was already on this roadmap for unrelated reasons. That overlap is the
+main finding: JettyOS mostly needs Jetty to be *finished*, not extended.
+
+**Already listed above, and load-bearing for JettyOS:**
+
+| Item | Phase | Why JettyOS needs it |
+|---|---|---|
+| Entry-node role + `Workload.Hostname` | 5 | §4 requires the browser to reach a *specific* node directly, not whichever one the tunnel picks |
+| DNS resolver replacing `extra_hosts` | 5 | Today adding a workload forces container recreation elsewhere — fatal for windows opened 40× an hour |
+| RTT on `Peer` | 5 | Placement input; §8's thin node wants latency-aware scheduling |
+| JSON error envelope | 3 | JettyOS is an API client; `text/plain` errors with no code contract are unworkable to program against |
+
+**New, and specific to JettyOS:**
+
+- [ ] **Wire up `JETTY_TUNNEL_HOST`.** The per-node subdomain is already read
+      from the environment and stored on the agent, then never used anywhere.
+      It is exactly the per-node addressing §4 needs, half-built.
+- [ ] **WebSocket upgrade in `/api/proxy/`.** Currently `httpClient.Do()` with
+      no hijack and no `websocket.Dialer`, so browser upgrade requests fail.
+      The single concrete blocker for browser↔container streams.
+- [ ] **Lift `bridgeWebSockets()` out of `handlers_terminal.go`.** It is already
+      payload-agnostic — forwards message type and data verbatim, unbuffered.
+      It just needs to stop living in the terminal handler.
+- [ ] **Extract `rankCandidates()` from `shouldClaim`, add launch-time
+      placement.** Worth doing regardless of JettyOS: today a workload lands on
+      whichever node received the POST, and the not-allowed fallback
+      (`findAllowedNode`) returns the first match in *Go map iteration order*.
+      Non-deterministic placement is a bug on its own.
+- [ ] **Node capability labels** (`gpu`, `nvme`, `bigmem`) in `NodeMeta`, so a
+      workload can require a capability instead of naming a hostname. Cheap
+      now, annoying once a catalog is full of hostnames.
+- [ ] **Gossip node resource metrics on a channel that is not `NodeMeta`.**
+      Memory/CPU/disk are already sampled and thrown away, but memberlist caps
+      node metadata at 512 bytes and the current payload already spends a few
+      hundred. See the `NodeMeta` truncation bug below — that must be fixed
+      first either way.
+- [ ] **Ephemeral workload class as a separate map**, not a flag on `Workload`.
+      `state.Workloads` is keyed by mesh IP, and ~11 subsystems iterate it
+      unconditionally; a flag needs a guard in every one of them and in every
+      future feature. A separate map keyed by window/session ID, never
+      persisted or gossiped, needs zero changes to any of them.
 
 ## Known scaling limits
 

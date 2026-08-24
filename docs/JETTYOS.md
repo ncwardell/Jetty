@@ -1,587 +1,325 @@
-# JettyOS — A Conceptual Architecture
+# JettyOS — Outline
 
-**Status: speculative design.** This document argues a direction. It is not a
-commitment, a plan, or a specification. It deliberately stays above the code —
-a detailed audit of what Jetty actually does, function by function, is the
-*next* document, and it should be written against a direction rather than
-inventing one as it goes.
+Jetty is the hardware. JettyOS is the desktop you drive it with.
 
-The question: can a Jetty cluster be a *computer* — one you sit down at, with a
-terminal, a shell, and an optional desktop — rather than a place you deploy
-services to?
-
-The answer this document argues: **yes, but only for a specific and
-non-obvious partition of the work.** Getting that partition right is the entire
-design. Everything else is implementation.
+This document maps desktop concepts onto Jetty mechanisms, lists what JettyOS is
+made of, and lists what Jetty needs added.
 
 ---
 
-## Part I — What a computer actually is
+## 1. Jetty as hardware
 
-Before claiming a cluster can be one, it's worth being precise about what the
-traditional model provides, because most of it is invisible until you try to
-distribute it.
+Treat the cluster as one machine. Jetty is its board.
 
-### The hierarchy, and the new layer
-
-Every computer is a latency hierarchy. The numbers, to order of magnitude:
-
-| Layer | Latency | Ratio to L1 |
-|---|---|---|
-| L1 cache | ~1 ns | 1× |
-| L3 cache | ~15 ns | 15× |
-| Main memory (DRAM) | ~100 ns | 100× |
-| NVMe SSD | ~50 µs | 50,000× |
-| **LAN round trip** | **~0.5–1 ms** | **~1,000,000×** |
-| WiFi round trip | ~2–10 ms, jittery | ~10,000,000× |
-| WAN / anycast round trip | ~10–50 ms | ~50,000,000× |
-
-An operating system is, structurally, a machine for hiding this hierarchy. Virtual
-memory hides the DRAM/disk boundary. The page cache hides the disk. Schedulers
-hide the fact that one CPU is pretending to be many.
-
-Distributing a computer means **adding a layer at the bottom that is 10,000×
-slower than the one above it** — and unlike every other layer, this one can
-fail partially.
-
-### The two thresholds — the central insight
-
-Traditional OS design treats the network as unusable for anything a program
-depends on, and it is right to. Compared to a memory bus, a network is a
-catastrophe.
-
-But there is a second threshold that has nothing to do with buses:
-
-| Human threshold | Budget |
+| Machine part | Jetty |
 |---|---|
-| One frame at 60 Hz | 16.7 ms |
-| Input-to-photon "feels instant" | ~50 ms |
-| "That was noticeable" | ~100 ms |
-| "This is laggy" | ~200 ms |
-
-So:
-
-- **DRAM (100 ns) → LAN (1 ms) is a 10,000× regression.** Catastrophic.
-- **LAN (1 ms) → "feels instant" (50 ms) is 50× of headroom.** Comfortable.
-
-**The network is far too slow to be a bus and far more than fast enough to be
-a human interface.** That gap is where a cluster computer lives, and it is the
-only reason this idea is coherent.
-
-### The historical argument
-
-A 7200 RPM hard disk seek was ~10 ms. Every desktop operating system whose
-metaphors we still use — the ones designed between 1984 and 1995 — was built
-assuming 10 ms was an acceptable latency for a user-facing operation. Opening a
-file, launching an app, paging in a window: all of it budgeted against a disk
-that slow.
-
-**A modern LAN round trip is roughly twenty times faster than the storage that
-all traditional desktop design assumed.**
-
-The network today is better than the disk was when the desktop was invented.
-That is why this is possible now and was not in 1995 — not browsers, not
-containers, not WASM. Those are conveniences. The latency budget is the
-substance.
-
-### Three scarcities, and how they invert
-
-A traditional OS exists to ration three scarce things:
-
-1. **CPU time** — hence schedulers, preemption, priorities.
-2. **RAM** — hence virtual memory, paging, the OOM killer.
-3. **I/O bandwidth** — hence caches, queues, elevators.
-
-On a cluster, the profile inverts:
-
-- **CPU is abundant.** Add a node.
-- **RAM is abundant but not poolable.** This is the one people always get
-  wrong. Four machines with 16 GB each do not make a 64 GB machine. No process
-  can exceed one node's RAM. Aggregate capacity grows; *maximum* capacity does
-  not.
-- **The new scarcity is locality.** Not cycles — distance.
-
-A cluster OS's scheduler is therefore not rationing time. It is rationing
-distance. That is a different job with a different shape.
-
-### Time-sharing versus space-sharing
-
-This follows directly:
-
-| | Traditional OS | Cluster OS |
-|---|---|---|
-| Resource | scarce hardware | abundant hardware |
-| Strategy | **time-share** it | **space-share** it |
-| Decision | who runs next, for 5 ms | where this lives, for its lifetime |
-| Frequency | thousands per second | a few per minute |
-| Requires | preemption | placement |
-| Can afford to be | fast and dumb | slow and smart |
-
-A traditional scheduler makes a microsecond decision ten thousand times a
-second, so it must be nearly free. A placement engine makes one decision per
-process lifetime, so it can consult load, latency, capability, trust, and
-affinity, and still cost nothing.
-
-**This is a genuine advantage, not a consolation.** Placement quality is
-something traditional operating systems cannot buy at any price, because they
-have nowhere to place anything.
-
-### Fate sharing versus partial failure
-
-A traditional computer has a simplifying property that is never named because
-it is never absent: **when it breaks, all of it breaks.** The CPU cannot lose
-contact with the RAM. Half the machine cannot keep running. Every abstraction —
-every syscall, every pointer, every open file — is built on the assumption that
-the substrate is either entirely present or entirely gone.
-
-Distributed systems have no such property. Partial failure is the defining
-characteristic, and it is why distributed programming is hard.
-
-The trade is exact:
-
-- **You lose:** the assumption that a call returns. Every boundary becomes a
-  place where the answer can be "I don't know," which is worse than "no."
-- **You gain:** survivability. Your computer can keep working when part of it
-  breaks. No desktop OS has ever offered this, and it cannot, because fate
-  sharing is the assumption it is built on.
-
-Jetty is already a partial-failure machine — gossip, health detection,
-ownership, failover, tombstones. That is the single most valuable thing it
-brings to this idea, and it is the part that would be hardest to build from
-scratch.
-
-### The display is memory
-
-One more traditional property, and it is the awkward one.
-
-On a real computer the framebuffer *is* memory. The GPU writes pixels into RAM
-and the display controller scans them out. Zero copy, zero network, zero
-serialization. The path from "program decided what to draw" to "photons" never
-leaves the box.
-
-Distributing a computer means the display is at the human and the computation
-is not. Pixels must cross the network. There is no clever architecture that
-avoids this — it is the one place where the cluster model is unavoidably worse
-than the traditional one, and it is why VDI and thin clients have remained
-niche for forty years despite being repeatedly reinvented.
-
----
-
-## Part II — The inversion
-
-### The partition rule
-
-From the two thresholds, one rule follows, and everything else in this document
-is downstream of it:
-
-> **Anything a human waits on may cross the network.
-> Anything a computation waits on may not.**
-
-Applied:
-
-| May be distributed | Must stay local |
-|---|---|
-| Launching an application | Executing instructions |
-| Opening or saving a file | Memory access |
-| Window management, focus, layout | The frame pipeline |
-| Session state — what's running | Any tight loop |
-| Service discovery, naming | Anything a program *blocks* on |
-| Notifications, clipboard, search | Audio buffer refill |
-| Anything human-initiated *and* human-observed | Anything program-initiated and program-observed |
-
-The line falls almost exactly on the **process boundary** — and that is not a
-coincidence. Processes were designed to be independently schedulable, isolated
-in memory, and to communicate by message. That is already the shape of a thing
-you can put on the far side of a network.
-
-### Why "distribute inside a program" always fails
-
-Every attempt at a single-system-image cluster — distributed shared memory,
-Mosix, Plan 9's process migration, and a long tail of research systems — has
-foundered on the same rock. If a program's memory accesses can cross a network,
-then a pointer dereference can take a millisecond and can fail. Programs are
-not written to survive that, and rewriting them to is called "distributed
-programming," which is a hard problem that no operating system can solve on the
-program's behalf.
-
-**Distribute between programs. Never inside one.** The unit is the application.
-
-### What Unix already got right, and what blocks it
-
-Unix processes are nearly the right shape already: isolated address space,
-message-based IPC, independently schedulable, killable and restartable. Three
-things stop them being distributable as-is:
-
-1. **`fork()`** — inheritance of an address space. Cannot cross a network.
-2. **Shared memory and `mmap`** — the fast paths are all shared-memory paths.
-3. **Syscalls that cannot fail** — the API has no vocabulary for "unreachable."
-
-Plan 9 solved the third-and-a-half of this by making everything a named
-resource in a per-process namespace, removing the need for shared memory to
-find things. It was right and it lost, partly because the network of 1992 could
-not carry it.
-
-**The container model removes `fork` by construction.** Every process starts
-from an image, never from a parent's memory. What looks like a limitation is
-precisely what makes the model distributable — and it is why the design below
-can be stateless in the places that matter.
-
----
-
-## Part III — Where Jetty already sits
-
-Jetty was not built to be an operating system. But because it solved the
-partial-failure problem honestly, it accidentally has most of a kernel's
-bookkeeping.
-
-### What it already is, in OS terms
-
-| OS concept | What Jetty already provides |
-|---|---|
-| Process table | cluster state, gossiped — replicated, survives node death |
+| CPU / RAM / disk | a node — reports arch, and should report GPU, cores, memory, free disk |
+| System bus | the WARP mesh (`10.100.0.0/16` service network) |
+| Device tree — what hardware exists | cluster state, replicated to every node |
 | Process | a workload (a compose project) |
-| Process identity | a stable mesh IP that survives migration |
-| Name service | workload name → address |
-| Isolation | containers, plus physical machine separation |
-| CPU affinity | node pinning |
-| Process group / session | tags, with group operations |
-| Migration | blue-green move between nodes |
-| Reaping | tombstones with a bounded lifetime |
-| Placement engine | deterministic failover election |
-| Heterogeneity | per-architecture images, mixed ARM and x86 in one cluster |
+| Process address | a mesh IP, stable across node moves |
+| Device name | the workload's DNS name |
+| Slot / socket assignment | node pinning (`allowed_nodes`) |
+| Hot-swap | failover — a workload's node dies, another picks it up |
+| Firmware console | the existing dashboard and API |
 
-That is a substantial amount of an operating system arrived at sideways.
+What this hardware already gives you, for free:
 
-The process table in particular is the valuable part. **A traditional kernel's
-process table is in RAM and dies with the machine.** Jetty's is replicated to
-every node and converges. That single difference is what makes everything in
-Part IV possible.
+- Run a container anywhere in the cluster and reach it by name from anywhere else
+- Mixed architectures (ARM and x86) in one machine
+- A thing that keeps running when the machine it was on dies
+- Persistent, replicated record of everything that exists
+- Add a node and the machine gets bigger, with no rebuild
 
-### The one conceptual mismatch
-
-Jetty's mental model is **"services that should always be running."**
-An operating system's mental model is **"things a person starts and stops all
-day."**
-
-Every default reflects the first: workloads are durable, gossiped cluster-wide,
-revivable, individually addressable, and leave tombstones when deleted. That is
-correct and well-tuned for a dozen long-lived services. It is wrong for
-something a user opens and closes forty times an hour, where each open would
-mean a cluster-wide state mutation and each close a tombstone.
-
-**This is the single most important conceptual change, and everything else
-follows from it:** an OS needs a second, cheaper class of thing.
+What it does not give you: a screen, a session, a launcher, or any concept of a
+user sitting in front of it. That's JettyOS.
 
 ---
 
-## Part IV — The concept
+## 2. JettyOS
 
-### The thin node is a node
+A workload that serves a web desktop. It holds the cluster's admin credential
+and uses the Jetty API to run everything else.
 
-The obvious design is a dumb terminal: a browser in kiosk mode, all compute
-elsewhere. This is the wrong design, for two reasons.
+- **Single user.** You're root. Extra users are a later feature, not a
+  foundation.
+- **Served over the tunnel**, same as anything else. Open it from any browser.
+- **The existing dashboard stays**, separately and publicly, for hardware-level
+  work: nodes, tunnels, join tokens, backups. JettyOS never becomes the only way
+  in — when it won't boot, that dashboard is how you fix it.
 
-Make the terminal a **full cluster member that happens to have a display
-attached**. Then:
+The browser is the screen, keyboard, and mouse. The cluster is everything else.
 
-1. **It is the nearest node, so locality-aware placement makes local things
-   local for free.** A text editor schedules onto the machine you're sitting at
-   — zero network, zero streaming, indistinguishable from native. Steam
-   schedules onto the GPU box. A build schedules onto whatever is idle. The
-   same mechanism handles all three, and the fast case requires no special
-   casing.
-2. **It degrades to a normal computer when the network dies.** A true thin
-   client with no network is a brick. A thin *node* with no network is a
-   single-machine computer running whatever it can host locally. This is not a
-   detail — it is the difference between a machine you can depend on and one
-   you cannot.
+---
 
-The "thin" in thin node is about *hardware expectations*, not about
-capability. It can be a laptop, a NUC, or a Pi. What makes it thin is that its
-own specifications stop being the ceiling on what you can run.
+## 3. Desktop → cluster mapping
 
-### Session is state; the shell is a projection
+The core of the design.
 
-The desktop — which windows exist, where, on what — belongs in **cluster
-state**, not in the shell's memory.
-
-The shell (window manager, launcher, dock) becomes a **stateless renderer**: it
-reads the session from the cluster and draws it. It holds nothing.
-
-Three consequences, and they are the payoff of the whole design:
-
-1. **The OS can crash and the applications survive.** They are separate
-   workloads on separate machines. Your desktop dies, is revived, re-reads
-   state, redraws — and your game never noticed. No conventional window manager
-   can be killed without at minimum disturbing everything it manages.
-
-2. **Multi-head across physical machines falls out for free.** Laptop, phone,
-   TV — each running its own local shell instance, all rendering the same live
-   session. No sync protocol, no handoff, no "continuity" feature, because they
-   are all just readers of the same replicated state.
-
-3. **Each head runs its own shell, pinned locally.** The shell is not one
-   cluster-wide workload; it is one per display, always local, always
-   stateless. Which is what makes (2) work without any coordination.
-
-**The discipline this requires:** the shell must never cache. The first time it
-keeps its own window list "for performance," multi-head breaks, failover
-breaks, and it will still work perfectly on your desk — so you won't find out
-until a node dies.
-
-### Two workload classes
-
-The conceptual change from Part III, stated concretely:
-
-| | **Services** (what Jetty has) | **Instances** (what it needs) |
+| Desktop thing | Jetty mechanism | Exists today? |
 |---|---|---|
-| Lifetime | months | minutes |
-| State | durable, gossiped cluster-wide | node-local, not gossiped |
-| Addressable | yes — stable mesh IP, DNS name | no — reachable only via its session |
-| Failover | yes | no; if the node dies, the window dies |
-| On delete | tombstone | just gone |
-| Examples | database, file server, clipboard broker | a terminal, an editor window, a browser tab |
+| Launch an app | create a workload | yes |
+| Quit an app | delete the workload | yes |
+| App window | a stream from the workload to the browser | **no** |
+| Task manager | list workloads + nodes | yes |
+| "Run this on the GPU box" | `allowed_nodes` | yes |
+| "Run this anywhere" | pick a node at spawn | **no — no scheduler at launch** |
+| Open session (what's running) | a tag grouping the session's workloads | yes |
+| Close everything | bulk action on the tag | yes |
+| Move a window to another machine | `POST /workloads/{name}/move` | yes |
+| Autostart on login | `autostart: true` | yes |
+| Background service (music daemon, sync) | ordinary durable workload | yes |
+| Files | a storage workload (NFS/SMB/S3) mounted by others | yes, by convention |
+| Clipboard, notifications | small always-on workloads with DNS names | yes |
+| Install an app | an entry in a catalog → a compose template | **no — needs a catalog** |
+| Short-lived window | needs a cheap workload class | **no — see §6** |
 
-The addressing point matters more than it looks. If every window needed a
-cluster-unique address, then rapid open/close would make address allocation a
-hot, contended decision — exactly the class of decision that a
-converge-don't-agree state layer handles badly. Instances don't need cluster
-addresses. **Services get well-known names; instances don't** — which is the
-same distinction Unix makes between well-known ports and ordinary processes.
+Most of the desktop is already expressible. Three gaps: **windows, launch-time
+placement, and cheap short-lived workloads.**
 
-The session ties them together with a **desired-state split**: cluster state
-holds one small record per session saying *what should be open*; each node
-reconciles its own containers against it. Declarative session, imperative local
-execution. One gossiped record per session instead of one per window.
+---
 
-### Two planes
+## 4. How a window works
 
-On a real computer, control and data share memory. Distributed, they cannot.
+The one flow that has to be designed rather than assembled.
 
-- **Control plane** — spawn, kill, list, focus, move, policy. Crosses the
-  cluster mesh. Tolerates tens of milliseconds. This is where all the
-  interesting architecture lives.
-- **Data plane** — pixels, audio, input events. Goes **directly** from the node
-  running the application to the display, never relayed through a third node.
+```
+click app in launcher
+  → JettyOS asks Jetty to create a workload (from a catalog template)
+  → Jetty picks a node (or honours the pin)
+  → container starts, app runs, exposes a display endpoint
+  → browser connects to THAT NODE directly and renders
+  → window closes → workload deleted
+```
 
-Routing pixels through the control plane is the single easiest way to build a
-beautiful architecture that feels terrible. This is a fork in the road at the
-beginning, not a limitation discovered later.
+Two rules that decide whether this feels good:
 
-### Two rendering modes
+**Stream direct, not through JettyOS.** If node C runs the app, the browser
+connects to node C. Relaying pixels through whichever node serves JettyOS adds a
+hop through the mesh for every frame. Control messages (launch, kill, focus) go
+through JettyOS; pixels don't.
 
-The other thing everyone gets wrong: building one pixel-streaming path and
-using it for everything, which makes a terminal feel like a game stream instead
-of like a terminal.
+**Two kinds of window, not one.**
 
-| | **Semantic remoting** | **Pixel streaming** |
+| | Semantic | Pixel |
 |---|---|---|
-| Carries | events, text, DOM, escape sequences | encoded video frames |
-| Bandwidth | kilobytes | megabits |
-| Latency tolerance | high — it's already event-driven | brutal — every millisecond visible |
-| Needs GPU | no | yes, hardware encode |
-| Covers | terminals, editors, chat, file managers, web apps, dashboards | games, video, 3D, CAD |
-| Share of a normal day | ~90% | ~10% |
+| Carries | HTML/text/events | encoded video |
+| Bandwidth | KB | Mbps |
+| Needs GPU | no | yes |
+| Use for | terminals, editors, web apps, dashboards, file manager | games, video, 3D |
+| Share of use | most of it | a little |
 
-Most of what a person does all day is event-driven and remotes almost for free.
-The expensive path is needed by a small set of applications — and those are
-precisely the ones you would pin to a specific machine anyway, which means they
-never migrate, which means their state never has to move.
+Building one pixel-streaming path and using it for everything makes a terminal
+feel like a game stream. Most windows should be a web app in an iframe or a
+terminal over WebSocket — both nearly free.
 
-**The pinning that makes the latency work also dissolves the state-migration
-problem.** The two hardest constraints cancel each other, and this is the most
-load-bearing structural fact in the design.
+For the pixel case, adopt existing work (WebRTC-based container streaming is a
+solved problem with mature implementations) rather than writing an encoder.
 
 ---
 
-## Part V — What has to change in Jetty
+## 5. Pinning does more work than it looks
 
-Conceptually, not as a work plan. Roughly in dependency order.
+Pin the heavy things — Steam to the GPU node, media server to the box with the
+disks, build agent to the fast CPU.
 
-1. **A second workload class.** Ephemeral, node-local, not gossiped, reaped
-   automatically. Everything else depends on this existing.
+That's not just placement. A pinned workload never moves, so **its data never
+has to move either.** The apps with big state are exactly the apps you'd pin,
+which means the hardest problem in the design (volumes don't follow failover)
+doesn't apply to them.
 
-2. **A placement engine that chooses.** Today placement happens on failover;
-   a node is chosen only when one dies. An OS needs a choice made at *spawn* —
-   by load, by latency, by capability, by trust. The inputs are already being
-   measured; they are just discarded.
-
-3. **Capability-based scheduling, not hostname pinning.** "This needs a GPU" is
-   portable; "this runs on `gpu-box`" breaks when you rename or replace the
-   machine. Nodes already report architecture — the concept generalizes.
-
-4. **A session abstraction.** A named, per-user grouping distinct from both a
-   single workload and the whole cluster. Groups already exist as a mechanism;
-   they need to mean something.
-
-5. **An inter-process call layer with a policy table.** This is the real gap.
-   Today, communication between workloads is whatever you configure by hand.
-   An OS needs named services (`fs.read`, `clipboard.get`, `gpu.claim`) that
-   resolve to a node and are authorized or refused by a *table* — data, not
-   code, and replicated like everything else. This is the layer that turns
-   "workloads on a cluster" into an operating system rather than a deployment
-   tool.
-
-   It also corrects the tempting mistake of a "system utilities" workload
-   holding `grep`, `find`, and friends. Those need *bytes*. If the bytes are on
-   another node you have moved data to code, which at cluster latency is
-   ruinous. **Ship the operation to the data.** A system-utilities service is a
-   dispatcher, not a toolbox.
-
-6. **A user.** There is currently one credential for the whole cluster. This is
-   conceptually a single-user, root-only machine. Multi-user needs per-user
-   identity and per-session scoping before any of it means anything.
-
-7. **A display path.** Both modes, as separate mechanisms. This is the largest
-   piece of genuinely new work, and it is the one where existing open-source
-   projects should be adopted rather than reinvented — browser-delivered
-   application streaming is a solved problem with several mature
-   implementations.
-
-8. **Ownership that is actually decided.** A converge-don't-agree state layer
-   is correct for observations and wrong for facts with exactly one right
-   answer. At OS spawn rates this matters more than it does for a dozen
-   services. Note the mitigation, though: **instances don't fail over, so they
-   have nothing to contend about.** Only the small set of long-lived services
-   needs this solved — which makes it a bounded problem rather than a
-   pervasive one.
+Light, stateless things stay unpinned and land wherever there's room.
 
 ---
 
-## Part VI — What this buys you
+## 6. What Jetty needs added
 
-- **The computer survives its own operating system crashing.** Structurally
-  novel. Nothing traditional offers it.
-- **Hardware failure stops being data loss.** A dead machine is a capacity
-  event, not an emergency.
-- **Incremental growth instead of replacement.** Adding a node makes your
-  computer faster. There is no upgrade cycle and no migration day.
-- **Genuine heterogeneity.** An ARM SBC and an x86 GPU box are one computer.
-  Traditional operating systems cannot span instruction sets.
-- **Isolation stronger than any single machine can offer.** Two applications on
-  different physical nodes share no cache, no TLB, no DRAM. The entire class of
-  cross-tenant side-channel attacks — Spectre, Meltdown, rowhammer — that has
-  consumed a decade of hypervisor engineering simply does not exist across
-  machines.
-- **Placement becomes a security primitive.** "Never schedule this alongside
-  anything untrusted" is expressible here and is not expressible on one
-  machine, at any price.
-- **Multiple simultaneous heads,** with no synchronization protocol.
-- **The machine works while you are not at it.** The distinction between "my
-  computer" and "my server" disappears.
-- **The whole system is already reproducible.** Applications are declarative
-  images; the state is small, versioned, and backed up. Rebuilding is not a
-  weekend.
+Short list. Neither item changes how Jetty works for its current use.
 
----
+**1. A cheap workload class.**
+Everything today is durable infrastructure: written to cluster state, gossiped
+to every node, tombstoned on delete. Correct for a database. Wrong for a
+terminal window you open and close forty times an hour.
 
-## Part VII — What it costs
+Needed: workloads that are node-local, not gossiped, don't fail over, and get
+reaped automatically. The session's *manifest* (what should be open) stays in
+cluster state; the individual containers don't.
 
-Honestly, including what cannot be fixed.
+This gates everything else.
 
-**Structural — no amount of engineering removes these:**
+**2. Placement at launch.**
+Today a node is only chosen when one dies. Creating a workload puts it on
+whichever node received the request.
 
-- **No trusted display path.** The strongest compartmentalized OS designs rest
-  on a small, air-gapped, local component that owns the screen and draws
-  unforgeable trust indicators, so a hostile application cannot paint a
-  convincing fake password prompt. When the display is on the far side of a
-  network and rendered by a general-purpose client, that component cannot
-  exist — the renderer is the thing you would have to trust. **This is a
-  compartmentalized OS, not a verifiably compartmentalized one.** Fine for a
-  personal cluster; not a substitute for a design where that property is the
-  point.
+Needed: "run this somewhere sensible" — by free memory, CPU, latency, or
+required capability. The inputs are already sampled on every node and thrown
+away.
 
-- **Single-thread latency has a floor.** Nothing distributed will ever match a
-  local memory bus. Applications that need one must run entirely on one node —
-  which the architecture supports, but it means the cluster is not helping
-  them.
-
-- **RAM does not pool.** Aggregate capacity grows; maximum process size does
-  not. The largest thing you can run is bounded by your largest single machine,
-  forever.
-
-- **Network dependency is total for anything remote.** Mitigated but not
-  removed by making the terminal a real node — you degrade to one machine
-  rather than to nothing, which is the difference between inconvenient and
-  useless.
-
-- **Partition splits your desktop.** Two halves that both keep accepting work
-  and reconcile by last-write-wins. On a single machine this cannot happen.
-
-**Practical — expensive but tractable:**
-
-- **Every node is fully privileged today.** Each holds the credentials for the
-  entire cluster, so compromising any one is compromising all of them. This is
-  precisely backwards from the compartmentalization model being invoked, and it
-  is the largest security gap in the concept.
-- **Cold start is seconds, not microseconds.** No fine-grained processes. There
-  is no `ls | grep` across the cluster; the unit of distribution is the
-  application, and anything finer happens inside one.
-- **Peripherals live at the edge, with the human,** and are mediated by client
-  APIs you don't control and that vary by vendor. For latency-sensitive input —
-  a gamepad — input latency stacks on top of frame latency.
-- **Power and cost.** N machines idling versus one laptop sleeping. This is a
-  desk computer, not a travel computer.
-- **You are depending on a browser** as the hardware abstraction layer, and its
-  capabilities are set by vendors with their own priorities.
+**Worth doing alongside:** let nodes advertise capabilities (`gpu`, `nvme`,
+`bigmem`) so a workload can say *"needs a GPU"* instead of *"runs on gpu-box"*.
+Nodes already report architecture; this is the same idea. Cheap now, annoying
+to retrofit once you have a catalog full of hostnames.
 
 ---
 
-## Part VIII — Direction
+## 7. What JettyOS is made of
 
-What makes sense:
-
-| Decision | Verdict |
+| Component | Job |
 |---|---|
-| Cluster hosts applications; browser is the head | **Yes.** The latency budget works. |
-| Terminal is a full node, not a dumb client | **Yes.** Gives the local fast path and offline degradation for free. |
-| Session in cluster state; shell as stateless projection | **Yes.** Multi-head and crash-survival fall out of it. |
-| Two workload classes — services and instances | **Yes.** The prerequisite for everything else. |
-| Control plane meshed; data plane direct | **Yes.** Decide this first; retrofitting is a rewrite. |
-| Semantic remoting for most apps, pixel streaming for few | **Yes.** One path for both is the classic mistake. |
-| Pin heavy, stateful applications | **Yes.** Solves latency and state migration with one decision. |
-| Capability-based placement, not hostname pinning | **Yes.** Cheap now, expensive later. |
-| A policy table for inter-process calls | **Yes.** This is what makes it an OS. |
+| Shell | window management, launcher, dock. Reads cluster state and draws it. Holds no state of its own — kill it and it redraws identically. |
+| Catalog | app definitions → compose templates. What "install an app" means. |
+| Session manager | tracks what's open, restores it, handles login |
+| Display bridge | per-window transport to the browser, in both modes |
+| Clipboard / notifications | small workloads, no special privilege |
+| Ops dispatcher | runs commands where the data is and returns the result — not a container full of `grep`. Sending a command to the data beats pulling the data to the command. |
 
-What does not:
-
-| Temptation | Verdict |
-|---|---|
-| Distributing a single application across nodes | **No.** Not an OS problem. Programs are not written to survive it. |
-| Pooling RAM into one large virtual machine | **No.** Physically doesn't work; the model lies. |
-| Making every window a gossiped cluster workload | **No.** Wrong lifetime class; the state layer will fight you. |
-| One pixel-streaming path for everything | **No.** Makes a terminal feel like a game stream. |
-| Aiming for verifiable compartmentalization | **No.** The trusted display path is not available. Don't sell a property you can't deliver. |
-| Replacing the laptop | **No.** This is a desk computer. Accept it and the design gets simpler. |
-
-The one-sentence version:
-
-> **The cluster is the computer at the granularity of applications, the browser
-> is the display, the session lives in replicated state, and the shell is a
-> disposable projection of it.**
-
-Every hard decision in this document is a consequence of that sentence and of
-the partition rule in Part II.
+The shell holding no state is what lets you open JettyOS on your laptop, phone,
+and TV at once and see the same desktop, with no sync protocol — they're all
+just reading cluster state.
 
 ---
 
-## Part IX — What to analyze next in the code
+## 8. The thin node
 
-This document deliberately avoided implementation. The audit that should follow
-it needs answers to these, in roughly this order:
+If the machine with the screen is also a Jetty node, two things follow:
 
-1. **Lifetime.** How deeply does "workloads are durable infrastructure" reach
-   into the state layer? Is a second, non-gossiped class a new concept or a
-   flag? This determines whether the whole idea is weeks or quarters.
-2. **Placement.** Where is a node actually chosen, and is spawn-time placement
-   a new code path or a generalization of the failover election?
-3. **Addressing.** What allocates identity to a workload, and how much of the
-   system assumes every workload has a cluster-unique address?
-4. **Attach.** How general is the existing cross-node interactive-session
-   plumbing, and does it carry arbitrary payloads or only terminal traffic?
-5. **Identity.** How far does the single-credential assumption reach, and what
-   would per-user scoping touch?
-6. **Reconciliation.** Does a desired-state-versus-actual-state loop already
-   exist in a reusable form, or is lifecycle imperative throughout?
+- Latency-sensitive apps schedule onto it and run locally — no streaming at all
+- With the network down, it degrades to a normal single-machine computer instead
+  of a dead terminal
 
-Question 1 gates everything. Answer it first.
+So the terminal should be a cluster member, not a dumb client. "Thin" means its
+specs stop being the ceiling, not that it does nothing.
+
+---
+
+## 9. Known limits
+
+- **A process can't be bigger than one node.** Four 16 GB machines aren't a
+  64 GB machine.
+- **Launch is seconds, not instant** — image pull and container start. Fine for
+  apps, useless for anything finer-grained.
+- **No `ls | grep` across the cluster.** The unit is the application; anything
+  smaller runs inside one.
+- **Volumes don't follow failover.** Mitigated by pinning stateful things (§5).
+- **Peripherals attach to the browser** (WebUSB/WebHID/gamepad), so their
+  latency stacks on top of display latency.
+
+---
+
+## 10. Answers
+
+The four questions, resolved against the code.
+
+### Q1 + Q3: the cheap workload class, and the mesh IP
+
+These turned out to be the same question, and the answer inverts the intuition.
+
+`state.Workloads` is `map[string]*Workload` **keyed by mesh IP** — the IP is the
+primary key, not an attribute. Everything downstream follows from that: sync
+dedup (`sync.go`), failover (`claimStillHeld(ip)`), route installation
+(`workloadRoutes[ip]`), `/etc/hosts`, compose `extra_hosts`, and
+`/api/proxy/{meshIP}/`.
+
+So a short-lived window that doesn't need a cluster-unique IP **cannot live in
+that map at all.** Which resolves the flag-vs-concept question:
+
+- **As a flag on `Workload`:** ~11 subsystems iterate `state.Workloads`
+  unconditionally — gossip broadcast, both merge paths, tombstones, failover,
+  `updateHosts`, `updateWorkloadRoutes`, compose overrides, `saveState`,
+  autostart, reconcile, list. Each needs an `if !wl.Ephemeral` guard, and every
+  future feature has to remember it. Brittle in proportion to the codebase's
+  future size.
+- **As a separate map** (`a.ephemeral`, keyed by session/window ID, no mesh IP,
+  never persisted, never gossiped): **zero changes to those 11 subsystems.**
+  They keep iterating `state.Workloads`, which simply doesn't contain them.
+
+**Verdict: a new concept, and that is the cheap option.** The "smaller" change
+is the expensive one. This is a smaller project than §6 implies — it is
+additive rather than invasive, because the existing durable path is left
+completely untouched.
+
+What an ephemeral workload gives up by not having a mesh IP: cross-node DNS,
+`/32` routing, failover, and `/api/proxy` reachability. For a window the browser
+connects to directly on a known node, none of those are needed. If one *is*
+needed later, the escape hatch is promoting it to a real workload.
+
+### Q2: placement
+
+Three paths choose a node today:
+
+| Path | Behaviour |
+|---|---|
+| Create | `wl.Owner = a.hwid` — whichever node received the POST |
+| Create, when that node isn't allowed | `findAllowedNode()` — **first match in map iteration order** |
+| Failover | `shouldClaim()` — ranked election |
+
+So placement exists but is arbitrary, and the fallback is non-deterministic
+(Go map iteration order). Only failover ranks anything.
+
+`shouldClaim`'s ranking **is separable** — it's ~15 lines that build a load
+count and sort. Extracting `rankCandidates()` makes `shouldClaim` become
+`ranked[0] == a.hwid` and gives launch-time placement `ranked[0]` for free.
+**Launch-time placement is a generalization, not a new path**, and it's a
+strict improvement to Jetty on its own — it replaces map-iteration-order with a
+deliberate choice.
+
+### Q2b: capabilities — the constraint that matters
+
+`Peer` carries only `Arch`. Memory, CPU, load, and disk are all sampled
+(`cpuSampleLoop` every 2s, `getSystemStats` on demand) and **never gossiped** —
+they're reachable only by an explicit `/api/health?node=local` call per node.
+There is no capability/label field anywhere.
+
+**Do not put resource metrics in `NodeMeta`.** memberlist caps node metadata at
+512 bytes, and the current payload (ID, Name, IP, Version, Arch, APIPort,
+APIKey) already spends a few hundred of them. Worse, the overflow path today is
+`return d.meta[:limit]` — it truncates JSON mid-string and ships a payload every
+peer fails to parse, with only a log line. Adding fields there is a live
+hazard, not just a tight fit.
+
+So the split is:
+- **`NodeMeta`** — small, slow-changing, high-value: capability labels (`gpu`,
+  `nvme`, `bigmem`). Compact enough to fit, and exactly what "needs a GPU"
+  requires.
+- **A separate channel** — resource metrics, which are large and change
+  constantly. Either periodic `/api/health` polling into an in-memory view, or
+  a dedicated gossip message, not node metadata.
+
+Capability labels are the cheap-now/expensive-later item §6 flagged, and that's
+correct — but they belong in `NodeMeta` and the metrics do not.
+
+### Q4: the streaming path
+
+Three findings, in increasing order of usefulness:
+
+1. **`bridgeWebSockets()` is already generic.** It forwards message type and
+   payload verbatim in both directions, unbuffered. Reusable as-is for any
+   stream; it just lives in `handlers_terminal.go` and should be lifted out.
+2. **The terminal wire protocol is not generic** — `0x00` = data, `0x01` =
+   resize(cols,rows). PTY-specific, as is shell selection and the `docker exec`
+   invocation. A different payload needs its own protocol; the transport
+   underneath is fine.
+3. **`/api/proxy/` cannot upgrade WebSockets.** It's `httpClient.Do()`, with no
+   hijack and no `websocket.Dialer`, so a browser upgrade request through it
+   fails. This is the single concrete blocker for "browser opens a stream to a
+   container", and it's a contained fix.
+
+And the useful surprise: **`JETTY_TUNNEL_HOST` — a per-node subdomain — is
+already read from the environment and stored, and then never used anywhere.**
+That is precisely the primitive §4 needs for "the browser connects to THAT NODE
+directly", sitting half-built. Wiring it up is much cheaper than designing
+per-node addressing from scratch.
+
+### What this means for sequencing
+
+Build order implied by the above:
+
+1. Per-node addressing (`JETTY_TUNNEL_HOST` + entry-node role) — §4's direct
+   streaming has no other foundation
+2. WebSocket upgrade in `/api/proxy/` — unblocks any browser↔container stream
+3. `rankCandidates()` extraction + launch-time placement
+4. Capability labels in `NodeMeta`; metrics on a separate channel
+5. The ephemeral map — gated on 1–3, but genuinely additive once they exist
+
+The Jetty-side prerequisites are tracked in ROADMAP.md under "JettyOS
+enablers".
