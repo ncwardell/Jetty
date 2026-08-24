@@ -81,16 +81,24 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       plus `?node=<id|name>` targeting. `CFTunnelDisabled` is node-local and
       never broadcast; the guard lives in `startCloudflared` so the monitor
       loop and token syncs can't resurrect a disabled connector.
-- [ ] **Ownership consensus.** `wl.Owner = a.hwid` (`failover.go`) is a
-      unilateral write to a contended field settled by highest-version-wins.
-      Two nodes can both claim a workload and both start the container. This is
-      a correctness bug at three nodes, not a scale bug.
+- [x] **Concurrent-claim safety.** `shouldClaim` runs a deterministic election
+      (least-loaded, HWID tiebreak) that is safe from *identical* state, but it
+      ranks by counts read from local state, so nodes whose maps have not
+      converged can both claim. The claim is now announced before deploying,
+      settles for 2s, and is re-checked — the loser never starts a container.
+- [ ] **Ownership consensus (proper).** The above shrinks the window; it does
+      not close it. Ownership is still last-write-wins, so a partition longer
+      than the settle can still produce two live containers. The real fix is
+      a small Raft group over placement decisions only (see the guiding
+      principle on observations vs. decisions). Gated behind wanting a
+      dependency; the settle buys time.
 - [x] **Panic recovery.** `goSafe` (drop the unit of work) and `goSupervised`
       (restart with backoff, bounded) applied to every goroutine spawn, plus
       inline barriers on all eight memberlist delegate callbacks.
-- [ ] **Multi-node convergence test.** `sync_test.go` is good but tests single
-      merges. Nothing partitions three agents and asserts they heal to identical
-      state with a single owner per workload.
+- [x] **Multi-node convergence test.** `convergence_test.go` runs 4-node
+      clusters through 50 randomized operation/gossip interleavings plus a
+      directional tombstone test. Verified by mutation: switching the merge to
+      first-write-wins fails 37 of 50 seeds.
 - [ ] Collapse the three overlapping sync paths (memberlist broadcast + 30s
       full sync + 10s HTTP pull) to one. Three paths that can disagree is not
       redundancy.
