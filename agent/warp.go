@@ -150,7 +150,7 @@ func (a *Agent) ipMonitorLoop() {
 			// pointing at a stale path, so re-ensure on both IP change and
 			// same-IP reconnect.
 			a.stateMu.Lock()
-			a.updateWorkloadRoutes()
+			a.triggerRouteReconcile()
 			a.stateMu.Unlock()
 		}
 	}

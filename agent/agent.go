@@ -45,6 +45,7 @@ func New() (*Agent, error) {
 		composeDir:         filepath.Join(dataDir, "compose"),
 		hostsFile:          "/etc/hosts",
 		workloadRoutes:     make(map[string]string),
+		routeReconcileCh:   make(chan struct{}, 1),
 		ipipWarnedPeers:    make(map[string]bool),
 		failoverInProgress: make(map[string]time.Time),
 		peerUnhealthySince: make(map[string]time.Time),
@@ -283,6 +284,10 @@ func (a *Agent) Start() error {
 	// first try - cold-boot ordering, transient docker errors, image
 	// pull races. Idempotent against healthy workloads.
 	goSupervised("reconcileWorkloadsLoop", a.reconcileWorkloadsLoop)
+
+	// Route programming runs here and nowhere else. Callers only signal, so
+	// no fork/exec ever happens under stateMu - see routereconcile.go.
+	goSupervised("routeReconcileLoop", a.routeReconcileLoop)
 
 	// Update hosts file
 	a.updateHosts()

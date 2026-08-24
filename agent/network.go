@@ -339,25 +339,23 @@ func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
 	tunName := "tun_" + shortID(peerID, 8)
 
 	// Check if tunnel already exists with correct config
-	out, _ := exec.Command("ip", "tunnel", "show", tunName).CombinedOutput()
+	out, _ := runBoundedOutput(routeCommandTimeout, "ip", "tunnel", "show", tunName)
 	if strings.Contains(string(out), peerIP) {
 		return nil // Tunnel exists with correct remote
 	}
 
 	// Delete existing tunnel if it has wrong config
-	exec.Command("ip", "tunnel", "del", tunName).Run()
+	routeCommandRunner(routeCommandTimeout, "ip", "tunnel", "del", tunName)
 
 	// Create tunnel using detected mode (ipip or gre): local=our WARP IP, remote=peer's WARP IP
-	cmd := exec.Command("ip", "tunnel", "add", tunName, "mode", a.tunnelMode,
-		"local", a.ip, "remote", peerIP)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := runBoundedOutput(routeCommandTimeout, "ip", "tunnel", "add", tunName,
+		"mode", a.tunnelMode, "local", a.ip, "remote", peerIP); err != nil {
 		return fmt.Errorf("create %s tunnel to %s: %s", a.tunnelMode, peerIP, strings.TrimSpace(string(out)))
 	}
 
 	// Bring up the tunnel interface
-	cmd = exec.Command("ip", "link", "set", "up", "dev", tunName)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		exec.Command("ip", "tunnel", "del", tunName).Run()
+	if out, err := runBoundedOutput(routeCommandTimeout, "ip", "link", "set", "up", "dev", tunName); err != nil {
+		routeCommandRunner(routeCommandTimeout, "ip", "tunnel", "del", tunName)
 		return fmt.Errorf("bring up tunnel %s: %s", tunName, strings.TrimSpace(string(out)))
 	}
 
@@ -368,7 +366,7 @@ func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
 // removePeerTunnel removes the IPIP tunnel to a peer.
 func (a *Agent) removePeerTunnel(peerID string) {
 	tunName := "tun_" + shortID(peerID, 8)
-	if err := exec.Command("ip", "tunnel", "del", tunName).Run(); err == nil {
+	if err := routeCommandRunner(routeCommandTimeout, "ip", "tunnel", "del", tunName); err == nil {
 		logInfof("Removed tunnel %s", tunName)
 	}
 }

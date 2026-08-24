@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 )
 
@@ -141,7 +140,7 @@ func (a *Agent) updateHosts() {
 	if hash == a.hostsBlockHash {
 		// Still need to reconcile remote-workload routes; that doesn't write
 		// to /etc/hosts but it does need to run after state changes.
-		a.updateWorkloadRoutes()
+		a.triggerRouteReconcile()
 		return
 	}
 
@@ -155,7 +154,7 @@ func (a *Agent) updateHosts() {
 	}
 
 	// Update routes for remote workloads
-	a.updateWorkloadRoutes()
+	a.triggerRouteReconcile()
 }
 
 // updateWorkloadRoutes reconciles the host's routing table with the desired
@@ -183,129 +182,3 @@ func (a *Agent) updateHosts() {
 //     branch is effectively a dead path; left in place as a "if you've
 //     configured WARP yourself" escape hatch.
 //
-// Caller must hold a.stateMu (read or write). Internally takes
-// a.workloadRoutesMu for the route-table mutation.
-func (a *Agent) updateWorkloadRoutes() {
-	// Skip if WARP is not connected
-	if a.ip == "" {
-		return
-	}
-
-	// IPIP/GRE: maintain tunnels to all known peers.
-	// Userspace: keep peer-IP cache up-to-date so the TUN reader knows where
-	// to ship packets.
-	// Ensure/refresh the transport to EVERY known peer, healthy or not - only
-	// gate on having a known WARP IP. In tunnel mode the peer health check
-	// runs *through* this tunnel, so gating tunnel setup on health creates a
-	// deadlock: a peer whose path broke (e.g. it moved networks and its
-	// underlay changed) can never recover, because the tunnel that health
-	// depends on is only rebuilt for already-healthy peers. Keeping the
-	// tunnel/peer-addr current for unhealthy peers lets the health check - and
-	// therefore routing - heal on its own. (Route *installation* below still
-	// only targets healthy peers, so we never point a route at a dead node.)
-	if a.tunnelMode != "" {
-		for _, peer := range a.state.Peers {
-			if peer.IP != "" {
-				if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
-					logWarnf("failed to ensure tunnel to %s: %v", peer.Name, err)
-				}
-			}
-		}
-	} else if a.tunDevice != nil {
-		for _, peer := range a.state.Peers {
-			if peer.IP != "" {
-				a.updateTunPeerAddr(peer.ID, peer.IP)
-			}
-		}
-	}
-
-	// Build map of desired routes: workload IP -> owner peer.
-	type routeInfo struct {
-		ownerID string
-		ownerIP string
-	}
-	desiredRoutes := make(map[string]routeInfo) // wlIP -> routeInfo
-	for _, wl := range a.state.Workloads {
-		if wl.Owner == a.hwid {
-			// Local workload - no route needed (handled by local iptables DNAT).
-			continue
-		}
-		// Only route through healthy peers with known IPs.
-		if peer, ok := a.state.Peers[wl.Owner]; ok && peer.IP != "" && peer.Healthy {
-			desiredRoutes[wl.IP] = routeInfo{ownerID: peer.ID, ownerIP: peer.IP}
-		}
-	}
-
-	a.workloadRoutesMu.Lock()
-	defer a.workloadRoutesMu.Unlock()
-
-	// Remove stale routes - either no longer needed or owner changed.
-	for wlIP, ownerID := range a.workloadRoutes {
-		if desired, ok := desiredRoutes[wlIP]; !ok || desired.ownerID != ownerID {
-			exec.Command("ip", "route", "del", wlIP+"/32").Run()
-			delete(a.workloadRoutes, wlIP)
-			logInfof("Removed route for %s (was via %s)", wlIP, shortID(ownerID, 8))
-		}
-	}
-
-	// Add or refresh routes. Uses `ip route replace` (not `add`) so the
-	// kernel state converges to what we want regardless of whether a
-	// matching route is already installed. This makes the reconciler
-	// self-healing: if a route was wiped out-of-band (TUN flap, manual
-	// `ip route del`, container restart that recreated the link without
-	// the agent restarting), the next reconcile re-installs it instead
-	// of trusting a.workloadRoutes as authoritative.
-	//
-	// Without this, an entry surviving in a.workloadRoutes whose kernel
-	// counterpart had been removed would never be re-added: the function
-	// would short-circuit on the in-memory match and skip the kernel
-	// write entirely. We observed this exact failure mode on a peer that
-	// had been up for days with no IPv4 mesh routes in `ip route show`
-	// despite a.workloadRoutes being populated.
-	for wlIP, info := range desiredRoutes {
-		var err error
-		var routeDesc string
-
-		if a.tunnelMode != "" {
-			tunName := a.getTunnelName(info.ownerID)
-			err = exec.Command("ip", "route", "replace", wlIP+"/32", "dev", tunName).Run()
-			routeDesc = "tunnel " + tunName
-		} else if a.tunDevice != nil {
-			// `src <warpIP>` pins the source address the kernel picks for
-			// packets via this route. Without it, jetty_tun has no IPv4
-			// address so the kernel falls back to the default route's
-			// source (eth0's public IP). Packets still leave correctly,
-			// but the *response* from the peer's workload container is
-			// addressed to a non-mesh IP - the peer's kernel routes that
-			// reply via its public default route instead of back through
-			// the tunnel, and the connection silently fails. Pinning src
-			// to our mesh IP keeps the whole round-trip on the mesh.
-			args := []string{"route", "replace", wlIP + "/32", "dev", "jetty_tun"}
-			if a.ip != "" {
-				args = append(args, "src", a.ip)
-			}
-			err = exec.Command("ip", args...).Run()
-			routeDesc = "userspace tunnel to " + info.ownerIP
-		} else {
-			// No transport available. Don't install a route - it would silently
-			// black-hole traffic. The previous "direct WARP via <peerIP>"
-			// fallback didn't actually work without Cloudflare-side routing
-			// configuration we don't perform, so removing it is a downgrade
-			// from "looks like it works but doesn't" to "obviously doesn't".
-			logWarnf("no transport for remote workload %s on owner %s - install ipip kernel module or check userspace tunnel init",
-				wlIP, shortID(info.ownerID, 8))
-			continue
-		}
-
-		if err == nil {
-			// Only log on owner change or first install. Steady-state
-			// replaces are silent to avoid log spam every reconcile.
-			if existingOwner, ok := a.workloadRoutes[wlIP]; !ok || existingOwner != info.ownerID {
-				logInfof("Added route for %s via %s", wlIP, routeDesc)
-			}
-			a.workloadRoutes[wlIP] = info.ownerID
-		} else {
-			logWarnf("failed to replace route for %s via %s: %v", wlIP, routeDesc, err)
-		}
-	}
-}

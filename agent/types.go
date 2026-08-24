@@ -396,6 +396,10 @@ type Agent struct {
 	// Route management
 	workloadRoutes   map[string]string // workload IP -> owner WARP IP (for remote workloads)
 	workloadRoutesMu sync.Mutex
+	// routeReconcileCh is a capacity-1 level trigger for route reconciliation.
+	// Capacity 1 so triggerRouteReconcile never blocks - it is called with
+	// stateMu held.
+	routeReconcileCh chan struct{}
 
 	// Container autoheal: last time we restarted each running-but-unhealthy
 	// container, so a container that keeps coming up unhealthy isn't

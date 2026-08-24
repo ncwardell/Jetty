@@ -105,6 +105,64 @@ mount hangs and 10–15s stalls on ~21% of public requests.
 
 ### 1b. Correctness
 
+- [x] **`stateMu` deadlock: fork/exec under the lock froze the whole control
+      plane.** Almost certainly the cause of the "everything is up but nothing
+      answers" incidents.
+
+      `updateWorkloadRoutes` was documented *"caller must hold a.stateMu"* and
+      shelled out — 3 `ip` calls plus 5 more per peer inside
+      `ensurePeerTunnel`, so 3+5N unbounded fork/execs — from six call sites,
+      five holding the **write** lock. `apiKeyMiddleware` takes
+      `stateMu.RLock()` on **every** API request, and Go's RWMutex excludes
+      new readers as soon as a writer is queued. One slow `ip` child therefore
+      stopped every endpoint at once, including `/api/health` — so a wedged
+      node could not report being wedged. The listener stays open because the
+      kernel owns it, which is why it looks exactly like a broken tunnel from
+      outside. There were **zero** `exec.CommandContext` calls in the package
+      (107 `exec.Command`).
+
+      The invariant: *never hold a lock across an operation of unbounded
+      duration — I/O, network, or process execution.*
+
+      Fixed by splitting reconciliation in three:
+      1. Call sites now call `triggerRouteReconcile()`, a non-blocking
+         capacity-1 send that is safe to make while holding `stateMu`.
+      2. A single reconciler goroutine snapshots state under a brief read
+         lock, releases it, and only then execs. Nothing that forks runs under
+         `stateMu`.
+      3. Reconciles **coalesce** rather than queue. Route reconciliation is
+         idempotent and level-triggered, so a burst should produce one
+         reconcile against final state — not N against N stale snapshots,
+         which is what a plain `routesMu` would have given.
+
+      All execs on this path are now bounded (`runBoundedCommand` /
+      `runBoundedOutput`, 10s). Regression test injects a *deliberately slow*
+      command and asserts an API-path read lock is still served — a fast-
+      failing command cannot demonstrate the property, and an earlier version
+      of the test passed against the reintroduced bug for exactly that reason.
+
+- [ ] **`a.ip` is written without holding `stateMu`** (`warp.go:45,64,139`)
+      while being read under it elsewhere — a genuine data race, pre-existing
+      and unrelated to the deadlock above. `ensurePeerTunnel` reads it from
+      five call sites. The clean fix is to pass the local WARP IP and tunnel
+      mode in as parameters rather than re-reading agent fields, which also
+      makes the dependency explicit. Deliberately not bundled into the
+      deadlock fix.
+
+- [ ] **Watchdog for a wedged control plane.** The reason the outage cost
+      hours is that `/api/health` sits behind the same middleware, so a
+      deadlocked node reports nothing at all rather than reporting that it is
+      deadlocked. A goroutine that periodically attempts `TryRLock` with a
+      deadline and logs loudly (or exits, letting Docker restart it) turns an
+      invisible hang into a visible one. Worth having independent of any
+      specific deadlock.
+
+- [ ] **Audit the remaining ~100 unbounded `exec.Command` sites.** The route
+      path is bounded now, but `deploy.go`, `handlers_nodes.go` and others
+      still fork with no deadline. Lower severity now that the worst of them
+      are off the lock, but a hung `docker` child still stalls whatever loop
+      it is on.
+
 - [x] **Node removal now sticks, and no longer double-runs workloads.**
       (Caused a production outage.) `DELETE /api/nodes/{id}` removes a peer from *everyone else's*
       view and never tells the node itself. The removed node keeps running,

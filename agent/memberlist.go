@@ -1044,7 +1044,7 @@ func (a *Agent) memberlistPeriodicSync() {
 
 	// Update routes for remote workloads (uses existing function from agent.go)
 	a.stateMu.Lock()
-	a.updateWorkloadRoutes()
+	a.triggerRouteReconcile()
 	a.stateMu.Unlock()
 	a.updateHosts()
 }
