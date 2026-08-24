@@ -21,7 +21,16 @@ import (
 var dashboardHTML []byte
 
 // Version is the current Jetty agent version (set at build time via -ldflags or defaults to "dev")
-var Version = "2.0.0"
+// Version is stamped at build time by the Dockerfile's
+// -ldflags "-X github.com/ncwardell/jetty/agent.Version=...".
+//
+// The default is "dev" on purpose. It used to be a version number, which
+// meant any binary built without the ldflag - a local `go build`, or a
+// release pipeline whose stamping silently broke - confidently reported
+// itself as a release it was not. A node claiming the wrong version is worse
+// than one admitting it does not know, because it is the field an operator
+// uses to decide whether a fix is deployed.
+var Version = "dev"
 
 func New() (*Agent, error) {
 	dataDir := getEnv("JETTY_DATA_DIR", "/data")

@@ -12,7 +12,7 @@ import (
 )
 
 // @title Jetty API
-// @version 2.0
+// @version 0.0.x
 // @description P2P Docker Compose orchestration with Cloudflare WARP mesh networking
 // @termsOfService http://swagger.io/terms/
 
