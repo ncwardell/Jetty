@@ -265,6 +265,25 @@ type tcpProxyConn struct {
 	mu        sync.Mutex      // Protects sequence numbers and conn
 	ready     chan struct{}   // Closed when connection is established (nil = already ready)
 	failed    bool            // True if connection establishment failed
+
+	// Flow control. The proxy used to advertise a fixed 0xFFFF window,
+	// ignore the peer's advertised window entirely, and stream everything
+	// the origin produced as fast as it could read it. Since the WS
+	// transport carries no retransmission, any segment the receiver
+	// dropped for lack of buffer was gone for good - the flow then
+	// deadlocked waiting on a hole that never filled. That is the stall
+	// behind both the CIFS bulk-transfer hangs and the 10-15s
+	// cross-node HTTP stalls.
+	//
+	// We don't need full TCP: the WS transport is reliable and ordered,
+	// so we only have to stop overrunning the receiver. sendUnacked
+	// tracks bytes in flight (localSeq - lastAck) and peerWindow is the
+	// window most recently advertised by the peer; the read loop waits
+	// on windowCh whenever in-flight would exceed it.
+	lastAck    uint32        // highest ACK seen from the peer
+	peerWindow uint32        // peer's advertised receive window (scaled)
+	windowCh   chan struct{} // signalled when the window opens
+	closed     bool          // set once the flow is torn down
 }
 
 // =============================================================================

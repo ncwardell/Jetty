@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"strconv"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -490,6 +491,8 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 	seqNum := uint32(tcpHeader[4])<<24 | uint32(tcpHeader[5])<<16 | uint32(tcpHeader[6])<<8 | uint32(tcpHeader[7])
 	tcpFlags := tcpHeader[13]
 	dataOffset := int(tcpHeader[12]>>4) * 4
+	ackNum := uint32(tcpHeader[8])<<24 | uint32(tcpHeader[9])<<16 | uint32(tcpHeader[10])<<8 | uint32(tcpHeader[11])
+	winSize := uint32(tcpHeader[14])<<8 | uint32(tcpHeader[15])
 
 	isSYN := tcpFlags&0x02 != 0
 	isACK := tcpFlags&0x10 != 0
@@ -520,7 +523,7 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 		a.tunTCPConns.Store(flowKey, proxyConn)
 
 		// Look up workload to translate virtual IP to container IP
-		targetAddr := fmt.Sprintf("%s:%d", dstIP, dstPort)
+		targetAddr := net.JoinHostPort(dstIP.String(), strconv.Itoa(int(dstPort)))
 
 		a.stateMu.RLock()
 		wl, exists := a.state.Workloads[dstIP.String()]
@@ -541,7 +544,7 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 				if containerPort != 0 {
 					dialPort = containerPort
 				}
-				targetAddr = fmt.Sprintf("%s:%d", containerIP, dialPort)
+				targetAddr = net.JoinHostPort(containerIP, strconv.Itoa(int(dialPort)))
 				log.Printf("WS tunnel proxy: translated %s:%d -> %s:%d", dstIP, dstPort, containerIP, dialPort)
 			}
 		}
@@ -574,6 +577,11 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 		proxyConn.mu.Unlock()
 		close(proxyConn.ready)
 
+		// Seed flow control from the client's SYN before any data can be
+		// queued: localSeq is about to advance past the SYN, and that is
+		// the base the in-flight calculation is relative to.
+		proxyConn.initFlow(winSize, proxyConn.localSeq+1)
+
 		// Send SYN-ACK with MSS option to limit segment sizes and prevent fragmentation.
 		// MSS = MTU(1280) - IP header(20) - TCP header(20) = 1240
 		a.sendTCPSynAck(tc, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 1240)
@@ -596,6 +604,15 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 		return
 	}
 	proxyConn := connVal.(*tcpProxyConn)
+
+	// Every segment from the peer carries its current window and (when
+	// ACK is set) how much of our stream it has retired. Feed both into
+	// flow control before doing anything else - this is what unblocks a
+	// sender parked in awaitWindow, including pure window updates that
+	// carry no payload.
+	if isACK {
+		proxyConn.noteAck(ackNum, winSize)
+	}
 
 	// Wait for connection to be established if it's still pending
 	if proxyConn.ready != nil {
@@ -623,6 +640,7 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 		// Send FIN-ACK and close
 		a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x11, nil) // FIN+ACK
 		proxyConn.conn.Close()
+		proxyConn.closeFlow()
 		a.tunTCPConns.Delete(flowKey)
 		return
 	}
@@ -630,6 +648,7 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 	// Handle RST
 	if isRST {
 		proxyConn.conn.Close()
+		proxyConn.closeFlow()
 		a.tunTCPConns.Delete(flowKey)
 		return
 	}
@@ -646,12 +665,105 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 			if _, err := proxyConn.conn.Write(payload); err != nil {
 				log.Printf("WS tunnel proxy: TCP write failed: %v", err)
 				proxyConn.conn.Close()
+				proxyConn.closeFlow()
 				a.tunTCPConns.Delete(flowKey)
 				return
 			}
 
 			// Send ACK
 			a.sendTCPResponse(tc, dstIP, srcIP, dstPort, srcPort, proxyConn.localSeq, proxyConn.remoteSeq, 0x10, nil) // ACK
+		}
+	}
+}
+
+const (
+	// defaultPeerWindow is the send window assumed when the client's SYN
+	// advertises a zero window. 64KB is the classic unscaled maximum, and
+	// matches the window we advertise back in sendTCPResponse.
+	defaultPeerWindow = 65535
+
+	// windowProbeInterval is how often awaitWindow re-checks a closed window.
+	// This is our equivalent of TCP's zero-window probe: without it, a lost
+	// window update would wedge the flow permanently.
+	windowProbeInterval = 250 * time.Millisecond
+)
+
+// initFlow seeds the flow-control state from the client's SYN. The window in
+// the SYN is unscaled (window scaling is negotiated by an option we neither
+// send nor honour), so treat it literally.
+func (c *tcpProxyConn) initFlow(window uint32, ackBase uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastAck = ackBase
+	c.peerWindow = window
+	if c.peerWindow == 0 {
+		c.peerWindow = defaultPeerWindow
+	}
+	c.windowCh = make(chan struct{}, 1)
+}
+
+// noteAck records an ACK from the peer: it retires in-flight bytes and
+// re-opens the send window. Sequence numbers wrap, so compare with the
+// serial-arithmetic rule (int32 of the difference) rather than <.
+func (c *tcpProxyConn) noteAck(ack uint32, window uint32) {
+	c.mu.Lock()
+	if int32(ack-c.lastAck) > 0 {
+		c.lastAck = ack
+	}
+	c.peerWindow = window
+	ch := c.windowCh
+	c.mu.Unlock()
+
+	// Wake a blocked sender. Non-blocking: the channel is a 1-slot
+	// edge signal, not a queue.
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// awaitWindow blocks until the peer's window can accept n more bytes, or the
+// flow is closed. Returns false if the caller should stop sending.
+//
+// A zero window is legal TCP ("stop, I'm full") and is lifted by a later
+// window update; we re-check on every wake and also poll on a timer so a lost
+// window-update can't wedge the flow permanently.
+func (c *tcpProxyConn) awaitWindow(n uint32) bool {
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return false
+		}
+		inFlight := c.localSeq - c.lastAck
+		window := c.peerWindow
+		ch := c.windowCh
+		c.mu.Unlock()
+
+		// Room for this segment? (inFlight+n within the advertised window)
+		if ch == nil || inFlight+n <= window {
+			return true
+		}
+
+		select {
+		case <-ch:
+		case <-time.After(windowProbeInterval):
+		}
+	}
+}
+
+// closeFlow releases anything blocked in awaitWindow.
+func (c *tcpProxyConn) closeFlow() {
+	c.mu.Lock()
+	c.closed = true
+	ch := c.windowCh
+	c.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
 		}
 	}
 }
@@ -675,6 +787,7 @@ func (a *Agent) tcpProxyReadLoop(flowKey string, proxyConn *tcpProxyConn) {
 			// Send FIN
 			a.sendTCPResponse(proxyConn.wsConn, proxyConn.dstIP, proxyConn.srcIP,
 				proxyConn.dstPort, proxyConn.srcPort, seq, ack, 0x11, nil) // FIN+ACK
+			proxyConn.closeFlow()
 			a.tunTCPConns.Delete(flowKey)
 			return
 		}
@@ -686,6 +799,14 @@ func (a *Agent) tcpProxyReadLoop(flowKey string, proxyConn *tcpProxyConn) {
 				segmentSize := len(data)
 				if segmentSize > maxSegmentSize {
 					segmentSize = maxSegmentSize
+				}
+
+				// Block until the peer's advertised window has room for
+				// this segment. Without this the receiver silently drops
+				// what it can't buffer and - with no retransmission on
+				// this transport - the flow deadlocks forever.
+				if !proxyConn.awaitWindow(uint32(segmentSize)) {
+					return // flow torn down while waiting
 				}
 
 				proxyConn.mu.Lock()
@@ -855,7 +976,7 @@ func (a *Agent) proxyUDP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 	log.Printf("WS tunnel proxy UDP: %s:%d -> %s:%d (%d bytes)", srcIP, srcPort, dstIP, dstPort, len(payload))
 
 	// Send UDP and get response
-	addr := fmt.Sprintf("%s:%d", dstIP, dstPort)
+	addr := net.JoinHostPort(dstIP.String(), strconv.Itoa(int(dstPort)))
 	udpConn, err := net.DialTimeout("udp", addr, 5*time.Second)
 	if err != nil {
 		log.Printf("WS tunnel proxy: UDP dial failed: %v", err)
