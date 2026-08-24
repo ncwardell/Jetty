@@ -197,13 +197,13 @@ type State struct {
 // least-HWID healthy node actually writes the file - same election
 // rule failover uses, so we don't get N copies on every node.
 type BackupSchedule struct {
-	IntervalMinutes int       `json:"interval_minutes"`        // 0 = disabled
-	Retention       int       `json:"retention,omitempty"`     // keep this many on-disk backups (0 = unlimited)
-	Passphrase      string    `json:"passphrase,omitempty"`    // optional - if set, every scheduled backup is JETTY-ENC-V1 wrapped
-	LastRunAt       time.Time `json:"last_run_at,omitempty"`   // updated on every successful run
-	LastStatus      string    `json:"last_status,omitempty"`   // "ok" or "error: ..."
+	IntervalMinutes int       `json:"interval_minutes"`      // 0 = disabled
+	Retention       int       `json:"retention,omitempty"`   // keep this many on-disk backups (0 = unlimited)
+	Passphrase      string    `json:"passphrase,omitempty"`  // optional - if set, every scheduled backup is JETTY-ENC-V1 wrapped
+	LastRunAt       time.Time `json:"last_run_at,omitempty"` // updated on every successful run
+	LastStatus      string    `json:"last_status,omitempty"` // "ok" or "error: ..."
 	LastBackupPath  string    `json:"last_backup_path,omitempty"`
-	UpdatedAt       time.Time `json:"updated_at,omitempty"`    // when the schedule itself was last changed
+	UpdatedAt       time.Time `json:"updated_at,omitempty"` // when the schedule itself was last changed
 }
 
 // JoinToken is a single-use bearer credential that authorizes a new
@@ -213,13 +213,13 @@ type BackupSchedule struct {
 // attacker every unburned token. Burning sets Used=true and is
 // idempotent - replays after the first successful join are rejected.
 type JoinToken struct {
-	ID        string    `json:"id"`                    // Random hex; the token value itself
-	CreatedAt time.Time `json:"created_at"`            // When minted
-	ExpiresAt time.Time `json:"expires_at"`            // After this, refused even if unused
-	Note      string    `json:"note,omitempty"`        // Free-form ("for arnold's laptop")
-	Used      bool      `json:"used"`                  // True after a successful join consumed it
-	UsedBy    string    `json:"used_by,omitempty"`     // Joining peer's ID (audit)
-	UsedAt    time.Time `json:"used_at,omitempty"`     // When consumed
+	ID        string    `json:"id"`                // Random hex; the token value itself
+	CreatedAt time.Time `json:"created_at"`        // When minted
+	ExpiresAt time.Time `json:"expires_at"`        // After this, refused even if unused
+	Note      string    `json:"note,omitempty"`    // Free-form ("for arnold's laptop")
+	Used      bool      `json:"used"`              // True after a successful join consumed it
+	UsedBy    string    `json:"used_by,omitempty"` // Joining peer's ID (audit)
+	UsedAt    time.Time `json:"used_at,omitempty"` // When consumed
 }
 
 // NewState creates an empty state with initialized maps
@@ -254,17 +254,17 @@ func (tc *tunnelConn) WriteMessage(messageType int, data []byte) error {
 
 // tcpProxyConn represents an active TCP proxy connection through the tunnel.
 type tcpProxyConn struct {
-	conn      net.Conn    // TCP connection to the workload (nil while pending)
-	wsConn    *tunnelConn // WebSocket connection back to the tunnel peer (with write mutex)
-	srcIP     net.IP          // Original source IP
-	srcPort   uint16          // Original source port
-	dstIP     net.IP          // Destination IP (workload)
-	dstPort   uint16          // Destination port
-	localSeq  uint32          // Our sequence number for responses
-	remoteSeq uint32          // Remote sequence number (from client)
-	mu        sync.Mutex      // Protects sequence numbers and conn
-	ready     chan struct{}   // Closed when connection is established (nil = already ready)
-	failed    bool            // True if connection establishment failed
+	conn      net.Conn      // TCP connection to the workload (nil while pending)
+	wsConn    *tunnelConn   // WebSocket connection back to the tunnel peer (with write mutex)
+	srcIP     net.IP        // Original source IP
+	srcPort   uint16        // Original source port
+	dstIP     net.IP        // Destination IP (workload)
+	dstPort   uint16        // Destination port
+	localSeq  uint32        // Our sequence number for responses
+	remoteSeq uint32        // Remote sequence number (from client)
+	mu        sync.Mutex    // Protects sequence numbers and conn
+	ready     chan struct{} // Closed when connection is established (nil = already ready)
+	failed    bool          // True if connection establishment failed
 
 	// Flow control. The proxy used to advertise a fixed 0xFFFF window,
 	// ignore the peer's advertised window entirely, and stream everything

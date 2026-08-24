@@ -65,6 +65,7 @@ func (a *Agent) apiListNodes(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(nodes)
 }
+
 // apiRemoveNode godoc
 // @Summary Remove a node from the cluster
 // @Description Removes a peer node from the cluster. Workloads owned by that node will be orphaned and eligible for failover if revive is enabled.
@@ -138,6 +139,7 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 		"message":            "node removed; orphaned workloads will failover if revive is enabled",
 	})
 }
+
 // apiUpdateNode godoc
 // @Summary Update a node (self-update)
 // @Description Triggers a self-update of the node by pulling a new Docker image and restarting. Only works on the target node itself - requests to other nodes will be proxied.
@@ -500,6 +502,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		os.Exit(0)
 	}()
 }
+
 // getSelfContainerID returns this container's ID
 func (a *Agent) getSelfContainerID() (string, error) {
 	// Method 1: Check hostname (often the container ID)

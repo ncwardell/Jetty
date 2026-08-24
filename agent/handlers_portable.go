@@ -46,10 +46,10 @@ import (
 
 // portableExport is the on-the-wire JSON for export/import.
 type portableExport struct {
-	Version            string             `json:"version"`              // "1"
-	ExportedAt         time.Time          `json:"exported_at"`
-	Workloads          []portableWorkload `json:"workloads"`
-	ReferencedEnvKeys  []string           `json:"referenced_env_keys,omitempty"` // env keys used in the compose strings (names only, never values)
+	Version           string             `json:"version"` // "1"
+	ExportedAt        time.Time          `json:"exported_at"`
+	Workloads         []portableWorkload `json:"workloads"`
+	ReferencedEnvKeys []string           `json:"referenced_env_keys,omitempty"` // env keys used in the compose strings (names only, never values)
 }
 
 // portableWorkload mirrors Workload but drops Owner and Version - the
@@ -150,18 +150,18 @@ func (a *Agent) apiExportWorkloads(w http.ResponseWriter, r *http.Request) {
 
 // importRequest is the body of POST /api/workloads/import.
 type importRequest struct {
-	Mode         string         `json:"mode,omitempty"`          // skip | replace | fail (default: skip)
-	ReassignIPs  *bool          `json:"reassign_ips,omitempty"`  // default: true
-	Payload      portableExport `json:"payload"`
+	Mode        string         `json:"mode,omitempty"`         // skip | replace | fail (default: skip)
+	ReassignIPs *bool          `json:"reassign_ips,omitempty"` // default: true
+	Payload     portableExport `json:"payload"`
 }
 
 // importEntry is one line of the import report.
 type importEntry struct {
-	Name        string `json:"name"`
-	Status      string `json:"status"` // imported | replaced | reassigned | skipped | error
-	Detail      string `json:"detail,omitempty"`
-	OriginalIP  string `json:"original_ip,omitempty"`
-	AssignedIP  string `json:"assigned_ip,omitempty"`
+	Name       string `json:"name"`
+	Status     string `json:"status"` // imported | replaced | reassigned | skipped | error
+	Detail     string `json:"detail,omitempty"`
+	OriginalIP string `json:"original_ip,omitempty"`
+	AssignedIP string `json:"assigned_ip,omitempty"`
 }
 
 type importReport struct {

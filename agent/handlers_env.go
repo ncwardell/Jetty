@@ -47,6 +47,7 @@ func (a *Agent) apiListEnv(w http.ResponseWriter, r *http.Request) {
 		"count": len(keys),
 	})
 }
+
 // apiSetEnv godoc
 // @Summary Set environment variables
 // @Description Stores encrypted environment variables (existing keys are overwritten)
@@ -147,6 +148,7 @@ func (a *Agent) apiSetEnv(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Env set: added=%v, updated=%v", added, updated)
 }
+
 // apiGetEnv godoc
 // @Summary Get environment variable
 // @Description Returns the decrypted value of a specific environment variable
@@ -181,6 +183,7 @@ func (a *Agent) apiGetEnv(w http.ResponseWriter, r *http.Request) {
 		"value": value,
 	})
 }
+
 // apiDeleteEnv godoc
 // @Summary Delete environment variable
 // @Description Removes an environment variable from storage

@@ -248,7 +248,6 @@ func (a *Agent) detectTunnelMode() string {
 	return ""
 }
 
-
 // initWarpRules sets up nftables rules for WARP traffic routing.
 // This includes:
 // 1. Masquerade rule for response routing through CloudflareWARP
