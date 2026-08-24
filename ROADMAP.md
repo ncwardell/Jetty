@@ -100,8 +100,8 @@ mount hangs and 10–15s stalls on ~21% of public requests.
 
 ### 1b. Correctness
 
-- [ ] **🔴 Node removal is broken and cannot stick. Caused a production
-      outage.** `DELETE /api/nodes/{id}` removes a peer from *everyone else's*
+- [x] **Node removal now sticks, and no longer double-runs workloads.**
+      (Caused a production outage.) `DELETE /api/nodes/{id}` removes a peer from *everyone else's*
       view and never tells the node itself. The removed node keeps running,
       stays on WARP, and stays an active memberlist member — so
       `NotifyJoin` (`memberlist.go:34`) and `apiPeerAnnounce`
@@ -120,7 +120,7 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       them. **One click double-runs a workload.** The claim-settle does not
       help; the removed node never finds out it is contesting anything.
 
-      The fix has three parts:
+      Fixed with tombstones plus a cooperative leave:
       1. **Peer tombstones** — `RemovedPeers` in cluster state, gossiped and
          version-merged like workload tombstones, so `NotifyJoin`,
          `peer-announce` and `sync` all refuse to resurrect a removed node.
@@ -133,9 +133,15 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       3. **Key revocation** — invalidate its `APIKey` so it cannot rejoin
          without a fresh join token.
 
-      Also: do not tear down tunnels/routes until the leave is acknowledged or
-      the node is confirmed unreachable. Today the teardown happens first,
-      unconditionally.
+      Teardown now happens after the leave is requested, and the response
+      reports `leave_acknowledged` so an operator knows whether the node
+      actually heard. Key revocation is NOT done - a removed node keeps its
+      APIKey, and the tombstone is what keeps it out. Worth closing later.
+
+      Not covered: a node that is off when removed and boots weeks later
+      inside the 30-day window will be refused by gossip and needs a fresh
+      join token. That is the intended behaviour, but it will surprise
+      someone.
 
 - [x] **Join no longer silently provisions a blackhole node.** The Cloudflare
       Mesh migration broke the generated join command and nothing noticed:
