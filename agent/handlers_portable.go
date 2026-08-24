@@ -187,7 +187,7 @@ type importReport struct {
 func (a *Agent) apiImportWorkloads(w http.ResponseWriter, r *http.Request) {
 	var req importRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), 400)
+		writeError(w, 400, "invalid JSON: "+err.Error())
 		return
 	}
 
@@ -198,7 +198,7 @@ func (a *Agent) apiImportWorkloads(w http.ResponseWriter, r *http.Request) {
 	switch mode {
 	case "skip", "replace", "fail":
 	default:
-		http.Error(w, "mode must be one of: skip, replace, fail", 400)
+		writeError(w, 400, "mode must be one of: skip, replace, fail")
 		return
 	}
 
@@ -208,7 +208,7 @@ func (a *Agent) apiImportWorkloads(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Payload.Version != "1" && req.Payload.Version != "" {
-		http.Error(w, fmt.Sprintf("unsupported export version %q (this agent supports v1)", req.Payload.Version), 400)
+		writeError(w, 400, fmt.Sprintf("unsupported export version %q (this agent supports v1)", req.Payload.Version))
 		return
 	}
 
@@ -221,7 +221,7 @@ func (a *Agent) apiImportWorkloads(w http.ResponseWriter, r *http.Request) {
 	// is false), and invalid fields before doing any state mutations.
 	if mode == "fail" {
 		if err := a.validateImportPayload(req.Payload.Workloads, reassignIPs); err != nil {
-			http.Error(w, "import validation failed: "+err.Error(), 409)
+			writeError(w, 409, "import validation failed: "+err.Error())
 			return
 		}
 	}

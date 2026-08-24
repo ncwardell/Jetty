@@ -3254,7 +3254,7 @@
             const url = `${state.apiUrl}/api/workloads/export${params.toString() ? '?' + params.toString() : ''}`;
             try {
                 const resp = await fetch(url, { headers: { 'X-API-Key': state.secretKey } });
-                if (!resp.ok) throw new Error(await resp.text() || `HTTP ${resp.status}`);
+                if (!resp.ok) throw new Error(await apiErrorMessage(resp));
                 const blob = await resp.blob();
                 const dlUrl = URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -3678,6 +3678,28 @@
             }
         }
 
+        // Every API error is a JSON envelope: {"error": "..."}. Read the
+        // message out of it rather than showing the operator raw JSON in a
+        // toast. Falls back to the raw body for anything that isn't the
+        // envelope (a proxy error page, an upstream 502) and finally to the
+        // bare status code, so no failure path ends up with an empty message.
+        async function apiErrorMessage(response) {
+            let raw = '';
+            try {
+                raw = await response.text();
+            } catch (_) { /* body already consumed or unreadable */ }
+            if (raw) {
+                try {
+                    const parsed = JSON.parse(raw);
+                    if (parsed && typeof parsed.error === 'string' && parsed.error) {
+                        return parsed.error;
+                    }
+                } catch (_) { /* not JSON - fall through to the raw text */ }
+                return raw;
+            }
+            return `HTTP ${response.status}`;
+        }
+
         // API Calls
         async function apiCall(endpoint, method = 'GET', body = null) {
             const url = `${state.apiUrl}/api${endpoint}`;
@@ -3696,8 +3718,7 @@
             const response = await fetch(url, options);
 
             if (!response.ok) {
-                const errorText = await response.text();
-                throw new Error(errorText || `HTTP ${response.status}`);
+                throw new Error(await apiErrorMessage(response));
             }
 
             const text = await response.text();
@@ -5276,7 +5297,7 @@
                     headers: { 'X-API-Key': state.secretKey }
                 });
                 if (!response.ok) {
-                    throw new Error(await response.text() || `HTTP ${response.status}`);
+                    throw new Error(await apiErrorMessage(response));
                 }
                 const logs = await response.text() || 'No logs available';
                 currentLogsContent = logs;

@@ -219,22 +219,22 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		APIKey    string `json:"api_key"` // Joiner-generated; stored as Peer.APIKey
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), 400)
+		writeError(w, 400, fmt.Sprintf("invalid JSON: %v", err))
 		return
 	}
 
 	// Validate joiner identity before consuming the token. Cheap and
 	// avoids burning a token on a malformed request.
 	if !validNamePattern.MatchString(req.ID) {
-		http.Error(w, "invalid id", 400)
+		writeError(w, 400, "invalid id")
 		return
 	}
 	if req.Name == "" || !validPeerNamePattern.MatchString(req.Name) {
-		http.Error(w, "invalid name", 400)
+		writeError(w, 400, "invalid name")
 		return
 	}
 	if req.APIKey == "" || len(req.APIKey) < 16 {
-		http.Error(w, "invalid api_key (must be present and >=16 chars)", 400)
+		writeError(w, 400, "invalid api_key (must be present and >=16 chars)")
 		return
 	}
 
@@ -242,7 +242,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	// can't hold an RLock around it.
 	tok, err := a.consumeJoinToken(req.JoinToken, req.ID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 	log.Printf("token: consumed %s for joiner %s (note=%q)", redactTokenID(tok.ID), shortID(req.ID, 12), tok.Note)
@@ -252,21 +252,21 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	// Check against our own IP
 	if req.IP == a.ip {
 		a.stateMu.RUnlock()
-		http.Error(w, "mesh_ip collision with existing node", 409)
+		writeError(w, 409, "mesh_ip collision with existing node")
 		return
 	}
 	// Check against existing peers
 	for _, p := range a.state.Peers {
 		if p.IP == req.IP && p.ID != req.ID {
 			a.stateMu.RUnlock()
-			http.Error(w, "mesh_ip collision with existing node", 409)
+			writeError(w, 409, "mesh_ip collision with existing node")
 			return
 		}
 	}
 	// Check against workloads
 	if _, exists := a.state.Workloads[req.IP]; exists {
 		a.stateMu.RUnlock()
-		http.Error(w, "mesh_ip collision with existing workload", 409)
+		writeError(w, 409, "mesh_ip collision with existing workload")
 		return
 	}
 	a.stateMu.RUnlock()

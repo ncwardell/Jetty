@@ -44,7 +44,7 @@ const (
 // @Router /tokens [post]
 func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required")
 		return
 	}
 
@@ -55,7 +55,7 @@ func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 	// Body is optional - empty body uses defaults.
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON: %v", err))
 			return
 		}
 	}
@@ -72,7 +72,7 @@ func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 
 	tokenID, err := generateAPIKey()
 	if err != nil {
-		http.Error(w, fmt.Sprintf("generate token: %v", err), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("generate token: %v", err))
 		return
 	}
 	now := time.Now()
@@ -110,7 +110,7 @@ func (a *Agent) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 // @Router /tokens [get]
 func (a *Agent) apiListTokens(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required")
 		return
 	}
 
@@ -149,13 +149,13 @@ func (a *Agent) apiListTokens(w http.ResponseWriter, r *http.Request) {
 // @Router /tokens/{id} [delete]
 func (a *Agent) apiDeleteToken(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required")
 		return
 	}
 
 	id := mux.Vars(r)["id"]
 	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "missing id")
 		return
 	}
 

@@ -256,7 +256,7 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 		Peer Peer `json:"peer"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), 400)
+		writeError(w, 400, err.Error())
 		return
 	}
 
@@ -274,7 +274,7 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	// /etc/hosts; an unvalidated newline/tab would let a (compromised)
 	// peer inject arbitrary host -> IP mappings on every node.
 	if !validIngestedPeer(&req.Peer) {
-		http.Error(w, "invalid peer fields", 400)
+		writeError(w, 400, "invalid peer fields")
 		return
 	}
 
@@ -304,7 +304,7 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 			a.stateMu.Unlock()
 			log.Printf("Refusing peer-announce IP change for %s: %s -> %s (RemoteAddr=%s does not match new IP)",
 				req.Peer.ID, oldIP, req.Peer.IP, remoteHost)
-			http.Error(w, "peer IP change must come from the new IP", 403)
+			writeError(w, 403, "peer IP change must come from the new IP")
 			return
 		}
 	}
@@ -357,7 +357,7 @@ func (a *Agent) apiHeartbeat(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), 400)
+		writeError(w, 400, err.Error())
 		return
 	}
 
@@ -434,7 +434,7 @@ func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
 		Token string `json:"token"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), 400)
+		writeError(w, 400, err.Error())
 		return
 	}
 
