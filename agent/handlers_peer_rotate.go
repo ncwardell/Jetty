@@ -96,7 +96,7 @@ func (a *Agent) apiRotatePeerKey(w http.ResponseWriter, r *http.Request) {
 	// AdminKey is cluster-wide) matches what the operator sent us.
 	pr, err := http.NewRequest("POST", url, nil)
 	if err != nil {
-		writeError(w, 500, "build proxy request: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "build proxy request: "+err.Error())
 		return
 	}
 	if k := r.Header.Get("X-API-Key"); k != "" {

@@ -82,7 +82,7 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 
 	// Can't remove self
 	if nodeID == a.hwid || nodeID == a.hostname {
-		writeError(w, 400, "cannot remove self from cluster")
+		writeError(w, http.StatusBadRequest, "cannot remove self from cluster")
 		return
 	}
 
@@ -101,7 +101,7 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 
 	if found == nil {
 		a.stateMu.Unlock()
-		writeError(w, 404, "node not found")
+		writeError(w, http.StatusNotFound, "node not found")
 		return
 	}
 
@@ -174,12 +174,12 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		Env   map[string]string `json:"env,omitempty"` // Optional env overrides applied last (override both preserved env and JETTY_SECRET)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, 400, "invalid request body")
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	if req.Image == "" {
-		writeError(w, 400, "image is required")
+		writeError(w, http.StatusBadRequest, "image is required")
 		return
 	}
 
@@ -199,7 +199,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		a.stateMu.RUnlock()
 
 		if targetPeer == nil {
-			writeError(w, 404, "node not found")
+			writeError(w, http.StatusNotFound, "node not found")
 			return
 		}
 
@@ -211,7 +211,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		reqBody, _ := json.Marshal(req)
 		proxyReq, err := http.NewRequest("POST", proxyURL, strings.NewReader(string(reqBody)))
 		if err != nil {
-			writeError(w, 500, fmt.Sprintf("build proxy request: %v", err))
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("build proxy request: %v", err))
 			return
 		}
 		a.stateMu.RLock()
@@ -222,7 +222,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 
 		resp, err := peerClient.Do(proxyReq)
 		if err != nil {
-			writeError(w, 503, fmt.Sprintf("failed to reach node: %v", err))
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("failed to reach node: %v", err))
 			return
 		}
 		defer resp.Body.Close()
@@ -242,7 +242,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	pullOutput, err := pullCmd.CombinedOutput()
 	if err != nil {
 		log.Printf("Failed to pull image %s: %v\nOutput: %s", req.Image, err, pullOutput)
-		writeError(w, 500, fmt.Sprintf("failed to pull image: %v", err))
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to pull image: %v", err))
 		return
 	}
 	log.Printf("Pulled image: %s", req.Image)
@@ -251,7 +251,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	containerID, err := a.getSelfContainerID()
 	if err != nil {
 		log.Printf("Failed to get own container ID: %v", err)
-		writeError(w, 500, fmt.Sprintf("failed to get container ID: %v", err))
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get container ID: %v", err))
 		return
 	}
 	log.Printf("Self container ID: %s", containerID)
@@ -261,7 +261,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	inspectOutput, err := inspectCmd.Output()
 	if err != nil {
 		log.Printf("Failed to inspect container: %v", err)
-		writeError(w, 500, fmt.Sprintf("failed to inspect container: %v", err))
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to inspect container: %v", err))
 		return
 	}
 
@@ -280,12 +280,12 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.Unmarshal(inspectOutput, &containers); err != nil {
 		log.Printf("Failed to parse inspect output: %v", err)
-		writeError(w, 500, fmt.Sprintf("failed to parse container config: %v", err))
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to parse container config: %v", err))
 		return
 	}
 
 	if len(containers) == 0 {
-		writeError(w, 500, "container not found")
+		writeError(w, http.StatusInternalServerError, "container not found")
 		return
 	}
 
@@ -419,7 +419,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	createOutput, err := createCmd.CombinedOutput()
 	if err != nil {
 		log.Printf("Failed to create new container: %v\nOutput: %s", err, createOutput)
-		writeError(w, 500, fmt.Sprintf("failed to create new container: %v", err))
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to create new container: %v", err))
 		return
 	}
 	newContainerID := strings.TrimSpace(string(createOutput))

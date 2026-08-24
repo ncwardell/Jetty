@@ -60,7 +60,7 @@ func (a *Agent) apiRotateAdminKey(w http.ResponseWriter, r *http.Request) {
 	if newKey == "" {
 		k, err := generateAPIKey()
 		if err != nil {
-			writeError(w, 500, "generate key: "+err.Error())
+			writeError(w, http.StatusInternalServerError, "generate key: "+err.Error())
 			return
 		}
 		newKey = k

@@ -73,14 +73,14 @@ type bulkSelected struct {
 func (a *Agent) apiBulkWorkload(w http.ResponseWriter, r *http.Request) {
 	var req bulkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, 400, "invalid JSON: "+err.Error())
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
 	switch req.Action {
 	case "start", "stop", "restart", "delete":
 	default:
-		writeError(w, 400, "action must be one of: start, stop, restart, delete")
+		writeError(w, http.StatusBadRequest, "action must be one of: start, stop, restart, delete")
 		return
 	}
 
@@ -95,7 +95,7 @@ func (a *Agent) apiBulkWorkload(w http.ResponseWriter, r *http.Request) {
 		selectors++
 	}
 	if selectors != 1 {
-		writeError(w, 400, "exactly one selector required: 'tag', 'names', or 'all'")
+		writeError(w, http.StatusBadRequest, "exactly one selector required: 'tag', 'names', or 'all'")
 		return
 	}
 

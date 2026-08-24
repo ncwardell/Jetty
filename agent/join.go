@@ -219,22 +219,22 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 		APIKey    string `json:"api_key"` // Joiner-generated; stored as Peer.APIKey
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, 400, fmt.Sprintf("invalid JSON: %v", err))
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON: %v", err))
 		return
 	}
 
 	// Validate joiner identity before consuming the token. Cheap and
 	// avoids burning a token on a malformed request.
 	if !validNamePattern.MatchString(req.ID) {
-		writeError(w, 400, "invalid id")
+		writeError(w, http.StatusBadRequest, "invalid id")
 		return
 	}
 	if req.Name == "" || !validPeerNamePattern.MatchString(req.Name) {
-		writeError(w, 400, "invalid name")
+		writeError(w, http.StatusBadRequest, "invalid name")
 		return
 	}
 	if req.APIKey == "" || len(req.APIKey) < 16 {
-		writeError(w, 400, "invalid api_key (must be present and >=16 chars)")
+		writeError(w, http.StatusBadRequest, "invalid api_key (must be present and >=16 chars)")
 		return
 	}
 
@@ -252,21 +252,21 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	// Check against our own IP
 	if req.IP == a.ip {
 		a.stateMu.RUnlock()
-		writeError(w, 409, "mesh_ip collision with existing node")
+		writeError(w, http.StatusConflict, "mesh_ip collision with existing node")
 		return
 	}
 	// Check against existing peers
 	for _, p := range a.state.Peers {
 		if p.IP == req.IP && p.ID != req.ID {
 			a.stateMu.RUnlock()
-			writeError(w, 409, "mesh_ip collision with existing node")
+			writeError(w, http.StatusConflict, "mesh_ip collision with existing node")
 			return
 		}
 	}
 	// Check against workloads
 	if _, exists := a.state.Workloads[req.IP]; exists {
 		a.stateMu.RUnlock()
-		writeError(w, 409, "mesh_ip collision with existing workload")
+		writeError(w, http.StatusConflict, "mesh_ip collision with existing workload")
 		return
 	}
 	a.stateMu.RUnlock()

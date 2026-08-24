@@ -167,13 +167,13 @@ func (a *Agent) writeBackup(w http.ResponseWriter, passphrase, filename string) 
 	var buf bytes.Buffer
 	if err := a.streamBackupTarGz(&buf); err != nil {
 		log.Printf("Backup: build failed: %v", err)
-		writeError(w, 500, "backup build failed: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "backup build failed: "+err.Error())
 		return
 	}
 	wrapped, err := encryptBackup(buf.Bytes(), passphrase)
 	if err != nil {
 		log.Printf("Backup: encrypt failed: %v", err)
-		writeError(w, 500, "backup encrypt failed: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "backup encrypt failed: "+err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
