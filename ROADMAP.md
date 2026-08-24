@@ -180,11 +180,14 @@ enforcing it. Remaining gaps:
       embeds whatever happens to be on disk. `go:embed` cannot traverse `..`,
       which is why the copy exists. Fix: move the source to `agent/web/`, embed
       it directly, delete `web-ui/`. CI drift check is the stopgap until then.
-- [ ] **Swagger drift.** 48 routes registered, 32 documented. Add regeneration
-      to `go:generate` plus a CI check that `docs/` is clean afterward. The 7
-      internal gossip routes (`/api/sync`, `/api/peer-announce`,
-      `/api/heartbeat`, `/api/tunnel/sync`, `/api/tunnel/ws`) belong in
-      `ARCHITECTURE.md`, not the public spec.
+- [x] **Swagger drift.** 32 → 38 documented paths; every registered route is
+      now either in the spec or on an explicit not-API list. The internal
+      node-to-node endpoints are documented under an `internal` tag rather than
+      hidden — they're part of the surface an operator can hit and a peer must
+      implement. `@host` dropped (was pinned to `localhost:6880`). Regeneration
+      wired into `go:generate`; CI fails on any diff, and
+      `TestEveryRegisteredRouteHasASwaggerAnnotation` catches the case
+      regeneration can't — a handler with no annotation at all.
 - [ ] **Docs gaps:** no `ARCHITECTURE.md`, no `CONTRIBUTING.md`, no development
       setup, no release process, no troubleshooting guide. `LOGIC.md` is stale.
       `docs/networking.md` is accurate and thorough — use it as the model.
