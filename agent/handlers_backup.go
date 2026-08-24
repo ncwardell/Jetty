@@ -137,7 +137,7 @@ func (a *Agent) apiBackup(w http.ResponseWriter, r *http.Request) {
 	// a peer key would let that peer recover admin credentials. Admin
 	// only.
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required for backup", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required for backup")
 		return
 	}
 
@@ -167,13 +167,13 @@ func (a *Agent) writeBackup(w http.ResponseWriter, passphrase, filename string) 
 	var buf bytes.Buffer
 	if err := a.streamBackupTarGz(&buf); err != nil {
 		log.Printf("Backup: build failed: %v", err)
-		http.Error(w, "backup build failed: "+err.Error(), 500)
+		writeError(w, 500, "backup build failed: "+err.Error())
 		return
 	}
 	wrapped, err := encryptBackup(buf.Bytes(), passphrase)
 	if err != nil {
 		log.Printf("Backup: encrypt failed: %v", err)
-		http.Error(w, "backup encrypt failed: "+err.Error(), 500)
+		writeError(w, 500, "backup encrypt failed: "+err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -221,7 +221,7 @@ func (a *Agent) streamBackupTarGz(dst io.Writer) error {
 func (a *Agent) apiRestore(w http.ResponseWriter, r *http.Request) {
 	// Restore overwrites every credential on this node. Admin only.
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required for restore", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required for restore")
 		return
 	}
 
@@ -233,7 +233,7 @@ func (a *Agent) apiRestore(w http.ResponseWriter, r *http.Request) {
 	// malicious uploader.
 	buf := &bytes.Buffer{}
 	if _, err := io.Copy(buf, io.LimitReader(r.Body, 64<<20)); err != nil {
-		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
 
@@ -244,12 +244,12 @@ func (a *Agent) apiRestore(w http.ResponseWriter, r *http.Request) {
 	if bytes.HasPrefix(body, backupEncMagic) {
 		passphrase := r.Header.Get("X-Backup-Passphrase")
 		if passphrase == "" {
-			http.Error(w, "encrypted backup detected; X-Backup-Passphrase header required", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "encrypted backup detected; X-Backup-Passphrase header required")
 			return
 		}
 		plain, err := decryptBackup(body, passphrase)
 		if err != nil {
-			http.Error(w, "decrypt: "+err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "decrypt: "+err.Error())
 			return
 		}
 		buf = bytes.NewBuffer(plain)
@@ -257,7 +257,7 @@ func (a *Agent) apiRestore(w http.ResponseWriter, r *http.Request) {
 
 	gz, err := gzip.NewReader(buf)
 	if err != nil {
-		http.Error(w, "decompress: "+err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "decompress: "+err.Error())
 		return
 	}
 	defer gz.Close()
@@ -267,7 +267,7 @@ func (a *Agent) apiRestore(w http.ResponseWriter, r *http.Request) {
 	// touching disk. Specifically, expect state.json at the archive root.
 	tmpDir, err := os.MkdirTemp(a.dataDir, "restore-*")
 	if err != nil {
-		http.Error(w, "mkdir temp: "+err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "mkdir temp: "+err.Error())
 		return
 	}
 	defer os.RemoveAll(tmpDir)
@@ -279,42 +279,42 @@ func (a *Agent) apiRestore(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if err != nil {
-			http.Error(w, "tar read: "+err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "tar read: "+err.Error())
 			return
 		}
 		// Refuse path-traversal attempts. Tar entries should all be
 		// relative paths under the archive root.
 		clean := filepath.Clean(hdr.Name)
 		if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
-			http.Error(w, "archive contains unsafe path: "+hdr.Name, http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "archive contains unsafe path: "+hdr.Name)
 			return
 		}
 		target := filepath.Join(tmpDir, clean)
 		// Defense in depth: ensure target is under tmpDir.
 		if !strings.HasPrefix(target, tmpDir+string(os.PathSeparator)) && target != tmpDir {
-			http.Error(w, "archive escapes target dir: "+hdr.Name, http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "archive escapes target dir: "+hdr.Name)
 			return
 		}
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, 0700); err != nil {
-				http.Error(w, "mkdir: "+err.Error(), http.StatusInternalServerError)
+				writeError(w, http.StatusInternalServerError, "mkdir: "+err.Error())
 				return
 			}
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
-				http.Error(w, "mkdir parent: "+err.Error(), http.StatusInternalServerError)
+				writeError(w, http.StatusInternalServerError, "mkdir parent: "+err.Error())
 				return
 			}
 			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 			if err != nil {
-				http.Error(w, "open: "+err.Error(), http.StatusInternalServerError)
+				writeError(w, http.StatusInternalServerError, "open: "+err.Error())
 				return
 			}
 			if _, err := io.Copy(f, tr); err != nil {
 				f.Close()
-				http.Error(w, "write: "+err.Error(), http.StatusInternalServerError)
+				writeError(w, http.StatusInternalServerError, "write: "+err.Error())
 				return
 			}
 			f.Close()
@@ -328,25 +328,25 @@ func (a *Agent) apiRestore(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !stateFound {
-		http.Error(w, "archive does not contain state.json - not a Jetty backup?", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "archive does not contain state.json - not a Jetty backup?")
 		return
 	}
 
 	// Validate that state.json parses before we commit it.
 	stateBytes, err := os.ReadFile(filepath.Join(tmpDir, "state.json"))
 	if err != nil {
-		http.Error(w, "read staged state: "+err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "read staged state: "+err.Error())
 		return
 	}
 	var probe State
 	if err := json.Unmarshal(stateBytes, &probe); err != nil {
-		http.Error(w, "staged state.json is not valid Jetty state: "+err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "staged state.json is not valid Jetty state: "+err.Error())
 		return
 	}
 
 	// Commit: move staged state.json into place, replace compose dir.
 	if err := os.Rename(filepath.Join(tmpDir, "state.json"), filepath.Join(a.dataDir, "state.json")); err != nil {
-		http.Error(w, "commit state.json: "+err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "commit state.json: "+err.Error())
 		return
 	}
 
@@ -362,7 +362,7 @@ func (a *Agent) apiRestore(w http.ResponseWriter, r *http.Request) {
 		if err := os.Rename(stagedCompose, a.composeDir); err != nil {
 			// Roll back
 			os.Rename(oldCompose, a.composeDir)
-			http.Error(w, "commit compose dir: "+err.Error(), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "commit compose dir: "+err.Error())
 			return
 		}
 		os.RemoveAll(oldCompose)

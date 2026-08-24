@@ -129,14 +129,14 @@ func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 			apiKey = r.URL.Query().Get("api_key")
 		}
 		if apiKey == "" {
-			http.Error(w, "unauthorized: missing API key", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "unauthorized: missing API key")
 			return
 		}
 		if a.authorizeAPIKey(apiKey) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		http.Error(w, "unauthorized: invalid API key", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: invalid API key")
 	})
 }
 

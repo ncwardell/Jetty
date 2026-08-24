@@ -39,7 +39,7 @@ import (
 // @Router /admin-key/rotate [post]
 func (a *Agent) apiRotateAdminKey(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required")
 		return
 	}
 
@@ -48,7 +48,7 @@ func (a *Agent) apiRotateAdminKey(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 			return
 		}
 	}
@@ -60,13 +60,13 @@ func (a *Agent) apiRotateAdminKey(w http.ResponseWriter, r *http.Request) {
 	if newKey == "" {
 		k, err := generateAPIKey()
 		if err != nil {
-			http.Error(w, "generate key: "+err.Error(), 500)
+			writeError(w, 500, "generate key: "+err.Error())
 			return
 		}
 		newKey = k
 	}
 	if len(newKey) < 16 {
-		http.Error(w, "new_key must be at least 16 characters", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "new_key must be at least 16 characters")
 		return
 	}
 

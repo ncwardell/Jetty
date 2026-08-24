@@ -285,7 +285,7 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 	if !hasAnyKey {
 		log.Printf("WS tunnel: refusing connection from %s - cluster has no auth keys configured", r.RemoteAddr)
-		http.Error(w, "tunnel disabled: cluster has not bootstrapped auth", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "tunnel disabled: cluster has not bootstrapped auth")
 		return
 	}
 	apiKey := r.Header.Get("X-API-Key")
@@ -294,7 +294,7 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 	}
 	if !a.authorizeAPIKey(apiKey) {
 		log.Printf("WS tunnel: rejected unauthenticated connection from %s", r.RemoteAddr)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 

@@ -43,7 +43,7 @@ const backupScheduleMinInterval = 5 // minutes
 // @Router /backup/schedule [get]
 func (a *Agent) apiGetBackupSchedule(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required")
 		return
 	}
 	a.stateMu.RLock()
@@ -74,20 +74,20 @@ func (a *Agent) apiGetBackupSchedule(w http.ResponseWriter, r *http.Request) {
 // @Router /backup/schedule [post]
 func (a *Agent) apiSetBackupSchedule(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required")
 		return
 	}
 	var req BackupSchedule
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 	if req.IntervalMinutes < backupScheduleMinInterval {
-		http.Error(w, fmt.Sprintf("interval_minutes must be >= %d", backupScheduleMinInterval), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("interval_minutes must be >= %d", backupScheduleMinInterval))
 		return
 	}
 	if req.Retention < 0 {
-		http.Error(w, "retention must be >= 0", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "retention must be >= 0")
 		return
 	}
 	req.UpdatedAt = time.Now().UTC()
@@ -123,7 +123,7 @@ func (a *Agent) apiSetBackupSchedule(w http.ResponseWriter, r *http.Request) {
 // @Router /backup/schedule [delete]
 func (a *Agent) apiDeleteBackupSchedule(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required")
 		return
 	}
 	a.stateMu.Lock()
