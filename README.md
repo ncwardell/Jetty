@@ -202,10 +202,26 @@ docker run -d \
   -v jetty-data:/data \
   -e JETTY_JOIN=https://your-tunnel-domain.com \
   -e JETTY_JOIN_TOKEN=8h2y...the-token-from-above...kf9 \
+  -e JETTY_WARP_CONNECTOR_TOKEN=...this-machine-s-mesh-token... \
   ghcr.io/ncwardell/jetty:latest
 ```
 
-> **That's it.** Joining nodes get the WARP token, tunnel config, admin key, and per-node API key automatically. No manual token copying after the join. The join token is consumed and can never be reused.
+Joining nodes get the tunnel config, admin key, and per-node API key
+automatically. The join token is consumed and can never be reused.
+
+> ### ⚠️ `JETTY_WARP_CONNECTOR_TOKEN` is per machine
+>
+> Create one **per node** in Cloudflare: Zero Trust → Networking → Mesh → Add a
+> node. It is the one value that cannot be handed out at join time, because
+> it identifies *this machine* to Cloudflare.
+>
+> **Omit it and the node still joins and still looks healthy** — it inherits
+> the cluster-shared token, and Cloudflare Mesh registers shared-token nodes as
+> active-passive replicas of a single identity. The passive ones **drop all
+> traffic** while gossiping normally and showing green in the dashboard.
+>
+> The agent logs a warning at startup when it falls back. If a node joins
+> cleanly but nothing can reach its workloads, check this first.
 
 ### Verify
 
