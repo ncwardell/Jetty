@@ -544,6 +544,27 @@ const docTemplate = `{
                 }
             }
         },
+        "/livez": {
+            "get": {
+                "description": "Answers without taking any lock, so it still responds when the agent's state mutex is held by a stuck writer - the one failure mode /api/health cannot report, because it takes that lock itself. ` + "`" + `state_lock_acquirable` + "`" + ` false alongside a high ` + "`" + `goroutines` + "`" + ` count means the control plane is wedged rather than merely busy. Unauthenticated and free: no background work, nothing runs until this is called.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "cluster"
+                ],
+                "summary": "Liveness and lock-health probe",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
         "/nodes": {
             "get": {
                 "description": "Returns all nodes in the cluster (self + peers)",

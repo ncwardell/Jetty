@@ -149,13 +149,23 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       makes the dependency explicit. Deliberately not bundled into the
       deadlock fix.
 
-- [ ] **Watchdog for a wedged control plane.** The reason the outage cost
-      hours is that `/api/health` sits behind the same middleware, so a
-      deadlocked node reports nothing at all rather than reporting that it is
-      deadlocked. A goroutine that periodically attempts `TryRLock` with a
-      deadline and logs loudly (or exits, letting Docker restart it) turns an
-      invisible hang into a visible one. Worth having independent of any
-      specific deadlock.
+- [x] **A wedged control plane can now say so.** Two subtractions rather than
+      new machinery, which is why there is no watchdog goroutine:
+
+      1. `apiKeyMiddleware` took `stateMu.RLock()` and scanned the whole peer
+         table *before* checking whether the path needed auth at all - so
+         `/api/health` depended on a lock it had no reason to touch, and
+         discarded the result. The public-path check now comes first. Strictly
+         less work per request.
+      2. `GET /api/livez` reports liveness, uptime, goroutine count and
+         whether `stateMu` is acquirable (`TryRLock`, non-blocking) - so it
+         cannot get stuck on the lock it is reporting on. No background
+         goroutine, no polling, no timer: it costs nothing until called.
+
+      `/api/health` is not a liveness check - it takes `stateMu` twice. Use
+      `/api/livez` when a node is unresponsive; `state_lock_acquirable=false`
+      alongside a high goroutine count means wedged rather than busy, and it
+      says so in a `diagnosis` field.
 
 - [ ] **Audit the remaining ~100 unbounded `exec.Command` sites.** The route
       path is bounded now, but `deploy.go`, `handlers_nodes.go` and others
