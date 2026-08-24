@@ -64,25 +64,30 @@ nothing retransmitted, and the flow deadlocked permanently. Observed as CIFS
 mount hangs and 10–15s stalls on ~21% of public requests.
 
 - [x] Flow control (`initFlow` / `noteAck` / `awaitWindow` / `closeFlow`)
-- [ ] Verify under load: sustained CIFS transfer, and public request latency
-      distribution with both nodes as Cloudflare tunnel connectors
+- [x] Unit tests for the flow-control state machine (window accounting,
+      sequence wraparound, zero-window block/unblock, probe timer, teardown
+      releases blocked senders). These four functions are at 100%.
+- [ ] **Verify under load** — the unit tests prove the state machine, not the
+      fix. Still needs: a sustained CIFS transfer, and a public request
+      latency distribution with both nodes as Cloudflare tunnel connectors.
+      This is the gate before production.
 - [ ] **Migrate to gVisor netstack.** Deletes ~600 lines of hand-rolled TCP,
       the whole bug class, the TUN device, and the `NET_ADMIN` requirement.
       `tunnel.go` is currently 1,069 lines of raw packet parsing at 0% coverage.
 
 ### 1b. Correctness
 
-- [ ] **Per-node tunnel control.** `DELETE /api/tunnel` on one node gossips
-      cluster-wide and kills every connector — observed taking all public sites
-      down with Cloudflare 530/1033. The CF token is cluster-shared state with
-      no per-node scope.
+- [x] **Per-node tunnel control.** `?scope=node` (default) vs `?scope=cluster`,
+      plus `?node=<id|name>` targeting. `CFTunnelDisabled` is node-local and
+      never broadcast; the guard lives in `startCloudflared` so the monitor
+      loop and token syncs can't resurrect a disabled connector.
 - [ ] **Ownership consensus.** `wl.Owner = a.hwid` (`failover.go`) is a
       unilateral write to a contended field settled by highest-version-wins.
       Two nodes can both claim a workload and both start the container. This is
       a correctness bug at three nodes, not a scale bug.
-- [ ] **Panic recovery.** Zero `recover()` calls exist. A panic in the
-      memberlist delegate, tunnel read loop, or any background ticker takes down
-      the entire agent.
+- [x] **Panic recovery.** `goSafe` (drop the unit of work) and `goSupervised`
+      (restart with backoff, bounded) applied to every goroutine spawn, plus
+      inline barriers on all eight memberlist delegate callbacks.
 - [ ] **Multi-node convergence test.** `sync_test.go` is good but tests single
       merges. Nothing partitions three agents and asserts they heal to identical
       state with a single owner per workload.
@@ -92,11 +97,12 @@ mount hangs and 10–15s stalls on ~21% of public requests.
 
 ### 1c. Test coverage
 
-Currently **18.8%**, and the gaps are precisely the dangerous subsystems:
+**21.0%** as of the panic-barrier work, up from 18.8%. The gaps are still the
+dangerous subsystems:
 
 | Area | Coverage | Note |
 |---|---|---|
-| `tunnel.go` | 0% | 19 functions, raw packet parsing |
+| `tunnel.go` | flow control 100%, rest ~0% | packet parsing still untested |
 | `handlers_workloads.go` | 0% | 1,749 lines, the largest source file |
 | `apiUpdateNode` | 0% | 350 lines — self-update; a bug here bricks a node |
 | `memberlist.go` | 5.7% | 41 functions |
