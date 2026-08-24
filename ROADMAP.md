@@ -224,6 +224,13 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       reports `leave_acknowledged` so an operator knows whether the node
       actually heard.
 
+      **Leaving stops workloads, it never removes them.** The first version
+      called `removeWorkload`, which runs `docker compose down -v` and would
+      have destroyed every named volume on the node being removed. Being
+      removed from a cluster must not mean losing your data - the operator may
+      be decommissioning the node, or may have clicked the wrong row. Guarded
+      by `TestLeaveNeverDestroysVolumes`.
+
       Two deliberate asymmetries: the tombstone does **not** gate `/api/join`
       (a fresh one-time token is an explicit decision to re-admit, and clears
       it), and a tombstone naming the local node is stored and propagated but
