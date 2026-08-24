@@ -117,6 +117,7 @@ func (d *jettyDelegate) LocalState(join bool) []byte {
 	for _, dek := range d.agent.state.DeletedEnvKeys {
 		syncResp.DeletedEnvKeys = append(syncResp.DeletedEnvKeys, dek)
 	}
+	syncResp.RemovedPeers = d.agent.removedPeersSlice()
 
 	data, err := json.Marshal(syncResp)
 	if err != nil {
@@ -188,6 +189,14 @@ func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
 	logInfof("Memberlist: node %s (%s) joined at %s", meta.Name, shortID(meta.ID, 12), meta.IP)
 
 	e.agent.stateMu.Lock()
+	// A removed node keeps gossiping - it is still up and still on WARP -
+	// so without this check the removal is undone within a round.
+	if e.agent.peerRemovedLocked(meta.ID) {
+		e.agent.stateMu.Unlock()
+		logWarnf("Memberlist: ignoring join from removed node %s (%s); "+
+			"issue a fresh join token to re-admit it", meta.Name, shortID(meta.ID, 12))
+		return
+	}
 	peer := e.agent.state.Peers[meta.ID]
 	if peer == nil {
 		peer = &Peer{

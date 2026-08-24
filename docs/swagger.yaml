@@ -540,6 +540,16 @@ definitions:
         description: Registry username; defaults to "x-access-token" for PATs
         type: string
     type: object
+  agent.RemovedPeer:
+    properties:
+      id:
+        type: string
+      name:
+        type: string
+      version:
+        description: UnixNano when removed; highest wins
+        type: integer
+    type: object
   agent.RevokeTokenResponse:
     properties:
       revoked:
@@ -604,6 +614,10 @@ definitions:
         additionalProperties:
           type: string
         type: object
+      removed_peers:
+        items:
+          $ref: '#/definitions/agent.RemovedPeer'
+        type: array
       workloads:
         items:
           $ref: '#/definitions/agent.Workload'
@@ -1089,6 +1103,24 @@ paths:
       summary: Join cluster
       tags:
       - cluster
+  /leave:
+    post:
+      description: 'Node-to-node. Tells this node it has been removed: it stops the
+        workloads it owns, leaves the memberlist gossip pool, and tombstones itself
+        so it does not rejoin by gossip. Re-admission requires a fresh join token.
+        Peer or admin API key required.'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Leave the cluster (internal)
+      tags:
+      - internal
   /nodes:
     get:
       description: Returns all nodes in the cluster (self + peers)
