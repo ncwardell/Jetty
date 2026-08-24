@@ -253,6 +253,7 @@ func (a *Agent) runAPI() {
 	// --- Node CRUD (handlers_nodes.go) -------------------------------
 	r.HandleFunc("/api/nodes", a.apiListNodes).Methods("GET")
 	r.HandleFunc("/api/nodes/{id}", a.apiRemoveNode).Methods("DELETE")
+	r.HandleFunc("/api/leave", a.apiLeave).Methods("POST")
 	r.HandleFunc("/api/nodes/{id}/update", a.apiUpdateNode).Methods("POST")
 
 	// --- Cloudflare Tunnel (handlers_tunnel.go) ----------------------

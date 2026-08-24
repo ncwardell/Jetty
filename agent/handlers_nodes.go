@@ -111,15 +111,32 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 			orphanedWorkloads = append(orphanedWorkloads, wl.Name)
 		}
 	}
-
-	// Remove the peer
-	delete(a.state.Peers, foundID)
+	target := *found // copy; the map entry is about to go
 	a.stateMu.Unlock()
 
-	// Clean up IPIP tunnel to this peer
-	a.removePeerTunnel(found.ID)
+	// Ask the node to leave BEFORE tearing anything down.
+	//
+	// This ordering is the whole fix. Removal used to delete the peer
+	// locally, tear down the tunnel and rewrite routes, and only then
+	// broadcast - while the node itself was never told. It kept running, kept
+	// gossiping, and was re-added within a round, so the teardown/rebuild
+	// flapped. And in the window where it was absent from state its workloads
+	// looked orphaned, so failover claimed them while the node was still
+	// running them.
+	//
+	// Memberlist has no forcible eviction: a node can only be made to leave by
+	// asking it. So we ask, and we wait for the answer before doing anything
+	// destructive. An unreachable node cannot double-run anything we would
+	// then claim - it is not serving - so proceeding is safe there.
+	left, leaveErr := a.requestPeerLeave(&target)
 
-	// Clean up routes for workloads that were owned by this peer
+	a.stateMu.Lock()
+	delete(a.state.Peers, foundID)
+	a.tombstonePeerLocked(target.ID, target.Name)
+	a.stateMu.Unlock()
+
+	a.removePeerTunnel(target.ID)
+
 	a.stateMu.Lock()
 	a.updateWorkloadRoutes()
 	a.stateMu.Unlock()
@@ -128,14 +145,22 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 	a.saveState()
 	a.broadcastState()
 
-	logInfof("Removed node: %s (%s), orphaned workloads: %v", found.Name, found.ID, orphanedWorkloads)
+	message := "node removed and acknowledged the leave; its workloads are stopped and will failover if revive is enabled"
+	if !left {
+		message = "node removed, but it did not acknowledge the leave (" + leaveErr +
+			"). If it is still running it will keep serving its workloads while the cluster fails them over - stop the agent on that node before it reconnects."
+		logWarnf("Removed node %s (%s) without a leave acknowledgement: %s",
+			target.Name, shortID(target.ID, 12), leaveErr)
+	} else {
+		logInfof("Removed node: %s (%s), orphaned workloads: %v", target.Name, target.ID, orphanedWorkloads)
+	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"removed":            found.Name,
-		"id":                 found.ID,
+	writeJSON(w, map[string]interface{}{
+		"removed":            target.Name,
+		"id":                 target.ID,
 		"orphaned_workloads": orphanedWorkloads,
-		"message":            "node removed; orphaned workloads will failover if revive is enabled",
+		"leave_acknowledged": left,
+		"message":            message,
 	})
 }
 

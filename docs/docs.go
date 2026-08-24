@@ -521,6 +521,29 @@ const docTemplate = `{
                 }
             }
         },
+        "/leave": {
+            "post": {
+                "description": "Node-to-node. Tells this node it has been removed: it stops the workloads it owns, leaves the memberlist gossip pool, and tombstones itself so it does not rejoin by gossip. Re-admission requires a fresh join token. Peer or admin API key required.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "internal"
+                ],
+                "summary": "Leave the cluster (internal)",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/nodes": {
             "get": {
                 "description": "Returns all nodes in the cluster (self + peers)",
@@ -2482,6 +2505,21 @@ const docTemplate = `{
                 }
             }
         },
+        "agent.RemovedPeer": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "version": {
+                    "description": "UnixNano when removed; highest wins",
+                    "type": "integer"
+                }
+            }
+        },
         "agent.RevokeTokenResponse": {
             "type": "object",
             "properties": {
@@ -2577,6 +2615,12 @@ const docTemplate = `{
                     "type": "object",
                     "additionalProperties": {
                         "type": "string"
+                    }
+                },
+                "removed_peers": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/agent.RemovedPeer"
                     }
                 },
                 "workloads": {

@@ -239,6 +239,7 @@ func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 	for _, dek := range a.state.DeletedEnvKeys {
 		deletedEnvKeys = append(deletedEnvKeys, dek)
 	}
+	removedPeers := a.removedPeersSlice()
 	a.stateMu.RUnlock()
 
 	// Return sync response with workloads, tombstones, and env data
@@ -253,6 +254,9 @@ func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(deletedEnvKeys) > 0 {
 		resp["deleted_env_keys"] = deletedEnvKeys
+	}
+	if len(removedPeers) > 0 {
+		resp["removed_peers"] = removedPeers
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -308,6 +312,15 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 
 	// Refuse to repoint an existing peer's IP via this endpoint.
 	a.stateMu.Lock()
+	// A removed node announces itself like any other - it is still running.
+	// Without this it is back in the peer table on the next announce.
+	if a.peerRemovedLocked(req.Peer.ID) {
+		a.stateMu.Unlock()
+		logWarnf("Rejecting announce from removed node %s (%s); "+
+			"issue a fresh join token to re-admit it", req.Peer.Name, shortID(req.Peer.ID, 12))
+		writeError(w, http.StatusForbidden, "node has been removed from this cluster")
+		return
+	}
 	oldPeer := a.state.Peers[req.Peer.ID]
 	oldIP := ""
 	oldAPIKey := ""

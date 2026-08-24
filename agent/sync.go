@@ -108,6 +108,14 @@ type MergeResult struct {
 func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 	result := &MergeResult{}
 
+	// Node removals first. A tombstone we have not seen yet may evict a peer
+	// whose workloads appear later in this same payload, and processing it
+	// first means those workloads are attributed to a node we already know is
+	// gone rather than one we are about to remove.
+	if a.mergeRemovedPeers(syncResp.RemovedPeers) {
+		result.Changed = true
+	}
+
 	// Process deleted workloads (tombstones) first
 	for _, dw := range syncResp.DeletedWorkloads {
 		if !validIngestedTombstone(dw) {

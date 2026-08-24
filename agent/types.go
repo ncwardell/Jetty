@@ -31,6 +31,11 @@ const (
 	IPMonitorInterval     = 10 * time.Second // How often to check for WARP IP changes
 	CPUSampleInterval     = 30 * time.Second // How often to sample CPU usage
 	TombstoneMaxAge       = 1 * time.Hour    // How long to keep deletion tombstones
+	// RemovedPeerMaxAge is far longer than TombstoneMaxAge on purpose. A
+	// workload tombstone only has to outlive a gossip round, but a removed
+	// node can legitimately be powered off for weeks and must not come back
+	// as a cluster member when it boots.
+	RemovedPeerMaxAge = 30 * 24 * time.Hour
 
 	// Timeouts
 	DefaultHTTPTimeout   = 30 * time.Second
@@ -47,6 +52,11 @@ const (
 	CloudflaredMaxBackoff     = 2 * time.Minute
 	CloudflaredMaxFailures    = 10
 	CloudflaredSuccessReset   = 30 * time.Second
+
+	// memberlistLeaveTimeout bounds how long a departing node waits for its
+	// leave to propagate. Short: the removal already happened, this is just
+	// courtesy notice so peers mark us gone promptly rather than by timeout.
+	memberlistLeaveTimeout = 5 * time.Second
 )
 
 // =============================================================================
@@ -149,6 +159,24 @@ type DeletedEnvKey struct {
 	Version int64  `json:"version"` // Timestamp when deleted
 }
 
+// RemovedPeer is a tombstone for a node removed from the cluster.
+//
+// Without one, removal cannot stick. A removed node keeps running, stays on
+// WARP and stays an active memberlist member, so NotifyJoin and
+// /api/peer-announce re-add it within a gossip round - while the removal has
+// already torn down the IPIP tunnel, the route table and /etc/hosts. The
+// resulting flap is what took the cluster down.
+//
+// Deliberately NOT consulted by /api/join: presenting a fresh, valid join
+// token is an explicit operator action that re-admits the node and clears the
+// tombstone. The tombstone blocks *resurrection by gossip*, not readmission
+// by decision.
+type RemovedPeer struct {
+	ID      string `json:"id"`
+	Name    string `json:"name,omitempty"`
+	Version int64  `json:"version"` // UnixNano when removed; highest wins
+}
+
 // State represents the cluster-wide state
 type State struct {
 	Peers            map[string]*Peer            `json:"peers"`                       // ID -> Peer
@@ -173,6 +201,11 @@ type State struct {
 	WarpToken      string                    `json:"warp_token,omitempty"`       // Cloudflare WARP connector token (shared cluster-wide)
 	EnvData        map[string]string         `json:"env_data,omitempty"`         // Encrypted environment variables (key -> encrypted value)
 	DeletedEnvKeys map[string]*DeletedEnvKey `json:"deleted_env_keys,omitempty"` // Key -> tombstone (for sync propagation)
+
+	// RemovedPeers are node tombstones, keyed by node ID. Gossiped and
+	// version-merged like workload tombstones so a removed node cannot be
+	// resurrected by a peer that has not heard about the removal yet.
+	RemovedPeers map[string]*RemovedPeer `json:"removed_peers,omitempty"`
 
 	// AdminKey is the cluster-wide operator/dashboard credential.
 	// Bootstrapped from JETTY_SECRET on the first node, persisted, and
@@ -246,6 +279,7 @@ func NewState() *State {
 		DeletedWorkloads: make(map[string]*DeletedWorkload),
 		EnvData:          make(map[string]string),
 		DeletedEnvKeys:   make(map[string]*DeletedEnvKey),
+		RemovedPeers:     make(map[string]*RemovedPeer),
 		JoinTokens:       make(map[string]*JoinToken),
 	}
 }
@@ -473,4 +507,5 @@ type SyncResponse struct {
 	DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
 	EnvData          map[string]string  `json:"env_data,omitempty"`
 	DeletedEnvKeys   []*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`
+	RemovedPeers     []*RemovedPeer     `json:"removed_peers,omitempty"`
 }

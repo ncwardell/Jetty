@@ -293,6 +293,16 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.stateMu.Lock()
+	// Re-admission. Reaching here means the node presented a valid one-time
+	// join token, which is an explicit operator decision to let it back in -
+	// so clear any removal tombstone rather than letting it silently
+	// re-remove the node on the next gossip round. The tombstone exists to
+	// block resurrection by gossip, not readmission by decision.
+	if a.peerRemovedLocked(peer.ID) {
+		logInfof("Re-admitting previously removed node %s (%s) on a fresh join token",
+			peer.Name, shortID(peer.ID, 12))
+	}
+	a.clearPeerTombstoneLocked(peer.ID)
 	a.state.Peers[peer.ID] = peer
 
 	// Build response with all peers (including self). Self carries

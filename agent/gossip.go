@@ -51,6 +51,9 @@ func (a *Agent) gcTombstones() {
 			removedWorkloads++
 		}
 	}
+	// Node tombstones expire on their own, much longer horizon - a removed
+	// node can legitimately be powered off for weeks.
+	a.gcRemovedPeers()
 	removedEnvKeys := 0
 	for key, dek := range a.state.DeletedEnvKeys {
 		if dek.Version < cutoff {

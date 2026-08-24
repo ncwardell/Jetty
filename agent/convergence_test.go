@@ -56,8 +56,13 @@ func (c *cluster) snapshot(a *Agent) map[string]interface{} {
 	for k, d := range a.state.DeletedEnvKeys {
 		envTomb[k] = d.Version
 	}
+	removed := map[string]int64{}
+	for id, rp := range a.state.RemovedPeers {
+		removed[id] = rp.Version
+	}
 	return map[string]interface{}{
 		"workloads": wl, "tombstones": tomb, "env": env, "envTombstones": envTomb,
+		"removedPeers": removed,
 	}
 }
 
@@ -81,6 +86,10 @@ func (c *cluster) syncResponseOf(a *Agent) *SyncResponse {
 	for _, d := range a.state.DeletedEnvKeys {
 		cp := *d
 		resp.DeletedEnvKeys = append(resp.DeletedEnvKeys, &cp)
+	}
+	for _, rp := range a.state.RemovedPeers {
+		cp := *rp
+		resp.RemovedPeers = append(resp.RemovedPeers, &cp)
 	}
 	return resp
 }
