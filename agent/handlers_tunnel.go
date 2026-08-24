@@ -36,6 +36,7 @@ func (a *Agent) apiGetTunnel(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
+
 // apiSetTunnel godoc
 // @Summary Configure tunnel
 // @Description Sets the Cloudflare tunnel token (propagates to all nodes)
@@ -82,6 +83,7 @@ func (a *Agent) apiSetTunnel(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Cloudflare tunnel configured")
 }
+
 // apiDeleteTunnel godoc
 // @Summary Remove tunnel
 // @Description Removes the Cloudflare tunnel configuration

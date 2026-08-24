@@ -283,6 +283,7 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 		"nodes":           results,
 	})
 }
+
 // cpuSampleLoop runs in the background and continuously samples CPU usage.
 // This provides accurate CPU metrics without blocking API requests.
 func (a *Agent) cpuSampleLoop() {
@@ -334,6 +335,7 @@ func (a *Agent) cpuSampleLoop() {
 		}
 	}
 }
+
 // getSystemStats returns CPU, memory, and disk statistics for the node
 func (a *Agent) getSystemStats() map[string]interface{} {
 	stats := make(map[string]interface{})
@@ -410,6 +412,7 @@ func (a *Agent) getSystemStats() map[string]interface{} {
 
 	return stats
 }
+
 // formatBytes converts bytes to human-readable format
 func formatBytes(b uint64) string {
 	const unit = 1024
@@ -423,6 +426,7 @@ func formatBytes(b uint64) string {
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
+
 // getHealthStatus returns "healthy", "medium", or "full" based on resource usage
 // healthy: CPU < 50% and memory < 60%
 // medium: CPU 50-80% or memory 60-85%

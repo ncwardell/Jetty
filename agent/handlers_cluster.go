@@ -348,6 +348,7 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Peer announced: %s (%s)", req.Peer.Name, req.Peer.IP)
 }
+
 // apiHeartbeat receives heartbeats from peers in tunnel-only mode.
 // This allows peers to track each other's health through the Cloudflare tunnel.
 func (a *Agent) apiHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -380,6 +381,7 @@ func (a *Agent) apiHeartbeat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "received_by": a.hostname})
 }
+
 // broadcastTunnelToken sends the CF token to all peers so they can start their tunnels.
 // Sends X-API-Key via peerRequest so the receiver's apiKeyMiddleware admits it.
 func (a *Agent) broadcastTunnelToken(token string) {

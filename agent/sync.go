@@ -560,4 +560,3 @@ func (a *Agent) broadcastState() {
 		}
 	}
 }
-

@@ -21,7 +21,9 @@ import (
 )
 
 // Passphrase-wrapped backup format:
-//   [12 bytes magic "JETTY-ENC-V1"][16 byte salt][12 byte nonce][ciphertext]
+//
+//	[12 bytes magic "JETTY-ENC-V1"][16 byte salt][12 byte nonce][ciphertext]
+//
 // where ciphertext = AES-256-GCM(passphrase-derived-key, nonce, tar.gz).
 // Argon2id parameters are picked for "wait a couple of seconds on
 // modern hardware" - this is offline-resistant by design since the
@@ -29,8 +31,8 @@ import (
 var backupEncMagic = []byte("JETTY-ENC-V1")
 
 const (
-	backupSaltSize     = 16
-	backupNonceSize    = 12 // AES-GCM standard
+	backupSaltSize            = 16
+	backupNonceSize           = 12 // AES-GCM standard
 	backupArgonTime    uint32 = 3
 	backupArgonMemory  uint32 = 64 * 1024
 	backupArgonThreads uint8  = 4

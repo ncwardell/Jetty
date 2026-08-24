@@ -165,7 +165,7 @@ func (a *Agent) runScheduledBackup() {
 
 	backupsDir := filepath.Join(a.dataDir, "backups")
 	if err := os.MkdirAll(backupsDir, 0700); err != nil {
-		a.recordBackupRunResult("error: mkdir: " + err.Error(), "")
+		a.recordBackupRunResult("error: mkdir: "+err.Error(), "")
 		return
 	}
 

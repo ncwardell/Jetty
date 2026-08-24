@@ -171,18 +171,18 @@ func (a *Agent) updateHosts() {
 //   - Stale routes (workload moved owners, peer went unhealthy) are removed.
 //
 // Transport selection (in priority order):
-//   1. IPIP/GRE tunnel (a.tunnelMode == "ipip" | "gre"):
-//        ip route add <wlIP>/32 dev tun_<peerID>
-//   2. Userspace WS tunnel (a.tunDevice != nil): all remote workloads route
-//      to the same TUN device; the TUN reader picks the destination peer
-//      from a.workloadRoutes:
-//        ip route add <wlIP>/32 dev jetty_tun
-//   3. Last resort - direct WARP routing:
-//        ip route add <wlIP>/32 via <peerWARPip> dev CloudflareWARP
-//      This requires WARP to know how to forward 10.100.x.x to the peer,
-//      which by default it doesn't (WARP only routes 100.96.0.0/12). This
-//      branch is effectively a dead path; left in place as a "if you've
-//      configured WARP yourself" escape hatch.
+//  1. IPIP/GRE tunnel (a.tunnelMode == "ipip" | "gre"):
+//     ip route add <wlIP>/32 dev tun_<peerID>
+//  2. Userspace WS tunnel (a.tunDevice != nil): all remote workloads route
+//     to the same TUN device; the TUN reader picks the destination peer
+//     from a.workloadRoutes:
+//     ip route add <wlIP>/32 dev jetty_tun
+//  3. Last resort - direct WARP routing:
+//     ip route add <wlIP>/32 via <peerWARPip> dev CloudflareWARP
+//     This requires WARP to know how to forward 10.100.x.x to the peer,
+//     which by default it doesn't (WARP only routes 100.96.0.0/12). This
+//     branch is effectively a dead path; left in place as a "if you've
+//     configured WARP yourself" escape hatch.
 //
 // Caller must hold a.stateMu (read or write). Internally takes
 // a.workloadRoutesMu for the route-table mutation.

@@ -235,6 +235,7 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(workloads)
 }
+
 // apiCreateWorkload godoc
 // @Summary Deploy a new workload
 // @Description Creates and deploys a new Docker Compose workload with a mesh IP
@@ -417,6 +418,7 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
+
 // apiGetWorkload godoc
 // @Summary Get workload details
 // @Description Returns details for a specific workload by name
@@ -474,7 +476,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 				"revive":        found.Revive,
 				"autostart":     found.Autostart,
 				"allowed_nodes": found.AllowedNodes,
-		"tags":          found.Tags,
+				"tags":          found.Tags,
 				"owner":         ownerInfo,
 				"version":       found.Version,
 				"is_local":      false,
@@ -497,7 +499,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 				"revive":        found.Revive,
 				"autostart":     found.Autostart,
 				"allowed_nodes": found.AllowedNodes,
-		"tags":          found.Tags,
+				"tags":          found.Tags,
 				"owner":         ownerInfo,
 				"version":       found.Version,
 				"is_local":      false,
@@ -543,6 +545,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
+
 // apiUpdateWorkload godoc
 // @Summary Update a workload
 // @Description Updates workload configuration. Some fields require redeploy.
@@ -793,6 +796,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
+
 // getContainerInfo retrieves Docker container details for a workload
 // computeWorkloadStatus returns a richer per-workload status string than
 // the legacy "running" / "stopped" check, by reading every container's
@@ -1002,6 +1006,7 @@ func (a *Agent) getContainerInfo(workloadName string) []map[string]interface{} {
 
 	return containers
 }
+
 // apiDeleteWorkload godoc
 // @Summary Delete a workload
 // @Description Stops and removes a workload from the cluster
@@ -1103,6 +1108,7 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(204)
 }
+
 // apiMoveWorkload godoc
 // @Summary Move workload to another node
 // @Description Migrates a workload to a different node in the cluster
@@ -1328,6 +1334,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"moved": "ok", "to": target.Name})
 }
+
 // apiWorkloadLogs godoc
 // @Summary Get workload logs
 // @Description Returns container logs for a workload
@@ -1385,6 +1392,7 @@ func (a *Agent) apiWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(out))
 }
+
 // apiStartWorkload godoc
 // @Summary Start a stopped workload
 // @Description Starts the containers for a workload that was previously stopped
@@ -1450,6 +1458,7 @@ func (a *Agent) apiStartWorkload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "started", "name": found.Name})
 }
+
 // apiStopWorkload godoc
 // @Summary Stop a running workload
 // @Description Stops the containers for a workload without removing them

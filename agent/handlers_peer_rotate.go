@@ -143,4 +143,3 @@ func (a *Agent) rotateSelfAPIKeyLocal() (string, error) {
 	}
 	return newKey, nil
 }
-
