@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -61,12 +62,11 @@ func hostsField(s string) string {
 // shared with every workload container. That is what makes hostname-based
 // resolution between workloads work without DNS.
 //
-// Quirk: the rewrite is unconditional and runs on every gossip tick.
-// Future optimization: hash the generated block and skip the write if
-// nothing changed.
+// The generated block is hashed and the write skipped when unchanged, so
+// steady-state gossip ticks do not touch the file.
 //
-// Also calls updateWorkloadRoutes at the end so route state stays in sync
-// with the host names we just published.
+// Triggers a route reconcile at the end so routing stays in sync with the
+// names just published.
 func (a *Agent) updateHosts() {
 	// Serialize the whole function: stateMu.RLock below is SHARED, so
 	// concurrent callers (e.g. per-workload bulk-action goroutines) would
@@ -75,8 +75,15 @@ func (a *Agent) updateHosts() {
 	a.hostsMu.Lock()
 	defer a.hostsMu.Unlock()
 
-	a.stateMu.RLock()
-	defer a.stateMu.RUnlock()
+	// Snapshot first, then do the file I/O with stateMu released.
+	//
+	// This used to hold stateMu.RLock across os.ReadFile and os.WriteFile.
+	// A read lock does not block other readers directly, but a writer queuing
+	// behind it does - and Go's RWMutex then excludes every subsequent reader,
+	// including apiKeyMiddleware on the API path. So a slow or hung /etc/hosts
+	// write wedged the control plane the same way route programming did, just
+	// one hop further round. Same invariant: no I/O under a lock.
+	snap := a.snapshotHosts()
 
 	// Read existing hosts
 	data, _ := os.ReadFile(a.hostsFile)
@@ -103,33 +110,13 @@ func (a *Agent) updateHosts() {
 	var jettyLines []string
 	jettyLines = append(jettyLines, "# JETTY START - managed by jetty, do not edit")
 	jettyLines = append(jettyLines, "# Mode: WARP mesh")
-	if a.tunnelDomain != "" {
-		jettyLines = append(jettyLines, fmt.Sprintf("# Tunnel: %s", a.tunnelDomain))
+	if snap.tunnelDomain != "" {
+		jettyLines = append(jettyLines, fmt.Sprintf("# Tunnel: %s", snap.tunnelDomain))
 	}
-
-	// Add self
-	jettyLines = append(jettyLines, fmt.Sprintf("%s\t%s\t# this node", hostsField(a.ip), hostsField(a.hostname)))
-
-	// Add peers
-	for _, p := range a.state.Peers {
-		status := "healthy"
-		if !p.Healthy {
-			status = "unhealthy"
-		}
-		jettyLines = append(jettyLines, fmt.Sprintf("%s\t%s\t# peer (%s)", hostsField(p.IP), hostsField(p.Name), status))
+	for _, e := range snap.entries {
+		jettyLines = append(jettyLines, fmt.Sprintf("%s\t%s\t# %s",
+			hostsField(e.ip), hostsField(e.name), e.note))
 	}
-
-	// Add workloads
-	for _, w := range a.state.Workloads {
-		if w.IP != "" && w.Name != "" {
-			location := "local"
-			if w.Owner != a.hwid {
-				location = "remote"
-			}
-			jettyLines = append(jettyLines, fmt.Sprintf("%s\t%s\t# workload (%s)", hostsField(w.IP), hostsField(w.Name), location))
-		}
-	}
-
 	jettyLines = append(jettyLines, "# JETTY END")
 
 	// Skip the write if the JETTY block hasn't changed since last time. This
@@ -157,28 +144,55 @@ func (a *Agent) updateHosts() {
 	a.triggerRouteReconcile()
 }
 
-// updateWorkloadRoutes reconciles the host's routing table with the desired
-// state of remote workloads.
+// hostsEntry is one line of the managed /etc/hosts block.
+type hostsEntry struct{ ip, name, note string }
+
+// hostsSnapshot is everything the block needs, copied out of cluster state so
+// the file read-modify-write can run with no lock held.
+type hostsSnapshot struct {
+	tunnelDomain string
+	entries      []hostsEntry
+}
+
+// snapshotHosts copies state for the /etc/hosts block. Takes stateMu.RLock
+// briefly - no I/O of any kind in here, which is the whole point.
 //
-// Required state:
-//   - Every healthy peer has a kernel tunnel from us (when tunnelMode is set).
-//     Tunnels are bidirectional in IPIP/GRE: encapsulated traffic arriving at
-//     a peer with no return tunnel is rejected, so we maintain tunnels to all
-//     healthy peers, not just owners of workloads we currently route to.
-//   - Every remote workload has a /32 route pointing at the right transport.
-//   - Stale routes (workload moved owners, peer went unhealthy) are removed.
-//
-// Transport selection (in priority order):
-//  1. IPIP/GRE tunnel (a.tunnelMode == "ipip" | "gre"):
-//     ip route add <wlIP>/32 dev tun_<peerID>
-//  2. Userspace WS tunnel (a.tunDevice != nil): all remote workloads route
-//     to the same TUN device; the TUN reader picks the destination peer
-//     from a.workloadRoutes:
-//     ip route add <wlIP>/32 dev jetty_tun
-//  3. Last resort - direct WARP routing:
-//     ip route add <wlIP>/32 via <peerWARPip> dev CloudflareWARP
-//     This requires WARP to know how to forward 10.100.x.x to the peer,
-//     which by default it doesn't (WARP only routes 100.96.0.0/12). This
-//     branch is effectively a dead path; left in place as a "if you've
-//     configured WARP yourself" escape hatch.
-//
+// Entries are emitted in a stable order (self, then peers by name, then
+// workloads by name). Map iteration order is random in Go, so without this the
+// rendered block differs between runs, the content hash never matches, and the
+// "skip the write if nothing changed" optimisation never fires - rewriting
+// /etc/hosts on every gossip tick.
+func (a *Agent) snapshotHosts() hostsSnapshot {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+
+	snap := hostsSnapshot{tunnelDomain: a.tunnelDomain}
+	snap.entries = append(snap.entries, hostsEntry{ip: a.ip, name: a.hostname, note: "this node"})
+
+	peers := make([]hostsEntry, 0, len(a.state.Peers))
+	for _, p := range a.state.Peers {
+		status := "healthy"
+		if !p.Healthy {
+			status = "unhealthy"
+		}
+		peers = append(peers, hostsEntry{ip: p.IP, name: p.Name, note: "peer (" + status + ")"})
+	}
+	sort.Slice(peers, func(i, j int) bool { return peers[i].name < peers[j].name })
+
+	workloads := make([]hostsEntry, 0, len(a.state.Workloads))
+	for _, w := range a.state.Workloads {
+		if w.IP == "" || w.Name == "" {
+			continue
+		}
+		location := "local"
+		if w.Owner != a.hwid {
+			location = "remote"
+		}
+		workloads = append(workloads, hostsEntry{ip: w.IP, name: w.Name, note: "workload (" + location + ")"})
+	}
+	sort.Slice(workloads, func(i, j int) bool { return workloads[i].name < workloads[j].name })
+
+	snap.entries = append(snap.entries, peers...)
+	snap.entries = append(snap.entries, workloads...)
+	return snap
+}

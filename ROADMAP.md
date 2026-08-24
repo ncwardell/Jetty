@@ -167,6 +167,20 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       alongside a high goroutine count means wedged rather than busy, and it
       says so in a `diagnosis` field.
 
+- [x] **`updateHosts` no longer holds a lock across file I/O.** Same shape as
+      the route deadlock, one hop further round: it held `stateMu.RLock()`
+      across `os.ReadFile`/`os.WriteFile` from 16 call sites. A read lock does
+      not block readers directly, but a writer queuing behind it does, and
+      Go's RWMutex then excludes every subsequent reader. Now snapshots, then
+      does the I/O with nothing held.
+
+      Fixing it exposed a live bug: the block was built by ranging over maps,
+      and Go randomises map iteration order — so the rendered block differed
+      on every call, its hash never matched, and the "skip the write if
+      nothing changed" optimisation **never fired**. `/etc/hosts` was being
+      rewritten on every gossip tick. Entries are now emitted in a stable
+      order and the optimisation actually works.
+
 - [ ] **Audit the remaining ~100 unbounded `exec.Command` sites.** The route
       path is bounded now, but `deploy.go`, `handlers_nodes.go` and others
       still fork with no deadline. Lower severity now that the worst of them
