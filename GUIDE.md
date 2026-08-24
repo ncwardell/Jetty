@@ -550,9 +550,17 @@ Imports also tell you which `${VAR_NAME}` references the compose YAML carries (`
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `GET /api/tunnel` | GET | Tunnel status |
-| `POST /api/tunnel` | POST | Set tunnel token |
-| `DELETE /api/tunnel` | DELETE | Remove tunnel |
+| `GET /api/tunnel` | GET | Tunnel status (`configured` is cluster-wide; `enabled`/`running` are node-local) |
+| `POST /api/tunnel` | POST | Set the token (`?scope=cluster`) or re-attach this node (`?scope=node`, default) |
+| `DELETE /api/tunnel` | DELETE | Detach this node (`?scope=node`, default) or remove the token cluster-wide (`?scope=cluster`) |
+
+Both mutating endpoints accept `?node=<id|name>` to target a peer.
+
+**Why the default is node-scoped:** every node running a connector on the same
+Cloudflare tunnel means Cloudflare load-balances public traffic across all of
+them. If one node can't reach a workload, that share of requests stalls. Use
+`?scope=node` to pull that node out of the rotation — `?scope=cluster` tears
+down every connector and takes public traffic down until a token is set again.
 
 ### Backup / Restore (admin-only)
 

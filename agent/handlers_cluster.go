@@ -450,7 +450,15 @@ func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
 			a.stopCloudflared()
 			log.Printf("Cloudflare tunnel removed via sync")
 		} else {
-			if err := a.restartCloudflared(); err != nil {
+			a.stateMu.RLock()
+			disabled := a.state.CFTunnelDisabled
+			a.stateMu.RUnlock()
+			if disabled {
+				// The token is cluster state and we accept it, but a node
+				// that opted out stays out. startCloudflared enforces this
+				// too; short-circuiting here keeps the log honest.
+				log.Printf("Cloudflare tunnel token synced but this node is disabled; not starting")
+			} else if err := a.restartCloudflared(); err != nil {
 				log.Printf("Failed to start tunnel after sync: %v", err)
 			} else {
 				log.Printf("Cloudflare tunnel started via sync")
