@@ -20,9 +20,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 'stable' rather than go-version-file: go.mod. The go directive is a
+      # minimum (1.25.0), and building against it would ship known-patched
+      # stdlib CVEs -- govulncheck below flags 27 of them on 1.25.2 alone.
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: stable
           cache: true
 
       - name: gofmt
@@ -66,7 +69,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: stable
           cache: true
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
