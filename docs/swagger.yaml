@@ -753,7 +753,7 @@ info:
     url: https://opensource.org/licenses/MIT
   termsOfService: http://swagger.io/terms/
   title: Jetty API
-  version: "2.0"
+  version: 0.0.x
 paths:
   /admin-key/rotate:
     post:
