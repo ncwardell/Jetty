@@ -179,7 +179,7 @@ func (a *Agent) tunnelModeHealthCheck() {
 	// Update routes if any peer health status changed
 	// This ensures routes to unhealthy peers are removed immediately
 	if healthChanged {
-		a.updateWorkloadRoutes()
+		a.triggerRouteReconcile()
 	}
 	a.stateMu.Unlock()
 }

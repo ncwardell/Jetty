@@ -369,7 +369,7 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	if ipChanged {
 		logInfof("Peer %s IP changed: %s -> %s", req.Peer.Name, oldIP, req.Peer.IP)
 		a.stateMu.Lock()
-		a.updateWorkloadRoutes()
+		a.triggerRouteReconcile()
 		a.stateMu.Unlock()
 	}
 

@@ -138,7 +138,7 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 	a.removePeerTunnel(target.ID)
 
 	a.stateMu.Lock()
-	a.updateWorkloadRoutes()
+	a.triggerRouteReconcile()
 	a.stateMu.Unlock()
 
 	a.updateHosts()
