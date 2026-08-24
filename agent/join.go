@@ -151,9 +151,15 @@ func (a *Agent) joinCluster() error {
 	// (JETTY_WARP_CONNECTOR_TOKEN). The shared token remains a fallback
 	// for clusters that predate per-node provisioning.
 	if result.WarpToken != "" && a.state.WarpToken == "" {
-		logInfof("WARP token: adopting cluster-shared token from join response. " +
-			"Prefer a per-node token (JETTY_WARP_CONNECTOR_TOKEN) - shared tokens " +
-			"make Cloudflare Mesh treat nodes as replicas of one identity.")
+		// Warn, not info. This node will join, gossip, run workloads and
+		// report healthy while Cloudflare Mesh treats it as a passive
+		// replica of an identity another machine already owns - and passive
+		// replicas drop all traffic. A silent degradation that presents as
+		// success is exactly what a warning level is for.
+		logWarnf("WARP token: no per-node token set, adopting the cluster-shared token. " +
+			"Cloudflare Mesh registers shared-token nodes as active-passive replicas of ONE " +
+			"identity and passive replicas DROP ALL TRAFFIC. Set JETTY_WARP_CONNECTOR_TOKEN " +
+			"to a per-node token (Zero Trust > Networking > Mesh > Add a node) and restart.")
 		a.state.WarpToken = result.WarpToken
 	}
 	ownWarpToken := a.state.WarpToken
