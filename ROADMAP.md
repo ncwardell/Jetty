@@ -137,37 +137,29 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       the node is confirmed unreachable. Today the teardown happens first,
       unconditionally.
 
-- [ ] **🔴 The generated join command silently produces a degraded node.**
-      The Cloudflare Mesh migration broke the one-paste join and the UI never
-      caught up.
+- [x] **Join no longer silently provisions a blackhole node.** The Cloudflare
+      Mesh migration broke the generated join command and nothing noticed:
+      `buildJoinDockerRun` emitted `JETTY_JOIN` and `JETTY_JOIN_TOKEN` only,
+      and `WARP_CONNECTOR` appeared zero times in the whole dashboard. Every
+      node created that way took the shared-token fallback, and Mesh registers
+      shared-token nodes as active-passive replicas of one identity — the
+      passive ones drop all traffic while joining cleanly, gossiping, running
+      workloads and showing green.
 
-      `buildJoinDockerRun` (`web-ui/index.html`) emits `JETTY_JOIN` and
-      `JETTY_JOIN_TOKEN` only. It never emits `JETTY_WARP_CONNECTOR_TOKEN`,
-      the create-token modal has no field for one, and the string
-      `WARP_CONNECTOR` appears **zero times** in the entire dashboard.
+      Fixed: a per-node Mesh token field in the create-token modal wired into
+      the generated command, a warning on the token-result screen when it is
+      left blank, the shared-token fallback raised from `logInfof` to
+      `logWarnf`, and the README's "That's it" claim removed — the WARP token
+      handed out at join is the shared one, which was the problem.
 
-      So a joiner takes the fallback at `join.go:153` and adopts the
-      cluster-shared WARP token. Cloudflare Mesh registers nodes sharing a
-      token as active-passive replicas of **one** identity, and passive
-      replicas **drop all traffic**. The node joins Jetty fine — gossip,
-      state, workloads all work — while its mesh networking is dead.
-
-      The only signal is a `logInfof` on the joining node, which an operator
-      pasting a `docker run` will never read. That should be `logWarnf` at
-      minimum; it describes a silent degradation, not an informational event.
-
-      Jetty cannot mint the per-node token itself — it comes from Zero Trust →
-      Networking → Mesh → Add a node. Two ways to fix:
-      1. **Cheap and honest:** add a "per-node WARP token" field to the
-         create-token modal, include it in the generated command, and warn
-         visibly when it is left blank. Still two steps for the operator, but
-         nothing is silent.
-      2. **Actually one paste:** call the Cloudflare API to mint a Mesh node
-         token at token-generation time. Restores the original property but
-         adds a Cloudflare API credential and scope requirement — which cuts
-         against "Cloudflare is a provider, not an assumption".
-
-      Do (1) now regardless; (2) is a separate decision.
+- [ ] **Restore true one-paste join (optional).** The above makes the failure
+      loud, not absent: provisioning a node is still two steps, because Jetty
+      cannot mint a Mesh token — it identifies a specific machine and comes
+      from the Cloudflare dashboard. Calling the Cloudflare API at
+      token-generation time would restore the original property, at the cost
+      of a stored Cloudflare API credential with Mesh scope. That cuts against
+      "Cloudflare is a provider, not an assumption", so it is a deliberate
+      decision rather than an obvious win.
 
 - [x] **Per-node tunnel control.** `?scope=node` (default) vs `?scope=cluster`,
       plus `?node=<id|name>` targeting. `CFTunnelDisabled` is node-local and
