@@ -15,3 +15,6 @@ hetzner
 
 # OS
 .DS_Store
+
+# Claude Code writes transient settings files here
+.claude/settings.local.json.tmp*
