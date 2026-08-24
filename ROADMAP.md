@@ -71,7 +71,7 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       fix. Still needs: a sustained CIFS transfer, and a public request
       latency distribution with both nodes as Cloudflare tunnel connectors.
       This is the gate before production.
-- [ ] **Migrate the tunnel *receive* path to gVisor netstack.** Deletes the
+- [x] **Tunnel receive path now runs on gVisor netstack.** Deletes the
       hand-rolled TCP and its whole bug class — retransmission, RTO, congestion
       control, window probes — replacing it with a real, tested stack.
 
@@ -95,8 +95,13 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       container stacks), not protocol code. Keep the local-workload-only
       destination check before injecting.
 
-      Ship behind `JETTY_TUNNEL_STACK=netstack|legacy` so there is an instant
-      rollback that does not need a different binary.
+      Shipped behind `JETTY_TUNNEL_STACK`, defaulting to `netstack`; set it to
+      `legacy` to roll back without a different binary. Tested by joining two
+      netstacks over an in-memory wire, so a real handshake and an 8MB
+      transfer run through the actual receive path (~0.12s). Binary 29M -> 33M.
+
+      NOT yet verified against real hardware, real workloads, or a real
+      WebSocket - see "Verify under load" above, which is still the gate.
 
 ### 1b. Correctness
 
