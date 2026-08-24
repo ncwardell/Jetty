@@ -71,11 +71,71 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       fix. Still needs: a sustained CIFS transfer, and a public request
       latency distribution with both nodes as Cloudflare tunnel connectors.
       This is the gate before production.
-- [ ] **Migrate to gVisor netstack.** Deletes ~600 lines of hand-rolled TCP,
-      the whole bug class, the TUN device, and the `NET_ADMIN` requirement.
-      `tunnel.go` is currently 1,069 lines of raw packet parsing at 0% coverage.
+- [ ] **Migrate the tunnel *receive* path to gVisor netstack.** Deletes the
+      hand-rolled TCP and its whole bug class — retransmission, RTO, congestion
+      control, window probes — replacing it with a real, tested stack.
+
+      Correcting an earlier overstatement: this does **not** remove the TUN
+      device or the `NET_ADMIN` requirement. Those belong to the *send* path,
+      where `tunReadLoop` captures kernel-routed packets off `jetty_tun`; that
+      side is a pure packet forwarder with no TCP logic and is fine as-is. The
+      hand-rolled TCP only ever existed on the receive side, which is exactly
+      what netstack replaces.
+
+      Feasibility confirmed: `gvisor.dev/gvisor@v0.0.0-20250428193742-2d800c3129d5`
+      builds and runs on amd64 and cross-compiles to arm64 (~6MB). Pin that
+      revision — tip has an upstream package conflict in `pkg/tcpip/stack`.
+      The API surface needed (channel endpoint, `tcp.NewForwarder`,
+      `udp.NewForwarder`, `gonet` adapters, `InjectInbound`/`ReadContext`)
+      compiles against it.
+
+      Preserve `getWorkloadContainerTargetForPort` — the mesh-IP:port →
+      container-IP:port translation is real domain logic (asymmetric
+      publications like `8222:80`, per-port container matching in multi-
+      container stacks), not protocol code. Keep the local-workload-only
+      destination check before injecting.
+
+      Ship behind `JETTY_TUNNEL_STACK=netstack|legacy` so there is an instant
+      rollback that does not need a different binary.
 
 ### 1b. Correctness
+
+- [ ] **🔴 Node removal is broken and cannot stick. Caused a production
+      outage.** `DELETE /api/nodes/{id}` removes a peer from *everyone else's*
+      view and never tells the node itself. The removed node keeps running,
+      stays on WARP, and stays an active memberlist member — so
+      `NotifyJoin` (`memberlist.go:34`) and `apiPeerAnnounce`
+      (`handlers_cluster.go:341`) both re-add it within one gossip round.
+      There is no peer tombstone anywhere to stop them.
+
+      Meanwhile the removal has already done destructive work on the way out:
+      `removePeerTunnel` tears down the IPIP tunnel, `updateWorkloadRoutes`
+      rewrites the route table, `updateHosts` rewrites `/etc/hosts` — then the
+      node returns and it is all rebuilt. That flap is what bricked the
+      cluster.
+
+      Worse: in the window where the peer is absent from state, its workloads
+      have an owner that is not in `Peers`, so they look orphaned and
+      `checkFailover` claims them — while the removed node is still running
+      them. **One click double-runs a workload.** The claim-settle does not
+      help; the removed node never finds out it is contesting anything.
+
+      The fix has three parts:
+      1. **Peer tombstones** — `RemovedPeers` in cluster state, gossiped and
+         version-merged like workload tombstones, so `NotifyJoin`,
+         `peer-announce` and `sync` all refuse to resurrect a removed node.
+         GC them, but on a much longer horizon than workload tombstones — a
+         node can legitimately be powered off for weeks.
+      2. **Cooperative leave** — tell the target it has been removed so it
+         calls `memberlist.Leave()`, stops gossiping, and stops the workloads
+         it no longer owns. Memberlist has no forcible eviction: the node has
+         to leave itself, so removal is a conversation, not a unilateral write.
+      3. **Key revocation** — invalidate its `APIKey` so it cannot rejoin
+         without a fresh join token.
+
+      Also: do not tear down tunnels/routes until the leave is acknowledged or
+      the node is confirmed unreachable. Today the teardown happens first,
+      unconditionally.
 
 - [x] **Per-node tunnel control.** `?scope=node` (default) vs `?scope=cluster`,
       plus `?node=<id|name>` targeting. `CFTunnelDisabled` is node-local and
