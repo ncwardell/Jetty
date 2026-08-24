@@ -51,14 +51,17 @@ jobs:
         run: |
           go tool cover -func=coverage.out | tail -1 | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Dashboard embed is in sync
-        # agent/dashboard.html is a go:generate copy of web-ui/index.html.
-        # Nothing enforces it at build time, so a dirty tree can ship a stale
-        # dashboard. Catch the drift here until the two files are collapsed
-        # into one (see ROADMAP.md, Phase 3).
+      - name: Generated files are current
+        # Two generators: agent/dashboard.html is a copy of web-ui/index.html,
+        # and docs/ is the OpenAPI spec built from the @Router annotations.
+        # Neither runs during a normal build, so a dirty tree can ship a stale
+        # dashboard or a spec that lies about the API. Regenerate and fail on
+        # any diff. Both generators are deterministic, so a clean tree stays
+        # clean.
         run: |
-          if ! diff -q web-ui/index.html agent/dashboard.html; then
-            echo "::error::agent/dashboard.html is out of sync with web-ui/index.html. Run: go generate ./..."
+          go generate ./...
+          if ! git diff --exit-code --stat; then
+            echo "::error::Generated files are stale. Run: go generate ./..."
             exit 1
           fi
 

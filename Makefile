@@ -3,7 +3,7 @@
 
 GO ?= go
 
-.PHONY: help fmt fmt-check vet build test test-race cover generate docs check clean
+.PHONY: help fmt fmt-check vet build test test-race cover generate generate-check check clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -33,8 +33,12 @@ cover: ## Run tests and report total coverage
 	$(GO) test -coverprofile=coverage.out -covermode=atomic ./...
 	$(GO) tool cover -func=coverage.out | tail -1
 
-generate: ## Sync the embedded dashboard from web-ui/
+generate: ## Regenerate the embedded dashboard and the OpenAPI spec
 	$(GO) generate ./...
+
+generate-check: ## Fail if generated files are stale
+	$(GO) generate ./...
+	@git diff --exit-code --stat || { echo "generated files are stale; commit the result of 'make generate'"; exit 1; }
 
 check: fmt-check vet build test-race ## Everything CI runs
 

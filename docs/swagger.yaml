@@ -80,6 +80,24 @@ definitions:
         example: H8mC...43-char-base64...
         type: string
     type: object
+  agent.DeletedEnvKey:
+    properties:
+      key:
+        description: The name of the deleted env key
+        type: string
+      version:
+        description: Timestamp when deleted
+        type: integer
+    type: object
+  agent.DeletedWorkload:
+    properties:
+      ip:
+        description: The IP of the deleted workload
+        type: string
+      version:
+        description: Timestamp when deleted (must be > workload version to take effect)
+        type: integer
+    type: object
   agent.EnvGetResponse:
     properties:
       key:
@@ -572,6 +590,25 @@ definitions:
           $ref: '#/definitions/agent.Workload'
         type: array
     type: object
+  agent.SyncResponse:
+    properties:
+      deleted_env_keys:
+        items:
+          $ref: '#/definitions/agent.DeletedEnvKey'
+        type: array
+      deleted_workloads:
+        items:
+          $ref: '#/definitions/agent.DeletedWorkload'
+        type: array
+      env_data:
+        additionalProperties:
+          type: string
+        type: object
+      workloads:
+        items:
+          $ref: '#/definitions/agent.Workload'
+        type: array
+    type: object
   agent.TunnelRequest:
     properties:
       token:
@@ -692,7 +729,6 @@ definitions:
         example: true
         type: boolean
     type: object
-host: localhost:6880
 info:
   contact:
     name: Jetty Support
@@ -912,6 +948,29 @@ paths:
       summary: Health check
       tags:
       - cluster
+  /heartbeat:
+    post:
+      consumes:
+      - application/json
+      description: Node-to-node liveness used in tunnel mode, where peers cannot reach
+        each other directly over WARP. Refreshes the sender's LastSeen. Peer API key
+        required.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Invalid request
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Peer liveness ping (internal)
+      tags:
+      - internal
   /host/compose:
     get:
       description: Returns containers grouped by compose project. Standalone containers
@@ -1116,6 +1175,29 @@ paths:
       summary: Update a node (self-update)
       tags:
       - nodes
+  /peer-announce:
+    post:
+      consumes:
+      - application/json
+      description: Node-to-node. A peer reports its identity, WARP IP, version and
+        architecture so the receiver can add or refresh it in the peer table. Peer
+        API key required.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Invalid request
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Announce a peer's current address and state (internal)
+      tags:
+      - internal
   /peers/{id}/rotate-key:
     post:
       description: Admin-only. Forces the named peer to regenerate its outbound peer
@@ -1146,6 +1228,37 @@ paths:
       summary: Rotate a peer's SelfAPIKey
       tags:
       - admin
+  /proxy/{ip}/{path}:
+    get:
+      description: Forwards to a workload by its mesh IP, so a workload's own HTTP
+        endpoint is reachable through the cluster API without exposing it publicly.
+        Local workloads are dialled directly; remote ones go over the mesh. Cluster
+        credentials are stripped before forwarding so a workload never sees the caller's
+        API key. HTTP only - WebSocket upgrades are not proxied.
+      parameters:
+      - description: Workload mesh IP, e.g. 10.100.0.50
+        in: path
+        name: ip
+        required: true
+        type: string
+      - description: Path on the workload
+        in: path
+        name: path
+        type: string
+      responses:
+        "200":
+          description: Response from the workload, passed through
+        "404":
+          description: No workload with that mesh IP
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "502":
+          description: Workload unreachable
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Proxy an HTTP request to a workload
+      tags:
+      - workloads
   /restore:
     post:
       consumes:
@@ -1183,6 +1296,21 @@ paths:
       summary: Get cluster status
       tags:
       - cluster
+  /sync:
+    get:
+      description: Node-to-node pull used as the backstop when memberlist gossip is
+        unavailable. Returns every workload, deletion tombstone, env value and env
+        tombstone so a peer can merge by highest-version-wins. Peer API key required.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.SyncResponse'
+      summary: Full replicated state dump (internal)
+      tags:
+      - internal
   /tokens:
     get:
       description: Returns pending and recently-burned tokens. Pending token IDs are
@@ -1253,15 +1381,43 @@ paths:
       - tokens
   /tunnel:
     delete:
-      description: Removes the Cloudflare tunnel configuration
+      description: Default scope=node stops this node's cloudflared connector and
+        leaves the cluster token and every other node untouched - use this to pull
+        one node out of Cloudflare's load-balancing rotation. scope=cluster clears
+        the token everywhere and stops every connector, taking public traffic down
+        until a token is set again.
+      parameters:
+      - description: node (default) or cluster
+        in: query
+        name: scope
+        type: string
+      - description: Target node id or name
+        in: query
+        name: node
+        type: string
+      produces:
+      - application/json
       responses:
-        "204":
-          description: Tunnel removed
-      summary: Remove tunnel
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.TunnelStatus'
+        "400":
+          description: Invalid scope
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Detach a node from the tunnel, or remove it cluster-wide
       tags:
       - tunnel
     get:
-      description: Returns Cloudflare tunnel configuration status
+      description: Returns Cloudflare tunnel status. "configured" is cluster-wide
+        (a token is set); "enabled" and "running" are local to this node. Pass ?node=<id|name>
+        to query a peer.
+      parameters:
+      - description: Target node id or name
+        in: query
+        name: node
+        type: string
       produces:
       - application/json
       responses:
@@ -1275,24 +1431,85 @@ paths:
     post:
       consumes:
       - application/json
-      description: Sets the Cloudflare tunnel token (propagates to all nodes)
+      description: With scope=cluster (or a body containing a token), sets the Cloudflare
+        tunnel token and propagates it to all nodes. With the default scope=node and
+        no token, re-attaches this node to the existing cluster token after a scope=node
+        delete.
       parameters:
-      - description: Tunnel token
+      - description: node (default) or cluster
+        in: query
+        name: scope
+        type: string
+      - description: Target node id or name
+        in: query
+        name: node
+        type: string
+      - description: Tunnel token (required for scope=cluster)
+        in: body
+        name: token
+        schema:
+          $ref: '#/definitions/agent.TunnelRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/agent.TunnelStatus'
+        "400":
+          description: Invalid request
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Configure tunnel or re-enable this node
+      tags:
+      - tunnel
+  /tunnel/sync:
+    post:
+      consumes:
+      - application/json
+      description: Node-to-node. Accepts the cluster CFToken from a peer and starts
+        or stops cloudflared to match. A node that has opted out via DELETE /tunnel?scope=node
+        accepts the token but stays stopped. Peer API key required.
+      parameters:
+      - description: Cluster tunnel token; empty string tears the tunnel down
         in: body
         name: token
         required: true
         schema:
           $ref: '#/definitions/agent.TunnelRequest'
+      produces:
+      - application/json
       responses:
         "200":
-          description: Tunnel configured
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
         "400":
           description: Invalid request
           schema:
             $ref: '#/definitions/agent.ErrorResponse'
-      summary: Configure tunnel
+      summary: Receive a tunnel token broadcast (internal)
       tags:
-      - tunnel
+      - internal
+  /tunnel/ws:
+    get:
+      description: Node-to-node WebSocket carrying raw IPv4 packets, used when kernel
+        IPIP/GRE tunnels are unavailable (ChromeOS, unprivileged containers). Each
+        binary frame is one packet; the receiver proxies it to a local workload and
+        returns the response over the same socket. Packets addressed to anything other
+        than a local workload are rejected. Peer API key required in X-API-Key.
+      responses:
+        "101":
+          description: Switching Protocols
+        "401":
+          description: Missing or invalid API key
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Userspace packet tunnel (internal, WebSocket)
+      tags:
+      - internal
   /workloads:
     get:
       description: Returns all workloads in the cluster, optionally filtered by node

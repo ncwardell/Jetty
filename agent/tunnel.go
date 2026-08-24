@@ -267,6 +267,13 @@ var wsUpgrader = websocket.Upgrader{
 //
 // This uses a PROXY model: packets are forwarded to workloads via raw sockets,
 // and responses are captured and sent back through the same WebSocket connection.
+// apiTunnelWs godoc
+// @Summary Userspace packet tunnel (internal, WebSocket)
+// @Description Node-to-node WebSocket carrying raw IPv4 packets, used when kernel IPIP/GRE tunnels are unavailable (ChromeOS, unprivileged containers). Each binary frame is one packet; the receiver proxies it to a local workload and returns the response over the same socket. Packets addressed to anything other than a local workload are rejected. Peer API key required in X-API-Key.
+// @Tags internal
+// @Success 101 "Switching Protocols"
+// @Failure 401 {object} ErrorResponse "Missing or invalid API key"
+// @Router /tunnel/ws [get]
 func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 	// The tunnel endpoint accepts arbitrary IPv4 packets and proxies them to local
 	// services. With --net host that is anything reachable from the host, so this

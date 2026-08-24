@@ -1644,7 +1644,17 @@ func (a *Agent) apiPrePullWorkload(w http.ResponseWriter, r *http.Request) {
 	writeJSONStatus(w, http.StatusAccepted, map[string]string{"status": "scheduled", "name": name})
 }
 
-// apiWorkloadProxy proxies HTTP requests to workloads.
+// apiWorkloadProxy godoc
+// @Summary Proxy an HTTP request to a workload
+// @Description Forwards to a workload by its mesh IP, so a workload's own HTTP endpoint is reachable through the cluster API without exposing it publicly. Local workloads are dialled directly; remote ones go over the mesh. Cluster credentials are stripped before forwarding so a workload never sees the caller's API key. HTTP only - WebSocket upgrades are not proxied.
+// @Tags workloads
+// @Param ip path string true "Workload mesh IP, e.g. 10.100.0.50"
+// @Param path path string false "Path on the workload"
+// @Success 200 "Response from the workload, passed through"
+// @Failure 404 {object} ErrorResponse "No workload with that mesh IP"
+// @Failure 502 {object} ErrorResponse "Workload unreachable"
+// @Router /proxy/{ip}/{path} [get]
+//
 // URL format: /api/proxy/{mesh_ip}/{path...}
 // If the workload is local, forwards to the container directly.
 // If remote, forwards through the tunnel or mesh IP.
