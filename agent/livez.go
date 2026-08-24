@@ -61,6 +61,8 @@ func (a *Agent) apiLivez(w http.ResponseWriter, r *http.Request) {
 		"uptime_seconds":        int(time.Since(a.startTime).Seconds()),
 		"goroutines":            goroutines,
 		"state_lock_acquirable": acquirable,
+		"log_level":             CurrentLogLevel(),
+		"tunnel_stack":          a.activeTunnelStack(),
 	}
 
 	// Say what it means, so an operator does not have to know the internals

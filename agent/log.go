@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,7 +32,32 @@ import (
 // a single format, and one configurable logger are the parts that pay off
 // immediately; attributes can be promoted message by message afterwards.
 
-var levelVar = new(slog.LevelVar)
+var (
+	levelVar = new(slog.LevelVar)
+
+	// The handler is rebuilt when the level changes at runtime, because
+	// AddSource is decided at construction - so remember what it was built
+	// with. Guarded by logMu.
+	logMu     sync.Mutex
+	logFormat           = "text"
+	logOutput io.Writer = os.Stderr
+)
+
+// SetLogLevel changes the level of an already-running agent and reports the
+// level actually applied.
+//
+// Restarting a node to turn on debug logging destroys the state you restarted
+// it to look at, which makes it useless for the failures worth debugging. The
+// handler is rebuilt rather than only the level swapped so that debug also
+// gets source positions, exactly as it would have at startup.
+func SetLogLevel(name string) slog.Level {
+	logMu.Lock()
+	defer logMu.Unlock()
+	return initLogging(name, logFormat, logOutput)
+}
+
+// CurrentLogLevel reports the level in force.
+func CurrentLogLevel() string { return levelVar.Level().String() }
 
 // InitLogging configures process-wide logging from the environment. Call it
 // first thing in main, before anything else has a chance to log.
@@ -47,6 +73,7 @@ func InitLogging() {
 func initLogging(levelName, format string, out io.Writer) slog.Level {
 	level := parseLogLevel(levelName)
 	levelVar.Set(level)
+	logFormat, logOutput = format, out
 
 	opts := &slog.HandlerOptions{
 		Level: levelVar,
@@ -76,11 +103,19 @@ func initLogging(levelName, format string, out io.Writer) slog.Level {
 	return level
 }
 
+// normalizeLogLevel canonicalises a level name. Shared so the parser and the
+// API validator cannot disagree about what is valid.
+func normalizeLogLevel(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
 // parseLogLevel maps a name to a level, defaulting to info. An unrecognised
 // value falls back rather than failing startup - a typo in an env var should
-// not stop a node from booting.
+// not stop a node booting. The API validator rejects instead of falling back,
+// because someone typing a level into an endpoint deserves to be told they got
+// it wrong; see isKnownLogLevel.
 func parseLogLevel(name string) slog.Level {
-	switch strings.ToLower(strings.TrimSpace(name)) {
+	switch normalizeLogLevel(name) {
 	case "debug":
 		return slog.LevelDebug
 	case "warn", "warning":
