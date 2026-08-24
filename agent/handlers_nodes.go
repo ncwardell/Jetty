@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -129,7 +128,7 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 	a.saveState()
 	a.broadcastState()
 
-	log.Printf("Removed node: %s (%s), orphaned workloads: %v", found.Name, found.ID, orphanedWorkloads)
+	logInfof("Removed node: %s (%s), orphaned workloads: %v", found.Name, found.ID, orphanedWorkloads)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -235,32 +234,32 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Self-update: pull image and restart
-	log.Printf("Starting self-update to image: %s", req.Image)
+	logInfof("Starting self-update to image: %s", req.Image)
 
 	// Step 1: Pull the new image
 	pullCmd := exec.Command("docker", "pull", req.Image)
 	pullOutput, err := pullCmd.CombinedOutput()
 	if err != nil {
-		log.Printf("Failed to pull image %s: %v\nOutput: %s", req.Image, err, pullOutput)
+		logErrorf("Failed to pull image %s: %v\nOutput: %s", req.Image, err, pullOutput)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to pull image: %v", err))
 		return
 	}
-	log.Printf("Pulled image: %s", req.Image)
+	logInfof("Pulled image: %s", req.Image)
 
 	// Step 2: Get our container ID
 	containerID, err := a.getSelfContainerID()
 	if err != nil {
-		log.Printf("Failed to get own container ID: %v", err)
+		logErrorf("Failed to get own container ID: %v", err)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get container ID: %v", err))
 		return
 	}
-	log.Printf("Self container ID: %s", containerID)
+	logInfof("Self container ID: %s", containerID)
 
 	// Step 3: Inspect self to get mounts and config
 	inspectCmd := exec.Command("docker", "inspect", containerID)
 	inspectOutput, err := inspectCmd.Output()
 	if err != nil {
-		log.Printf("Failed to inspect container: %v", err)
+		logErrorf("Failed to inspect container: %v", err)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to inspect container: %v", err))
 		return
 	}
@@ -279,7 +278,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"Name"`
 	}
 	if err := json.Unmarshal(inspectOutput, &containers); err != nil {
-		log.Printf("Failed to parse inspect output: %v", err)
+		logErrorf("Failed to parse inspect output: %v", err)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to parse container config: %v", err))
 		return
 	}
@@ -368,7 +367,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	// -e arg that aborts docker create halfway through.
 	for k, v := range req.Env {
 		if k == "" || strings.ContainsAny(k, "=\x00") || strings.ContainsAny(v, "\x00") {
-			log.Printf("Update: skipping malformed env entry %q", k)
+			logInfof("Update: skipping malformed env entry %q", k)
 			continue
 		}
 		args = append(args, "-e", k+"="+v)
@@ -402,7 +401,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	// Add the image
 	args = append(args, req.Image)
 
-	log.Printf("Creating new container with: docker %v", args)
+	logInfof("Creating new container with: docker %v", args)
 
 	// Step 5: Create new container (but don't start it yet - avoids port conflict)
 	// Change "run" to "create" so we can control when it starts
@@ -418,12 +417,12 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	createCmd := exec.Command("docker", newArgs...)
 	createOutput, err := createCmd.CombinedOutput()
 	if err != nil {
-		log.Printf("Failed to create new container: %v\nOutput: %s", err, createOutput)
+		logErrorf("Failed to create new container: %v\nOutput: %s", err, createOutput)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to create new container: %v", err))
 		return
 	}
 	newContainerID := strings.TrimSpace(string(createOutput))
-	log.Printf("Created new container (not started): %s", newContainerID)
+	logInfof("Created new container (not started): %s", newContainerID)
 
 	// Respond before stopping self - the actual switch happens in the goroutine
 	w.Header().Set("Content-Type", "application/json")
@@ -443,17 +442,17 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(500 * time.Millisecond) // Give time for response to be sent
 
 		// Rename old container first (while it's still running)
-		log.Printf("Renaming old container %s to %s-old", containerName, containerName)
+		logInfof("Renaming old container %s to %s-old", containerName, containerName)
 		renameOldCmd := exec.Command("docker", "rename", containerName, containerName+"-old")
 		if out, err := renameOldCmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to rename old container: %v, output: %s", err, out)
+			logWarnf("failed to rename old container: %v, output: %s", err, out)
 		}
 
 		// Rename new container to original name (while it's stopped)
-		log.Printf("Renaming new container to %s", containerName)
+		logInfof("Renaming new container to %s", containerName)
 		renameNewCmd := exec.Command("docker", "rename", containerName+"-update", containerName)
 		if out, err := renameNewCmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to rename new container: %v, output: %s", err, out)
+			logWarnf("failed to rename new container: %v, output: %s", err, out)
 		}
 
 		// Spawn a helper container to do the actual stop/start sequence
@@ -464,37 +463,37 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 			"sleep 1 && docker stop -t 5 %s && docker start %s && docker rm %s",
 			containerID, newContainerID, containerID)
 
-		log.Printf("Spawning helper container to orchestrate restart")
+		logInfof("Spawning helper container to orchestrate restart")
 		helperCmd := exec.Command("docker", "run", "--rm", "-d",
 			"--entrypoint", "sh",
 			"-v", "/var/run/docker.sock:/var/run/docker.sock",
 			req.Image, "-c", restartScript)
 
 		if out, err := helperCmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to spawn helper container: %v, output: %s", err, out)
+			logWarnf("failed to spawn helper container: %v, output: %s", err, out)
 			// Fallback: try docker:cli image (smaller, commonly available)
-			log.Printf("Trying docker:cli as fallback helper...")
+			logInfof("Trying docker:cli as fallback helper...")
 			helperCmd = exec.Command("docker", "run", "--rm", "-d",
 				"-v", "/var/run/docker.sock:/var/run/docker.sock",
 				"docker:cli", "sh", "-c", restartScript)
 			if out, err := helperCmd.CombinedOutput(); err != nil {
-				log.Printf("Warning: docker:cli also failed: %v, output: %s", err, out)
-				log.Printf("Falling back to direct restart (may fail)")
+				logWarnf("docker:cli also failed: %v, output: %s", err, out)
+				logInfof("Falling back to direct restart (may fail)")
 
 				// Last resort: non-blocking commands
-				log.Printf("Stopping old container %s", containerID)
+				logInfof("Stopping old container %s", containerID)
 				stopCmd := exec.Command("docker", "stop", "-t", "5", containerID)
 				stopCmd.Start() // Non-blocking - don't wait
 
 				time.Sleep(100 * time.Millisecond)
-				log.Printf("Starting new container %s", newContainerID)
+				logInfof("Starting new container %s", newContainerID)
 				startCmd := exec.Command("docker", "start", newContainerID)
 				startCmd.Start() // Non-blocking
 			} else {
-				log.Printf("Helper container (docker:cli) spawned successfully, exiting...")
+				logInfof("Helper container (docker:cli) spawned successfully, exiting...")
 			}
 		} else {
-			log.Printf("Helper container spawned successfully, exiting...")
+			logInfof("Helper container spawned successfully, exiting...")
 		}
 
 		// Give commands time to be sent to Docker daemon before we exit

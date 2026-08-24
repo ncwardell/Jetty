@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -183,7 +182,7 @@ func (a *Agent) attachPTYToWS(conn *websocket.Conn, cmd *exec.Cmd) {
 			cols := binary.BigEndian.Uint16(msg[1:3])
 			rows := binary.BigEndian.Uint16(msg[3:5])
 			if err := resizePTY(master, cols, rows); err != nil {
-				log.Printf("Terminal resize failed: %v", err)
+				logErrorf("Terminal resize failed: %v", err)
 			}
 		}
 	}
@@ -273,14 +272,14 @@ func (a *Agent) apiWorkloadExec(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := termWSUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Terminal exec: WS upgrade failed: %v", err)
+		logErrorf("Terminal exec: WS upgrade failed: %v", err)
 		return
 	}
 	defer conn.Close()
 
 	shell := pickShell(r, "/bin/sh")
 	cmd := exec.Command("docker", "exec", "-i", "-t", containerID, shell)
-	log.Printf("Terminal: exec into workload %s container %s shell=%s from %s",
+	logInfof("Terminal: exec into workload %s container %s shell=%s from %s",
 		name, shortID(containerID, 12), shell, r.RemoteAddr)
 	a.attachPTYToWS(conn, cmd)
 }
@@ -326,7 +325,7 @@ func (a *Agent) apiHostShell(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := termWSUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Host shell: WS upgrade failed: %v", err)
+		logErrorf("Host shell: WS upgrade failed: %v", err)
 		return
 	}
 	defer conn.Close()
@@ -368,7 +367,7 @@ func (a *Agent) apiHostShell(w http.ResponseWriter, r *http.Request) {
 		// xterm.js will render this before the shell's first prompt.
 		_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{termMsgData}, []byte(banner)...))
 	}
-	log.Printf("Host shell: opened by %s (host_ns=%v)", r.RemoteAddr, hostNamespacesAvailable())
+	logInfof("Host shell: opened by %s (host_ns=%v)", r.RemoteAddr, hostNamespacesAvailable())
 	a.attachPTYToWS(conn, cmd)
 }
 
@@ -509,7 +508,7 @@ func (a *Agent) apiHostExec(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	log.Printf("Host exec: by %s (%dms exit=%d, %d stdout / %d stderr bytes)",
+	logInfof("Host exec: by %s (%dms exit=%d, %d stdout / %d stderr bytes)",
 		r.RemoteAddr, resp.DurationMs, resp.ExitCode, len(resp.Stdout), len(resp.Stderr))
 	writeJSON(w, resp)
 }
@@ -616,12 +615,12 @@ func (a *Agent) proxyHostShell(w http.ResponseWriter, r *http.Request, nodeID st
 
 	clientConn, err := termWSUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Host shell proxy: WS upgrade failed: %v", err)
+		logErrorf("Host shell proxy: WS upgrade failed: %v", err)
 		return
 	}
 	defer clientConn.Close()
 
-	log.Printf("Host shell proxy: %s -> peer %s (%s)", r.RemoteAddr, peer.Name, shortID(nodeID, 12))
+	logInfof("Host shell proxy: %s -> peer %s (%s)", r.RemoteAddr, peer.Name, shortID(nodeID, 12))
 	bridgeWebSockets(clientConn, peerConn)
 }
 

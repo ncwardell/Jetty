@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -44,7 +43,7 @@ func (a *Agent) detectWarpIP() {
 	// Check environment variable first (set by entrypoint script)
 	if ip := os.Getenv("JETTY_WARP_IP"); ip != "" {
 		a.ip = ip
-		log.Printf("WARP IP from environment: %s", ip)
+		logInfof("WARP IP from environment: %s", ip)
 		return
 	}
 
@@ -63,7 +62,7 @@ func (a *Agent) detectWarpIP() {
 	for _, addr := range addrs {
 		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
 			a.ip = ipnet.IP.String()
-			log.Printf("WARP IP detected: %s", a.ip)
+			logInfof("WARP IP detected: %s", a.ip)
 			return
 		}
 	}
@@ -138,12 +137,12 @@ func (a *Agent) ipMonitorLoop() {
 			if ipChanged {
 				oldIP := a.ip
 				a.ip = newIP
-				log.Printf("WARP IP changed: %s -> %s", oldIP, newIP)
+				logInfof("WARP IP changed: %s -> %s", oldIP, newIP)
 				// Notify memberlist + re-announce so peers rebuild toward us.
 				a.updateMemberlistIP(newIP)
 				goSafe("announceOurIP", a.announceOurIP)
 			} else {
-				log.Printf("WARP reconnected (IP unchanged %s); re-ensuring tunnels/routes", newIP)
+				logInfof("WARP reconnected (IP unchanged %s); re-ensuring tunnels/routes", newIP)
 			}
 
 			// Recreate IPIP/GRE tunnels. They embed our local WARP IP in the
@@ -201,15 +200,15 @@ func (a *Agent) deregisterWarp() {
 		return
 	}
 	if out, err := exec.Command("warp-cli", "--accept-tos", "disconnect").CombinedOutput(); err != nil {
-		log.Printf("WARP deregister: disconnect: %v (%s)", err, out)
+		logInfof("WARP deregister: disconnect: %v (%s)", err, out)
 	}
 	if out, err := exec.Command("warp-cli", "--accept-tos", "registration", "delete").CombinedOutput(); err != nil {
-		log.Printf("WARP deregister: registration delete: %v (%s)", err, out)
+		logInfof("WARP deregister: registration delete: %v (%s)", err, out)
 		return
 	}
 	// Wipe the connector-ID stamp so the next start re-registers cleanly.
 	_ = os.Remove(filepath.Join(a.dataDir, "warp", "registered-connector-id"))
-	log.Printf("WARP deregistered with Cloudflare (device slot freed)")
+	logInfof("WARP deregistered with Cloudflare (device slot freed)")
 }
 
 // configureWarpRuntime brings up WARP using a connector token received from
@@ -232,11 +231,11 @@ func (a *Agent) configureWarpRuntime(token string) error {
 		return fmt.Errorf("no WARP token provided")
 	}
 
-	log.Printf("Configuring WARP at runtime...")
+	logInfof("Configuring WARP at runtime...")
 
 	// Check if warp-svc is running, start it if not
 	if err := exec.Command("warp-cli", "--accept-tos", "status").Run(); err != nil {
-		log.Printf("Starting WARP service...")
+		logInfof("Starting WARP service...")
 
 		// RUST_LOG=error reduces verbose debug output that floods logs on
 		// some distros (e.g., Arch). We don't capture stdout/stderr - the
@@ -275,21 +274,21 @@ func (a *Agent) configureWarpRuntime(token string) error {
 	if !needsRegister && expectedConnectorID != "" {
 		stamped, _ := os.ReadFile(stampPath)
 		if string(stamped) != expectedConnectorID {
-			log.Printf("WARP registration is bound to a different Connector (%q) than the env token (%q); re-registering",
+			logInfof("WARP registration is bound to a different Connector (%q) than the env token (%q); re-registering",
 				string(stamped), expectedConnectorID)
 			if out, err := exec.Command("warp-cli", "--accept-tos", "registration", "delete").CombinedOutput(); err != nil {
-				log.Printf("Warning: warp-cli registration delete: %v (%s)", err, out)
+				logWarnf("warp-cli registration delete: %v (%s)", err, out)
 			}
 			needsRegister = true
 		} else {
-			log.Printf("WARP already registered to expected Connector %s, connecting...", expectedConnectorID)
+			logInfof("WARP already registered to expected Connector %s, connecting...", expectedConnectorID)
 		}
 	} else if !needsRegister {
-		log.Printf("WARP already registered, connecting...")
+		logInfof("WARP already registered, connecting...")
 	}
 
 	if needsRegister {
-		log.Printf("Registering WARP connector...")
+		logInfof("Registering WARP connector...")
 		cmd := exec.Command("warp-cli", "--accept-tos", "connector", "new", token)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("failed to register WARP connector: %s", output)
@@ -301,7 +300,7 @@ func (a *Agent) configureWarpRuntime(token string) error {
 		}
 	}
 
-	log.Printf("Connecting WARP...")
+	logInfof("Connecting WARP...")
 	if err := exec.Command("warp-cli", "--accept-tos", "connect").Run(); err != nil {
 		return fmt.Errorf("failed to connect WARP: %w", err)
 	}
@@ -313,10 +312,10 @@ func (a *Agent) configureWarpRuntime(token string) error {
 		output, _ := exec.Command("warp-cli", "--accept-tos", "status").CombinedOutput()
 		if strings.Contains(strings.ToLower(string(output)), "connected") {
 			a.detectWarpIP()
-			log.Printf("WARP connected successfully: %s", a.ip)
+			logInfof("WARP connected successfully: %s", a.ip)
 
 			if err := a.initWarpRules(); err != nil {
-				log.Printf("Warning: failed to init WARP rules: %v", err)
+				logWarnf("failed to init WARP rules: %v", err)
 			}
 
 			// Tell peers our address so cross-node routing can begin.

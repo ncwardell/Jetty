@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"log"
 	"runtime/debug"
 	"time"
 )
@@ -59,7 +58,7 @@ func recoverPanic(name string) interface{} {
 }
 
 func logPanic(name string, r interface{}) {
-	log.Printf("PANIC recovered in %s: %v\n%s", name, r, debug.Stack())
+	logErrorf("PANIC recovered in %s: %v\n%s", name, r, debug.Stack())
 }
 
 // goSafe runs fn in a new goroutine behind a panic barrier. Use for one-shot
@@ -80,10 +79,10 @@ func goSupervised(name string, fn func()) {
 				return // clean return: the loop is done, leave it alone
 			}
 			if attempt >= superviseMaxRestarts {
-				log.Printf("PANIC in %s: giving up after %d restarts", name, superviseMaxRestarts)
+				logErrorf("PANIC in %s: giving up after %d restarts", name, superviseMaxRestarts)
 				return
 			}
-			log.Printf("Restarting %s in %s (attempt %d/%d)",
+			logInfof("Restarting %s in %s (attempt %d/%d)",
 				name, superviseRestartDelay, attempt+1, superviseMaxRestarts)
 			time.Sleep(superviseRestartDelay)
 		}

@@ -3,7 +3,6 @@ package agent
 import (
 	"crypto/subtle"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -200,18 +199,18 @@ func (a *Agent) waitForAPI() {
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 200 || resp.StatusCode == 401 { // 401 is OK, means API is up but needs auth
-				log.Printf("API server ready")
+				logInfof("API server ready")
 				return
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	log.Printf("Warning: API server not responding after 5s, continuing anyway")
+	logWarnf("API server not responding after 5s, continuing anyway")
 }
 
 // runAPI builds the route table, wraps it in middleware, and starts
 // ListenAndServe. Called as a goroutine from Start(); blocks forever
-// (or exits the process via log.Fatalf if ListenAndServe fails).
+// (or exits the process via logFatalf if ListenAndServe fails).
 func (a *Agent) runAPI() {
 	// Set Swagger host to empty so it uses the current request's host
 	// This makes it work automatically for both localhost and cloudflared tunnels
@@ -329,8 +328,8 @@ func (a *Agent) runAPI() {
 	a.stateMu.RLock()
 	hasAdmin := a.state.AdminKey != ""
 	a.stateMu.RUnlock()
-	log.Printf("API on %s (auth=%v)", addr, hasAdmin)
+	logInfof("API on %s (auth=%v)", addr, hasAdmin)
 	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatalf("API server failed: %v", err)
+		logFatalf("API server failed: %v", err)
 	}
 }

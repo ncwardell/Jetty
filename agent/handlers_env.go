@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"regexp"
 	"sort"
@@ -146,7 +145,7 @@ func (a *Agent) apiSetEnv(w http.ResponseWriter, r *http.Request) {
 		"updated": updated,
 	})
 
-	log.Printf("Env set: added=%v, updated=%v", added, updated)
+	logInfof("Env set: added=%v, updated=%v", added, updated)
 }
 
 // apiGetEnv godoc
@@ -225,5 +224,5 @@ func (a *Agent) apiDeleteEnv(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(204)
-	log.Printf("Env deleted: %s, created tombstone for sync propagation", key)
+	logInfof("Env deleted: %s, created tombstone for sync propagation", key)
 }

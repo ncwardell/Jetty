@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"log"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -43,12 +42,12 @@ const (
 // images that are about to be needed.
 func (a *Agent) imagePruneLoop() {
 	if strings.EqualFold(getEnv("JETTY_IMAGE_PRUNE", "true"), "false") {
-		log.Printf("Image prune: disabled (JETTY_IMAGE_PRUNE=false)")
+		logInfof("Image prune: disabled (JETTY_IMAGE_PRUNE=false)")
 		return
 	}
 	age := getEnv("JETTY_IMAGE_PRUNE_UNTIL", imagePruneDefault)
 	if _, err := time.ParseDuration(age); err != nil {
-		log.Printf("Image prune: invalid JETTY_IMAGE_PRUNE_UNTIL %q, using %s", age, imagePruneDefault)
+		logInfof("Image prune: invalid JETTY_IMAGE_PRUNE_UNTIL %q, using %s", age, imagePruneDefault)
 		age = imagePruneDefault
 	}
 
@@ -87,7 +86,7 @@ func (a *Agent) pruneImages(age string) {
 	total += runPrune("docker", "builder", "prune", "-f", "--filter", "until="+age)
 
 	if total > 0 {
-		log.Printf("Image prune: reclaimed ~%.1f MB", total)
+		logInfof("Image prune: reclaimed ~%.1f MB", total)
 	}
 }
 
@@ -96,7 +95,7 @@ func (a *Agent) pruneImages(age string) {
 func runPrune(name string, args ...string) float64 {
 	out, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
-		log.Printf("Image prune: %s %s failed: %v", name, strings.Join(args, " "), err)
+		logErrorf("Image prune: %s %s failed: %v", name, strings.Join(args, " "), err)
 		return 0
 	}
 	// Output ends with e.g. "Total reclaimed space: 4.881GB" (or "0B").

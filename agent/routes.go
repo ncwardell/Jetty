@@ -3,7 +3,6 @@ package agent
 import (
 	"crypto/sha256"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -150,7 +149,7 @@ func (a *Agent) updateHosts() {
 	newLines = append(newLines, jettyLines...)
 
 	if err := os.WriteFile(a.hostsFile, []byte(strings.Join(newLines, "\n")), 0644); err != nil {
-		log.Printf("Warning: failed to update %s: %v", a.hostsFile, err)
+		logWarnf("failed to update %s: %v", a.hostsFile, err)
 	} else {
 		a.hostsBlockHash = hash
 	}
@@ -208,7 +207,7 @@ func (a *Agent) updateWorkloadRoutes() {
 		for _, peer := range a.state.Peers {
 			if peer.IP != "" {
 				if err := a.ensurePeerTunnel(peer.ID, peer.IP); err != nil {
-					log.Printf("Warning: failed to ensure tunnel to %s: %v", peer.Name, err)
+					logWarnf("failed to ensure tunnel to %s: %v", peer.Name, err)
 				}
 			}
 		}
@@ -245,7 +244,7 @@ func (a *Agent) updateWorkloadRoutes() {
 		if desired, ok := desiredRoutes[wlIP]; !ok || desired.ownerID != ownerID {
 			exec.Command("ip", "route", "del", wlIP+"/32").Run()
 			delete(a.workloadRoutes, wlIP)
-			log.Printf("Removed route for %s (was via %s)", wlIP, shortID(ownerID, 8))
+			logInfof("Removed route for %s (was via %s)", wlIP, shortID(ownerID, 8))
 		}
 	}
 
@@ -293,7 +292,7 @@ func (a *Agent) updateWorkloadRoutes() {
 			// fallback didn't actually work without Cloudflare-side routing
 			// configuration we don't perform, so removing it is a downgrade
 			// from "looks like it works but doesn't" to "obviously doesn't".
-			log.Printf("Warning: no transport for remote workload %s on owner %s - install ipip kernel module or check userspace tunnel init",
+			logWarnf("no transport for remote workload %s on owner %s - install ipip kernel module or check userspace tunnel init",
 				wlIP, shortID(info.ownerID, 8))
 			continue
 		}
@@ -302,11 +301,11 @@ func (a *Agent) updateWorkloadRoutes() {
 			// Only log on owner change or first install. Steady-state
 			// replaces are silent to avoid log spam every reconcile.
 			if existingOwner, ok := a.workloadRoutes[wlIP]; !ok || existingOwner != info.ownerID {
-				log.Printf("Added route for %s via %s", wlIP, routeDesc)
+				logInfof("Added route for %s via %s", wlIP, routeDesc)
 			}
 			a.workloadRoutes[wlIP] = info.ownerID
 		} else {
-			log.Printf("Warning: failed to replace route for %s via %s: %v", wlIP, routeDesc, err)
+			logWarnf("failed to replace route for %s via %s: %v", wlIP, routeDesc, err)
 		}
 	}
 }

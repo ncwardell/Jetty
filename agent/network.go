@@ -2,7 +2,6 @@ package agent
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -129,21 +128,21 @@ func (a *Agent) initNetwork() error {
 	switch strings.ToLower(getEnv("JETTY_TUNNEL_MODE", "")) {
 	case "ipip":
 		a.tunnelMode = "ipip"
-		log.Printf("Tunnel mode: IPIP (opt-in; requires the path between peers to forward IP protocol 4)")
+		logInfof("Tunnel mode: IPIP (opt-in; requires the path between peers to forward IP protocol 4)")
 	case "gre":
 		a.tunnelMode = "gre"
-		log.Printf("Tunnel mode: GRE (opt-in; requires the path between peers to forward IP protocol 47)")
+		logInfof("Tunnel mode: GRE (opt-in; requires the path between peers to forward IP protocol 47)")
 	default:
 		a.tunnelMode = ""
-		log.Printf("Tunnel mode: userspace (jetty_tun)")
+		logInfof("Tunnel mode: userspace (jetty_tun)")
 	}
 
 	// ALWAYS start userspace tunnel listener - even if we have IPIP for sending,
 	// we need to receive packets from peers that don't have IPIP (e.g., ChromeOS)
 	if err := a.initUserspaceTunnel(); err != nil {
-		log.Printf("Warning: userspace tunnel failed: %v", err)
+		logWarnf("userspace tunnel failed: %v", err)
 		if a.tunnelMode == "" {
-			log.Printf("Warning: no tunnel mode available - cross-node workload routing disabled")
+			logWarnf("no tunnel mode available - cross-node workload routing disabled")
 		}
 	}
 
@@ -153,7 +152,7 @@ func (a *Agent) initNetwork() error {
 	// no-op when rules already exist.
 	goSupervised("iptablesMaintenanceLoop", a.iptablesMaintenanceLoop)
 
-	log.Printf("Network ready: %s (WARP), workload interface: jetty0", a.ip)
+	logInfof("Network ready: %s (WARP), workload interface: jetty0", a.ip)
 	return nil
 }
 
@@ -168,10 +167,10 @@ func (a *Agent) applyMeshIptablesRules(verbose bool) {
 	if err := exec.Command("iptables", "-C", "FORWARD", "-d", a.serviceCIDR, "-j", "ACCEPT").Run(); err != nil {
 		if err := exec.Command("iptables", "-I", "FORWARD", "1", "-d", a.serviceCIDR, "-j", "ACCEPT").Run(); err != nil {
 			if verbose {
-				log.Printf("Warning: failed to add FORWARD ACCEPT (dst=%s): %v", a.serviceCIDR, err)
+				logWarnf("failed to add FORWARD ACCEPT (dst=%s): %v", a.serviceCIDR, err)
 			}
 		} else if !verbose {
-			log.Printf("Re-inserted FORWARD ACCEPT (dst=%s) - had been removed", a.serviceCIDR)
+			logInfof("Re-inserted FORWARD ACCEPT (dst=%s) - had been removed", a.serviceCIDR)
 		}
 	}
 
@@ -179,10 +178,10 @@ func (a *Agent) applyMeshIptablesRules(verbose bool) {
 	if err := exec.Command("iptables", "-C", "FORWARD", "-s", a.serviceCIDR, "-j", "ACCEPT").Run(); err != nil {
 		if err := exec.Command("iptables", "-I", "FORWARD", "2", "-s", a.serviceCIDR, "-j", "ACCEPT").Run(); err != nil {
 			if verbose {
-				log.Printf("Warning: failed to add FORWARD ACCEPT (src=%s): %v", a.serviceCIDR, err)
+				logWarnf("failed to add FORWARD ACCEPT (src=%s): %v", a.serviceCIDR, err)
 			}
 		} else if !verbose {
-			log.Printf("Re-inserted FORWARD ACCEPT (src=%s) - had been removed", a.serviceCIDR)
+			logInfof("Re-inserted FORWARD ACCEPT (src=%s) - had been removed", a.serviceCIDR)
 		}
 	}
 
@@ -190,10 +189,10 @@ func (a *Agent) applyMeshIptablesRules(verbose bool) {
 	if err := exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING", "-d", a.serviceCIDR, "-j", "MASQUERADE").Run(); err != nil {
 		if err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-d", a.serviceCIDR, "-j", "MASQUERADE").Run(); err != nil {
 			if verbose {
-				log.Printf("Warning: failed to add MASQUERADE for container-to-mesh traffic: %v", err)
+				logWarnf("failed to add MASQUERADE for container-to-mesh traffic: %v", err)
 			}
 		} else if !verbose {
-			log.Printf("Re-inserted POSTROUTING MASQUERADE (dst=%s) - had been removed", a.serviceCIDR)
+			logInfof("Re-inserted POSTROUTING MASQUERADE (dst=%s) - had been removed", a.serviceCIDR)
 		}
 	}
 }
@@ -240,7 +239,7 @@ func (a *Agent) detectTunnelMode() string {
 		"local", "127.0.0.1", "remote", "127.0.0.2").Run()
 	if err == nil {
 		exec.Command("ip", "tunnel", "del", testName).Run()
-		log.Printf("Using GRE tunnels for cross-node routing (IPIP unavailable)")
+		logInfof("Using GRE tunnels for cross-node routing (IPIP unavailable)")
 		return "gre"
 	}
 
@@ -266,7 +265,7 @@ func (a *Agent) initWarpRules() error {
 	// This ensures responses from our mesh IPs route back through WARP
 	if err := exec.Command("nft", "add", "rule", "ip", "jetty", "postrouting",
 		"oifname", "CloudflareWARP", "masquerade").Run(); err != nil {
-		log.Printf("Warning: failed to add WARP masquerade rule: %v", err)
+		logWarnf("failed to add WARP masquerade rule: %v", err)
 	}
 
 	// Add route for WARP client IP range to CloudflareWARP interface
@@ -280,17 +279,17 @@ func (a *Agent) initWarpRules() error {
 	// Exception: if WARP was already running before Jetty started, the
 	// operator owns it. Don't touch their firewall - they may depend on it.
 	if a.warpPreexisting {
-		log.Printf("Leaving WARP firewall table alone (WARP was pre-existing)")
+		logInfof("Leaving WARP firewall table alone (WARP was pre-existing)")
 	} else if _, err := exec.Command("nft", "list", "table", "inet", "cloudflare-warp").Output(); err == nil {
-		log.Printf("Removing WARP firewall table (routing still works without it)...")
+		logInfof("Removing WARP firewall table (routing still works without it)...")
 		if err := exec.Command("nft", "delete", "table", "inet", "cloudflare-warp").Run(); err != nil {
-			log.Printf("Warning: failed to delete cloudflare-warp table: %v", err)
+			logWarnf("failed to delete cloudflare-warp table: %v", err)
 		} else {
-			log.Printf("WARP firewall table removed")
+			logInfof("WARP firewall table removed")
 		}
 	}
 
-	log.Printf("WARP nft rules initialized (table: ip jetty)")
+	logInfof("WARP nft rules initialized (table: ip jetty)")
 	return nil
 }
 
@@ -362,7 +361,7 @@ func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
 		return fmt.Errorf("bring up tunnel %s: %s", tunName, strings.TrimSpace(string(out)))
 	}
 
-	log.Printf("Created %s tunnel %s to peer %s (%s)", strings.ToUpper(a.tunnelMode), tunName, shortID(peerID, 8), peerIP)
+	logInfof("Created %s tunnel %s to peer %s (%s)", strings.ToUpper(a.tunnelMode), tunName, shortID(peerID, 8), peerIP)
 	return nil
 }
 
@@ -370,7 +369,7 @@ func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
 func (a *Agent) removePeerTunnel(peerID string) {
 	tunName := "tun_" + shortID(peerID, 8)
 	if err := exec.Command("ip", "tunnel", "del", tunName).Run(); err == nil {
-		log.Printf("Removed tunnel %s", tunName)
+		logInfof("Removed tunnel %s", tunName)
 	}
 }
 

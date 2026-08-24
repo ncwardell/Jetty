@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"regexp"
 	"sort"
@@ -248,7 +247,7 @@ func (a *Agent) apiImportWorkloads(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	enc.Encode(report)
-	log.Printf("Import: mode=%s total=%d created=%d skipped=%d errors=%d",
+	logInfof("Import: mode=%s total=%d created=%d skipped=%d errors=%d",
 		mode, report.Total, report.Created, report.Skipped, report.Errors)
 }
 

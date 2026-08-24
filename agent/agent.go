@@ -5,7 +5,6 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -81,9 +80,9 @@ func (a *Agent) cleanupOrphanedState() {
 	if err == nil {
 		for _, name := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 			if name != "" && strings.HasSuffix(name, "-old") {
-				log.Printf("Removing old container from previous update: %s", name)
+				logInfof("Removing old container from previous update: %s", name)
 				if err := exec.Command("docker", "rm", "-f", name).Run(); err != nil {
-					log.Printf("Warning: failed to remove old container %s: %v", name, err)
+					logWarnf("failed to remove old container %s: %v", name, err)
 				}
 			}
 		}
@@ -91,9 +90,9 @@ func (a *Agent) cleanupOrphanedState() {
 
 	// Check if there's orphaned jetty0 interface from previous run
 	if err := exec.Command("ip", "link", "show", "jetty0").Run(); err == nil {
-		log.Printf("Found orphaned jetty0 interface from previous run, cleaning up...")
+		logInfof("Found orphaned jetty0 interface from previous run, cleaning up...")
 		if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
-			log.Printf("Warning: failed to delete orphaned jetty0 interface: %v", err)
+			logWarnf("failed to delete orphaned jetty0 interface: %v", err)
 		}
 	}
 
@@ -105,9 +104,9 @@ func (a *Agent) cleanupOrphanedState() {
 			if len(parts) > 0 {
 				tunName := strings.TrimSuffix(parts[0], ":")
 				if err := exec.Command("ip", "tunnel", "del", tunName).Run(); err != nil {
-					log.Printf("Warning: failed to delete orphaned tunnel %s: %v", tunName, err)
+					logWarnf("failed to delete orphaned tunnel %s: %v", tunName, err)
 				} else {
-					log.Printf("Cleaned up orphaned tunnel: %s", tunName)
+					logInfof("Cleaned up orphaned tunnel: %s", tunName)
 				}
 			}
 		}
@@ -118,7 +117,7 @@ func (a *Agent) cleanupOrphanedState() {
 	// software on the host may own.
 	_, svcNet, err := net.ParseCIDR(a.serviceCIDR)
 	if err != nil {
-		log.Printf("Warning: invalid service CIDR %q, skipping orphaned route cleanup: %v", a.serviceCIDR, err)
+		logWarnf("invalid service CIDR %q, skipping orphaned route cleanup: %v", a.serviceCIDR, err)
 	} else {
 		output, _ = exec.Command("ip", "route", "show").CombinedOutput()
 		for _, line := range strings.Split(string(output), "\n") {
@@ -135,9 +134,9 @@ func (a *Agent) cleanupOrphanedState() {
 				continue
 			}
 			if err := exec.Command("ip", "route", "del", parts[0]).Run(); err != nil {
-				log.Printf("Warning: failed to delete orphaned route %s: %v", parts[0], err)
+				logWarnf("failed to delete orphaned route %s: %v", parts[0], err)
 			} else {
-				log.Printf("Cleaned up orphaned route: %s", parts[0])
+				logInfof("Cleaned up orphaned route: %s", parts[0])
 			}
 		}
 	}
@@ -169,9 +168,9 @@ func (a *Agent) cleanupLegacyNftRules() {
 				handle := strings.TrimSpace(parts[1])
 				if handle != "" {
 					if err := exec.Command("nft", "delete", "rule", "ip", "nat", "POSTROUTING", "handle", handle).Run(); err != nil {
-						log.Printf("Warning: failed to delete legacy nft rule handle %s: %v", handle, err)
+						logWarnf("failed to delete legacy nft rule handle %s: %v", handle, err)
 					} else {
-						log.Printf("Cleaned up legacy nft rule handle %s", handle)
+						logInfof("Cleaned up legacy nft rule handle %s", handle)
 					}
 				}
 			}
@@ -192,19 +191,19 @@ func (a *Agent) Start() error {
 	hasPeers := len(a.state.Peers) > 0
 	a.stateMu.RUnlock()
 	if !hasAdmin && !hasPeers && a.joinURL == "" && a.clusterSecret == "" {
-		log.Printf("!!! WARNING: JETTY_SECRET is not set and no cluster state exists - the API will be UNAUTHENTICATED. !!!")
-		log.Printf("!!! Set JETTY_SECRET to a strong random value before exposing this node to a network.              !!!")
+		logInfof("!!! WARNING: JETTY_SECRET is not set and no cluster state exists - the API will be UNAUTHENTICATED. !!!")
+		logInfof("!!! Set JETTY_SECRET to a strong random value before exposing this node to a network.              !!!")
 	}
 
 	if a.hostShellEnabled {
-		log.Printf("!!! Host shell endpoint /api/host/shell is ENABLED - anyone with the cluster admin key can run shell commands on this host. !!!")
+		logInfof("!!! Host shell endpoint /api/host/shell is ENABLED - anyone with the cluster admin key can run shell commands on this host. !!!")
 	}
 
 	// Record whether WARP was already running before we touched anything.
 	// If it was, the operator owns it and we must not tear it down on Stop().
 	if _, err := net.InterfaceByName("CloudflareWARP"); err == nil {
 		a.warpPreexisting = true
-		log.Printf("CloudflareWARP interface already present - Jetty will not tear it down on shutdown")
+		logInfof("CloudflareWARP interface already present - Jetty will not tear it down on shutdown")
 	}
 
 	// Clean up any orphaned state from previous unclean shutdown
@@ -239,7 +238,7 @@ func (a *Agent) Start() error {
 	if needsJoin {
 		// Join cluster first - this will give us the WARP token
 		// We join via the tunnel URL, which doesn't require WARP
-		log.Printf("Joining cluster to obtain WARP configuration...")
+		logInfof("Joining cluster to obtain WARP configuration...")
 		if err := a.joinCluster(); err != nil {
 			return fmt.Errorf("join: %w", err)
 		}
@@ -259,7 +258,7 @@ func (a *Agent) Start() error {
 
 	// Init WARP nft rules
 	if err := a.initWarpRules(); err != nil {
-		log.Printf("Warning: failed to init WARP rules: %v", err)
+		logWarnf("failed to init WARP rules: %v", err)
 	}
 
 	// Sync with existing peers if not a fresh join
@@ -295,13 +294,13 @@ func (a *Agent) Start() error {
 
 	// Start Cloudflare tunnel if configured
 	if err := a.startCloudflared(); err != nil {
-		log.Printf("Warning: failed to start cloudflared: %v", err)
+		logWarnf("failed to start cloudflared: %v", err)
 	}
 
 	// Initialize memberlist for cluster membership and failure detection
 	ml, err := a.initMemberlist()
 	if err != nil {
-		log.Printf("Warning: memberlist init failed: %v - falling back to HTTP gossip", err)
+		logWarnf("memberlist init failed: %v - falling back to HTTP gossip", err)
 		// Fall back to HTTP-based gossip if memberlist fails
 		goSupervised("gossipLoop", a.gossipLoop)
 	} else {
@@ -337,12 +336,12 @@ func (a *Agent) Start() error {
 	if a.tunnelDomain != "" {
 		mode += " + tunnel (" + a.tunnelDomain + ")"
 	}
-	log.Printf("Jetty started: %s (%s) @ %s [mode: %s]", a.hostname, shortID(a.hwid, 12), a.ip, mode)
+	logInfof("Jetty started: %s (%s) @ %s [mode: %s]", a.hostname, shortID(a.hwid, 12), a.ip, mode)
 	return nil
 }
 
 func (a *Agent) Stop() {
-	log.Printf("Shutting down Jetty...")
+	logInfof("Shutting down Jetty...")
 
 	// Hand off owned, revivable workloads to peers BEFORE we tear down the
 	// network. Each workload is "released" by clearing our ownership and
@@ -395,22 +394,22 @@ func (a *Agent) gracefulDrain() {
 
 	if a.memberlist == nil {
 		if ownedRevivable > 0 {
-			log.Printf("Graceful drain: %d revivable workload(s) will be picked up by peers via gossip (memberlist unavailable)", ownedRevivable)
+			logInfof("Graceful drain: %d revivable workload(s) will be picked up by peers via gossip (memberlist unavailable)", ownedRevivable)
 		}
 		return
 	}
 
 	if ownedRevivable > 0 {
-		log.Printf("Graceful drain: announcing departure to peers (%d revivable workload(s) to hand off)", ownedRevivable)
+		logInfof("Graceful drain: announcing departure to peers (%d revivable workload(s) to hand off)", ownedRevivable)
 	} else {
-		log.Printf("Graceful drain: announcing departure (no revivable workloads to hand off)")
+		logInfof("Graceful drain: announcing departure (no revivable workloads to hand off)")
 	}
 
 	// Leave() blocks until the broadcast is sent to a few peers; bounded
 	// by the deadline. After this returns, peers have already received
 	// our departure and started claiming.
 	if err := a.memberlist.Leave(2 * time.Second); err != nil {
-		log.Printf("Graceful drain: memberlist Leave failed: %v (peers will detect via timeout)", err)
+		logErrorf("Graceful drain: memberlist Leave failed: %v (peers will detect via timeout)", err)
 		return
 	}
 
@@ -423,13 +422,13 @@ func (a *Agent) gracefulDrain() {
 
 // cleanupNetwork removes all Jetty-created network resources
 func (a *Agent) cleanupNetwork() {
-	log.Printf("Cleaning up network resources...")
+	logInfof("Cleaning up network resources...")
 
 	// Clean up workload routes first
 	a.workloadRoutesMu.Lock()
 	for wlIP := range a.workloadRoutes {
 		exec.Command("ip", "route", "del", wlIP+"/32").Run()
-		log.Printf("Removed route for %s", wlIP)
+		logInfof("Removed route for %s", wlIP)
 	}
 	a.workloadRoutes = make(map[string]string)
 	a.workloadRoutesMu.Unlock()
@@ -439,7 +438,7 @@ func (a *Agent) cleanupNetwork() {
 	for _, peer := range a.state.Peers {
 		tunName := a.getTunnelName(peer.ID)
 		if err := exec.Command("ip", "tunnel", "del", tunName).Run(); err == nil {
-			log.Printf("Removed tunnel %s", tunName)
+			logInfof("Removed tunnel %s", tunName)
 		}
 	}
 
@@ -456,7 +455,7 @@ func (a *Agent) cleanupNetwork() {
 					if containerIP != "" {
 						exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run()
 						exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run()
-						log.Printf("Removed iptables rules for %s (%s -> %s)", wl.Name, wl.IP, containerIP)
+						logInfof("Removed iptables rules for %s (%s -> %s)", wl.Name, wl.IP, containerIP)
 					}
 				}
 			}
@@ -472,24 +471,24 @@ func (a *Agent) cleanupNetwork() {
 
 	// Remove jetty0 interface (this also removes all IPs bound to it)
 	if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
-		log.Printf("Warning: could not remove jetty0 interface: %v", err)
+		logWarnf("could not remove jetty0 interface: %v", err)
 	} else {
-		log.Printf("Removed jetty0 interface")
+		logInfof("Removed jetty0 interface")
 	}
 
 	// If WARP was already running before Jetty started, the operator owns it -
 	// leave it alone. Otherwise, tear down the WARP state we set up.
 	if a.warpPreexisting {
-		log.Printf("Leaving WARP intact (was already running before Jetty started)")
+		logInfof("Leaving WARP intact (was already running before Jetty started)")
 		return
 	}
 
 	// Disconnect WARP (don't delete registration - state is persisted in /data/warp and reused on restart)
-	log.Printf("Disconnecting WARP...")
+	logInfof("Disconnecting WARP...")
 	if output, err := exec.Command("warp-cli", "--accept-tos", "disconnect").CombinedOutput(); err != nil {
-		log.Printf("WARP disconnect: %v (%s)", err, strings.TrimSpace(string(output)))
+		logInfof("WARP disconnect: %v (%s)", err, strings.TrimSpace(string(output)))
 	} else {
-		log.Printf("WARP disconnected")
+		logInfof("WARP disconnected")
 	}
 	// Registration is preserved in /data/warp for reuse across restarts/updates
 
@@ -498,7 +497,7 @@ func (a *Agent) cleanupNetwork() {
 	exec.Command("ip", "link", "delete", "CloudflareWARP").Run()
 	exec.Command("nft", "delete", "table", "inet", "cloudflare-warp").Run()
 	exec.Command("ip", "route", "del", "100.96.0.0/12").Run()
-	log.Printf("Removed WARP network modifications")
+	logInfof("Removed WARP network modifications")
 }
 
 // =============================================================================

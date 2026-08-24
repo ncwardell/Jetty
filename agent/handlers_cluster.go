@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"runtime"
@@ -302,7 +301,7 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 		remoteHost, _, _ := net.SplitHostPort(r.RemoteAddr)
 		if remoteHost != req.Peer.IP {
 			a.stateMu.Unlock()
-			log.Printf("Refusing peer-announce IP change for %s: %s -> %s (RemoteAddr=%s does not match new IP)",
+			logInfof("Refusing peer-announce IP change for %s: %s -> %s (RemoteAddr=%s does not match new IP)",
 				req.Peer.ID, oldIP, req.Peer.IP, remoteHost)
 			writeError(w, http.StatusForbidden, "peer IP change must come from the new IP")
 			return
@@ -331,13 +330,13 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	// IPIP requires both sides to have matching tunnels
 	if req.Peer.IP != "" {
 		if err := a.ensurePeerTunnel(req.Peer.ID, req.Peer.IP); err != nil {
-			log.Printf("Warning: failed to create tunnel to %s: %v", req.Peer.Name, err)
+			logWarnf("failed to create tunnel to %s: %v", req.Peer.Name, err)
 		}
 	}
 
 	// If peer IP changed, also update workload routes
 	if ipChanged {
-		log.Printf("Peer %s IP changed: %s -> %s", req.Peer.Name, oldIP, req.Peer.IP)
+		logInfof("Peer %s IP changed: %s -> %s", req.Peer.Name, oldIP, req.Peer.IP)
 		a.stateMu.Lock()
 		a.updateWorkloadRoutes()
 		a.stateMu.Unlock()
@@ -346,7 +345,7 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 
-	log.Printf("Peer announced: %s (%s)", req.Peer.Name, req.Peer.IP)
+	logInfof("Peer announced: %s (%s)", req.Peer.Name, req.Peer.IP)
 }
 
 // apiHeartbeat receives heartbeats from peers in tunnel-only mode.
@@ -392,12 +391,12 @@ func (a *Agent) broadcastTunnelToken(token string) {
 		url := a.getTunnelAPIURL("/api/tunnel/sync")
 		req, err := a.peerRequest("POST", url, strings.NewReader(string(data)))
 		if err != nil {
-			log.Printf("Failed to build tunnel-token broadcast: %v", err)
+			logErrorf("Failed to build tunnel-token broadcast: %v", err)
 			return
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			log.Printf("Failed to broadcast tunnel token: %v", err)
+			logErrorf("Failed to broadcast tunnel token: %v", err)
 		} else {
 			resp.Body.Close()
 		}
@@ -418,12 +417,12 @@ func (a *Agent) broadcastTunnelToken(token string) {
 		url := fmt.Sprintf("http://%s:%d/api/tunnel/sync", peer.IP, a.apiPort)
 		req, err := a.peerRequest("POST", url, strings.NewReader(string(data)))
 		if err != nil {
-			log.Printf("Failed to build tunnel-token broadcast to %s: %v", peer.Name, err)
+			logErrorf("Failed to build tunnel-token broadcast to %s: %v", peer.Name, err)
 			continue
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			log.Printf("Failed to broadcast tunnel token to %s: %v", peer.Name, err)
+			logErrorf("Failed to broadcast tunnel token to %s: %v", peer.Name, err)
 			continue
 		}
 		resp.Body.Close()
@@ -448,7 +447,7 @@ func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
 		a.saveState()
 		if req.Token == "" {
 			a.stopCloudflared()
-			log.Printf("Cloudflare tunnel removed via sync")
+			logInfof("Cloudflare tunnel removed via sync")
 		} else {
 			a.stateMu.RLock()
 			disabled := a.state.CFTunnelDisabled
@@ -457,11 +456,11 @@ func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
 				// The token is cluster state and we accept it, but a node
 				// that opted out stays out. startCloudflared enforces this
 				// too; short-circuiting here keeps the log honest.
-				log.Printf("Cloudflare tunnel token synced but this node is disabled; not starting")
+				logInfof("Cloudflare tunnel token synced but this node is disabled; not starting")
 			} else if err := a.restartCloudflared(); err != nil {
-				log.Printf("Failed to start tunnel after sync: %v", err)
+				logErrorf("Failed to start tunnel after sync: %v", err)
 			} else {
-				log.Printf("Cloudflare tunnel started via sync")
+				logInfof("Cloudflare tunnel started via sync")
 			}
 		}
 	}

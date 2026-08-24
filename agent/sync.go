@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"time"
 )
@@ -23,17 +22,17 @@ func validIngestedWorkload(w *Workload) bool {
 		return false
 	}
 	if !ValidateWorkloadName(w.Name) {
-		log.Printf("Sync: rejecting workload with invalid name %q", w.Name)
+		logInfof("Sync: rejecting workload with invalid name %q", w.Name)
 		return false
 	}
 	if net.ParseIP(w.IP) == nil {
-		log.Printf("Sync: rejecting workload %q with invalid IP %q", w.Name, w.IP)
+		logInfof("Sync: rejecting workload %q with invalid IP %q", w.Name, w.IP)
 		return false
 	}
 	if len(w.Tags) > 0 {
 		normTags, badTag := normalizeTags(w.Tags)
 		if badTag != "" {
-			log.Printf("Sync: rejecting workload %q with invalid tag %q", w.Name, badTag)
+			logInfof("Sync: rejecting workload %q with invalid tag %q", w.Name, badTag)
 			return false
 		}
 		w.Tags = normTags
@@ -49,7 +48,7 @@ func validIngestedTombstone(dw *DeletedWorkload) bool {
 		return false
 	}
 	if net.ParseIP(dw.IP) == nil {
-		log.Printf("Sync: rejecting tombstone with invalid IP %q", dw.IP)
+		logInfof("Sync: rejecting tombstone with invalid IP %q", dw.IP)
 		return false
 	}
 	return true
@@ -65,18 +64,18 @@ func validIngestedPeer(p *Peer) bool {
 		return false
 	}
 	if !ValidateWorkloadName(p.ID) {
-		log.Printf("Sync: rejecting peer with invalid ID %q", p.ID)
+		logInfof("Sync: rejecting peer with invalid ID %q", p.ID)
 		return false
 	}
 	// Peer.Name is operator-supplied (hostname); allow alphanumerics,
 	// dash, underscore, and dot for FQDN-style hostnames.
 	if !validPeerNamePattern.MatchString(p.Name) {
-		log.Printf("Sync: rejecting peer %q with invalid name %q", p.ID, p.Name)
+		logInfof("Sync: rejecting peer %q with invalid name %q", p.ID, p.Name)
 		return false
 	}
 	// Peer.IP may be empty briefly during bootstrap before WARP attaches.
 	if p.IP != "" && net.ParseIP(p.IP) == nil {
-		log.Printf("Sync: rejecting peer %q with invalid IP %q", p.ID, p.IP)
+		logInfof("Sync: rejecting peer %q with invalid IP %q", p.ID, p.IP)
 		return false
 	}
 	// Version/arch are peer-supplied and rendered by the dashboard -
@@ -123,7 +122,7 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 		// Check if we have a local workload that should be deleted
 		existing := a.state.Workloads[dw.IP]
 		if existing != nil && dw.Version > existing.Version {
-			log.Printf("Sync: removing workload %s (IP %s) - deleted by peer (tombstone version %d > workload version %d)",
+			logInfof("Sync: removing workload %s (IP %s) - deleted by peer (tombstone version %d > workload version %d)",
 				existing.Name, dw.IP, dw.Version, existing.Version)
 			if existing.Owner == a.hwid {
 				result.LostOwnership = append(result.LostOwnership, existing)
@@ -148,7 +147,7 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 		if existing == nil || w.Version > existing.Version {
 			// Check if we lost ownership (IP collision resolution)
 			if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
-				log.Printf("Lost ownership of %s (IP %s) to %s - newer version wins", existing.Name, w.IP, shortID(w.Owner, 12))
+				logInfof("Lost ownership of %s (IP %s) to %s - newer version wins", existing.Name, w.IP, shortID(w.Owner, 12))
 				result.LostOwnership = append(result.LostOwnership, existing)
 			}
 			a.state.Workloads[w.IP] = w
@@ -171,7 +170,7 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 			result.Changed = true
 		}
 		if _, exists := a.state.EnvData[dek.Key]; exists {
-			log.Printf("Sync: removing env key %s - deleted by peer", dek.Key)
+			logInfof("Sync: removing env key %s - deleted by peer", dek.Key)
 			delete(a.state.EnvData, dek.Key)
 			result.EnvUpdated = true
 		}
@@ -194,7 +193,7 @@ func (a *Agent) mergeWorkloadState(syncResp *SyncResponse) *MergeResult {
 	}
 	for k, v := range syncResp.EnvData {
 		if !ValidateEnvKey(k) {
-			log.Printf("Sync: rejecting env key with invalid name %q", k)
+			logInfof("Sync: rejecting env key with invalid name %q", k)
 			continue
 		}
 		if tombstone := a.state.DeletedEnvKeys[k]; tombstone != nil {
@@ -243,7 +242,7 @@ func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) *MergeResult {
 		}
 		existing := a.state.Workloads[dw.IP]
 		if existing != nil && dw.Version > existing.Version {
-			log.Printf("Startup sync: workload %s was deleted while we were down", existing.Name)
+			logInfof("Startup sync: workload %s was deleted while we were down", existing.Name)
 			if existing.Owner == a.hwid {
 				result.LostOwnership = append(result.LostOwnership, existing)
 			}
@@ -263,7 +262,7 @@ func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) *MergeResult {
 		existing := a.state.Workloads[w.IP]
 		if existing == nil || w.Version > existing.Version {
 			if existing != nil && existing.Owner == a.hwid && w.Owner != a.hwid {
-				log.Printf("Workload %s was revived by %s while we were down", w.Name, shortID(w.Owner, 12))
+				logInfof("Workload %s was revived by %s while we were down", w.Name, shortID(w.Owner, 12))
 				result.LostOwnership = append(result.LostOwnership, existing)
 			}
 			a.state.Workloads[w.IP] = w
@@ -283,7 +282,7 @@ func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) *MergeResult {
 			a.state.DeletedEnvKeys[dek.Key] = dek
 		}
 		if _, exists := a.state.EnvData[dek.Key]; exists {
-			log.Printf("Startup sync: env key %s was deleted while we were down", dek.Key)
+			logInfof("Startup sync: env key %s was deleted while we were down", dek.Key)
 			delete(a.state.EnvData, dek.Key)
 		}
 	}
@@ -300,7 +299,7 @@ func (a *Agent) mergeStartupSyncData(syncResp *SyncResponse) *MergeResult {
 	}
 	for k, v := range syncResp.EnvData {
 		if !ValidateEnvKey(k) {
-			log.Printf("Startup sync: rejecting env key with invalid name %q", k)
+			logInfof("Startup sync: rejecting env key with invalid name %q", k)
 			continue
 		}
 		if a.state.DeletedEnvKeys[k] != nil {
@@ -329,7 +328,7 @@ func (a *Agent) syncStateOnStartup() {
 		return
 	}
 
-	log.Printf("Syncing state with cluster on startup...")
+	logInfof("Syncing state with cluster on startup...")
 	synced := false
 	var allLostOwnership []*Workload
 
@@ -384,15 +383,15 @@ func (a *Agent) syncStateOnStartup() {
 	// down -v` and is safe to call without the state lock - we already
 	// updated state inside the merge.
 	for _, wl := range allLostOwnership {
-		log.Printf("Startup sync: stopping local workload %s - ownership transferred during downtime", wl.Name)
+		logInfof("Startup sync: stopping local workload %s - ownership transferred during downtime", wl.Name)
 		a.removeWorkload(wl)
 	}
 
 	if synced {
-		log.Printf("Startup sync complete")
+		logInfof("Startup sync complete")
 		a.saveState()
 	} else {
-		log.Printf("Warning: could not reach any peers for startup sync")
+		logWarnf("could not reach any peers for startup sync")
 	}
 }
 
@@ -460,7 +459,7 @@ func (a *Agent) syncWorkloads() {
 
 	// Stop workloads we lost ownership of (outside lock)
 	for _, wl := range allLostOwnership {
-		log.Printf("Stopping local workload %s - ownership transferred", wl.Name)
+		logInfof("Stopping local workload %s - ownership transferred", wl.Name)
 		a.removeWorkload(wl)
 	}
 
@@ -519,7 +518,7 @@ func (a *Agent) tunnelModeSyncWorkloads() {
 
 	// Stop workloads we lost ownership of (outside lock)
 	for _, wl := range result.LostOwnership {
-		log.Printf("Stopping local workload %s - ownership transferred", wl.Name)
+		logInfof("Stopping local workload %s - ownership transferred", wl.Name)
 		a.removeWorkload(wl)
 	}
 

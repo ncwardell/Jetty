@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os/exec"
@@ -792,7 +791,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		"redeployed": needsRedeploy,
 	}
 
-	log.Printf("Updated workload %s (redeploy=%v)", found.Name, needsRedeploy)
+	logInfof("Updated workload %s (redeploy=%v)", found.Name, needsRedeploy)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
@@ -1061,7 +1060,7 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Owner is dead - allow cleanup of orphaned workload from our state
-		log.Printf("Cleaning up orphaned workload %s (owner %s unreachable)", name, found.Owner)
+		logInfof("Cleaning up orphaned workload %s (owner %s unreachable)", name, found.Owner)
 	}
 
 	// Distinguish a real deletion from the source-side cleanup half of a
@@ -1086,9 +1085,9 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.Unlock()
 
 	if isMove {
-		log.Printf("Move: stopping local %s (IP %s); new owner already recorded", name, foundIP)
+		logInfof("Move: stopping local %s (IP %s); new owner already recorded", name, foundIP)
 	} else {
-		log.Printf("Deleted workload %s (IP %s), created tombstone for sync propagation", name, foundIP)
+		logInfof("Deleted workload %s (IP %s), created tombstone for sync propagation", name, foundIP)
 	}
 
 	// Remove if we're running it
@@ -1256,7 +1255,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 			delReq, _ := a.peerRequest("DELETE", deleteURL, nil)
 			delResp, err := httpClient.Do(delReq)
 			if err != nil {
-				log.Printf("Warning: failed to remove workload from original owner (will reconcile via gossip): %v", err)
+				logWarnf("failed to remove workload from original owner (will reconcile via gossip): %v", err)
 			} else {
 				delResp.Body.Close()
 			}
@@ -1290,7 +1289,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 			} `json:"owner"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&deployResult); err != nil {
-			log.Printf("Warning: could not parse deploy response: %v", err)
+			logWarnf("could not parse deploy response: %v", err)
 		}
 		newVersion = deployResult.Version
 
@@ -1306,7 +1305,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 			delReq, _ := a.peerRequest("DELETE", deleteURL, nil)
 			delResp, err := httpClient.Do(delReq)
 			if err != nil {
-				log.Printf("Warning: failed to remove workload from original owner: %v", err)
+				logWarnf("failed to remove workload from original owner: %v", err)
 			} else {
 				delResp.Body.Close()
 			}
@@ -1330,7 +1329,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	a.saveState()
 	a.broadcastState()
 
-	log.Printf("Moved workload %s to %s", found.Name, target.Name)
+	logInfof("Moved workload %s to %s", found.Name, target.Name)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"moved": "ok", "to": target.Name})
 }
@@ -1454,7 +1453,7 @@ func (a *Agent) apiStartWorkload(w http.ResponseWriter, r *http.Request) {
 	// Re-setup mesh IP routing (container IP may have changed)
 	a.setupWorkloadIP(found)
 
-	log.Printf("Started workload: %s", found.Name)
+	logInfof("Started workload: %s", found.Name)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "started", "name": found.Name})
 }
@@ -1520,7 +1519,7 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Stopped workload: %s", found.Name)
+	logInfof("Stopped workload: %s", found.Name)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "stopped", "name": found.Name})
 }
@@ -1594,7 +1593,7 @@ func (a *Agent) apiRestartWorkload(w http.ResponseWriter, r *http.Request) {
 		a.setupWorkloadIP(found)
 	}
 
-	log.Printf("Restarted workload: %s", found.Name)
+	logInfof("Restarted workload: %s", found.Name)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "restarted", "name": found.Name})
 }
