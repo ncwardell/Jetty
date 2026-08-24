@@ -120,28 +120,38 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       them. **One click double-runs a workload.** The claim-settle does not
       help; the removed node never finds out it is contesting anything.
 
-      Fixed with tombstones plus a cooperative leave:
+      Fixed with two things that have to happen together:
       1. **Peer tombstones** — `RemovedPeers` in cluster state, gossiped and
-         version-merged like workload tombstones, so `NotifyJoin`,
-         `peer-announce` and `sync` all refuse to resurrect a removed node.
-         GC them, but on a much longer horizon than workload tombstones — a
-         node can legitimately be powered off for weeks.
-      2. **Cooperative leave** — tell the target it has been removed so it
-         calls `memberlist.Leave()`, stops gossiping, and stops the workloads
-         it no longer owns. Memberlist has no forcible eviction: the node has
-         to leave itself, so removal is a conversation, not a unilateral write.
-      3. **Key revocation** — invalidate its `APIKey` so it cannot rejoin
-         without a fresh join token.
+         version-merged like workload tombstones, carried on both the
+         memberlist `LocalState` path and `/api/sync`. `NotifyJoin` and
+         `peer-announce` consult them, so no peer can resurrect a removed
+         node. They expire after 30 days rather than the 1 hour used for
+         workload tombstones — a node can legitimately be powered off for
+         weeks, but must not be stranded forever either.
+      2. **Cooperative leave** — `POST /api/leave` tells the target it is out.
+         It stops the workloads it owns *before* the cluster fails them over,
+         leaves the gossip pool, and tombstones itself. Memberlist has no
+         forcible eviction, so removal is a conversation, not an announcement.
 
       Teardown now happens after the leave is requested, and the response
       reports `leave_acknowledged` so an operator knows whether the node
-      actually heard. Key revocation is NOT done - a removed node keeps its
-      APIKey, and the tombstone is what keeps it out. Worth closing later.
+      actually heard.
 
-      Not covered: a node that is off when removed and boots weeks later
-      inside the 30-day window will be refused by gossip and needs a fresh
-      join token. That is the intended behaviour, but it will surprise
-      someone.
+      Two deliberate asymmetries: the tombstone does **not** gate `/api/join`
+      (a fresh one-time token is an explicit decision to re-admit, and clears
+      it), and a tombstone naming the local node is stored and propagated but
+      never acted on (one stale gossip message must not evict a healthy node
+      from its own view).
+
+- [ ] **Revoke a removed node's API key.** Not done. A removed node keeps its
+      `APIKey`, so the tombstone is the only thing keeping it out — good
+      enough against gossip, but it should not still hold a valid cluster
+      credential.
+
+- [ ] **Removal is silent to a node that is off at the time.** It boots later,
+      is refused by gossip, and needs a fresh join token with no indication
+      why. Intended behaviour, but it will surprise someone — surface it in
+      the dashboard's node list rather than leaving it to a log line.
 
 - [x] **Join no longer silently provisions a blackhole node.** The Cloudflare
       Mesh migration broke the generated join command and nothing noticed:
