@@ -84,6 +84,35 @@ func (a *Agent) corsMiddleware(next http.Handler) http.Handler {
 // set JETTY_SECRET so AdminKey gets bootstrapped.
 func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Public endpoints are checked FIRST, before any lock is taken.
+		//
+		// This ordering is load-bearing. Taking stateMu.RLock() up front meant
+		// every request - including ones that need no credential at all -
+		// scanned the whole peer table under the lock and discarded the
+		// result. So when a writer was stuck (route programming used to
+		// fork/exec under this lock), even /api/health blocked, and a wedged
+		// node could not report being wedged. Cheaper per request and, more
+		// importantly, keeps the endpoints you reach for during an incident
+		// independent of the lock that is stuck.
+		publicPaths := []string{
+			"/api/health",
+			"/api/livez",
+			"/api/join",
+			"/swagger/",
+		}
+
+		path := r.URL.Path
+		if path == "/" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		for _, p := range publicPaths {
+			if strings.HasPrefix(path, p) {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
 		// Skip authentication if neither AdminKey nor any peer key is
 		// configured. Mirrors the original behavior on first-ever-node
 		// startup before bootstrap completes.
@@ -102,25 +131,6 @@ func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 		if adminKey == "" && selfKey == "" && !hasAnyPeerKey {
 			next.ServeHTTP(w, r)
 			return
-		}
-
-		// Public endpoints that don't require API key.
-		publicPaths := []string{
-			"/api/health",
-			"/api/join",
-			"/swagger/",
-		}
-
-		path := r.URL.Path
-		if path == "/" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		for _, p := range publicPaths {
-			if strings.HasPrefix(path, p) {
-				next.ServeHTTP(w, r)
-				return
-			}
 		}
 
 		apiKey := r.Header.Get("X-API-Key")
@@ -254,6 +264,7 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/nodes", a.apiListNodes).Methods("GET")
 	r.HandleFunc("/api/nodes/{id}", a.apiRemoveNode).Methods("DELETE")
 	r.HandleFunc("/api/leave", a.apiLeave).Methods("POST")
+	r.HandleFunc("/api/livez", a.apiLivez).Methods("GET")
 	r.HandleFunc("/api/nodes/{id}/update", a.apiUpdateNode).Methods("POST")
 
 	// --- Cloudflare Tunnel (handlers_tunnel.go) ----------------------
