@@ -404,7 +404,10 @@ type Agent struct {
 	healTimesMu sync.Mutex
 
 	// Tunnel support for cross-node routing
-	tunnelMode        string          // "ipip", "gre", or "" (none available)
+	tunnelMode string // "ipip", "gre", or "" (none available)
+	// tunnelStack selects the userspace tunnel receive implementation:
+	// "netstack" (gVisor, real TCP) or "legacy" (the hand-rolled proxy).
+	tunnelStack       string
 	ipipWarnedPeers   map[string]bool // Peers we've already warned about tunnel failure
 	ipipWarnedPeersMu sync.Mutex
 

@@ -39,6 +39,7 @@ func New() (*Agent, error) {
 		clusterSecret:      getEnv("JETTY_SECRET", ""),
 		tunnelDomain:       getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - Cloudflare tunnel for API access
 		tunnelHost:         getEnv("JETTY_TUNNEL_HOST", ""),   // e.g., "node1.cluster.example.com" - this node's specific subdomain
+		tunnelStack:        getEnv("JETTY_TUNNEL_STACK", "netstack"),
 		hostShellEnabled:   strings.EqualFold(getEnv("JETTY_HOST_SHELL", "false"), "true"),
 		cfTunnelID:         getEnv("JETTY_CF_TUNNEL_ID", ""), // WARP connector tunnel ID for route management
 		composeDir:         filepath.Join(dataDir, "compose"),
