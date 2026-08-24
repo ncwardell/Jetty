@@ -555,7 +555,7 @@ volumes:
 | `JETTY_DATA_DIR` | Where state lives. | `/data` |
 | `JETTY_API_PORT` | API port. | `6880` |
 | `JETTY_TUNNEL_STACK` | Which TCP implementation terminates the userspace tunnel's *receive* side: `netstack` (gVisor — real TCP, with retransmission and congestion control) or `legacy` (the older hand-rolled proxy, kept only as a rollback). Only affects nodes that fall back to the userspace tunnel; kernel IPIP/GRE paths are unaffected. | `netstack` |
-| `JETTY_LOG_LEVEL` | `debug`, `info`, `warn`, or `error`. `debug` also turns on source file:line. An unrecognised value falls back to `info` rather than failing startup. | `info` |
+| `JETTY_LOG_LEVEL` | Startup log level: `debug`, `info`, `warn`, or `error`. `debug` also turns on source file:line. An unrecognised value falls back to `info` rather than failing startup. Change it on a **running** node with `POST /api/log-level` — restarting to enable debug destroys the state you wanted to debug. | `info` |
 | `JETTY_LOG_FORMAT` | `text` (logfmt — readable in `docker logs`) or `json` (for shipping to a log collector). | `text` |
 | `JETTY_SERVICE_CIDR` | Mesh network CIDR for workload IPs. | `10.100.0.0/16` |
 | `JETTY_TUNNEL_DOMAIN` | Cloudflare tunnel domain (e.g., `cluster.example.com`). | - |

@@ -265,6 +265,8 @@ func (a *Agent) runAPI() {
 	r.HandleFunc("/api/nodes/{id}", a.apiRemoveNode).Methods("DELETE")
 	r.HandleFunc("/api/leave", a.apiLeave).Methods("POST")
 	r.HandleFunc("/api/livez", a.apiLivez).Methods("GET")
+	r.HandleFunc("/api/log-level", a.apiGetLogLevel).Methods("GET")
+	r.HandleFunc("/api/log-level", a.apiSetLogLevel).Methods("POST")
 	r.HandleFunc("/api/nodes/{id}/update", a.apiUpdateNode).Methods("POST")
 
 	// --- Cloudflare Tunnel (handlers_tunnel.go) ----------------------

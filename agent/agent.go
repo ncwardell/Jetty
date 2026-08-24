@@ -193,12 +193,12 @@ func (a *Agent) Start() error {
 	hasPeers := len(a.state.Peers) > 0
 	a.stateMu.RUnlock()
 	if !hasAdmin && !hasPeers && a.joinURL == "" && a.clusterSecret == "" {
-		logInfof("!!! WARNING: JETTY_SECRET is not set and no cluster state exists - the API will be UNAUTHENTICATED. !!!")
-		logInfof("!!! Set JETTY_SECRET to a strong random value before exposing this node to a network.              !!!")
+		logWarnf("!!! WARNING: JETTY_SECRET is not set and no cluster state exists - the API will be UNAUTHENTICATED. !!!")
+		logWarnf("!!! Set JETTY_SECRET to a strong random value before exposing this node to a network.              !!!")
 	}
 
 	if a.hostShellEnabled {
-		logInfof("!!! Host shell endpoint /api/host/shell is ENABLED - anyone with the cluster admin key can run shell commands on this host. !!!")
+		logWarnf("!!! Host shell endpoint /api/host/shell is ENABLED - anyone with the cluster admin key can run shell commands on this host. !!!")
 	}
 
 	// Record whether WARP was already running before we touched anything.
@@ -343,7 +343,34 @@ func (a *Agent) Start() error {
 		mode += " + tunnel (" + a.tunnelDomain + ")"
 	}
 	logInfof("Jetty started: %s (%s) @ %s [mode: %s]", a.hostname, shortID(a.hwid, 12), a.ip, mode)
+	a.logEffectiveConfig()
 	return nil
+}
+
+// logEffectiveConfig prints the settings that decide how this node behaves.
+//
+// Worth its own line because "which code path am I actually on" is the first
+// question during any incident or rollout, and the answer was previously
+// invisible: JETTY_TUNNEL_STACK selects between a brand-new TCP stack and the
+// old hand-rolled one, and nothing logged which had been chosen - including
+// when netstack failed to initialise and silently fell back.
+func (a *Agent) logEffectiveConfig() {
+	tunnelStack := "legacy"
+	if a.useNetstackTunnel() {
+		tunnelStack = "netstack"
+	}
+	transport := a.tunnelMode
+	if transport == "" {
+		if a.tunDevice != nil {
+			transport = "userspace"
+		} else {
+			transport = "none"
+		}
+	}
+	logInfof("Config: tunnel_stack=%s transport=%s api_port=%d service_cidr=%s "+
+		"host_shell=%v log_level=%s cf_tunnel=%v",
+		tunnelStack, transport, a.apiPort, a.serviceCIDR,
+		a.hostShellEnabled, levelVar.Level().String(), a.tunnelDomain != "")
 }
 
 func (a *Agent) Stop() {

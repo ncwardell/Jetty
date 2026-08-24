@@ -562,6 +562,79 @@
                 }
             }
         },
+        "/log-level": {
+            "get": {
+                "description": "Returns the level this node is logging at right now, which may differ from JETTY_LOG_LEVEL if it was changed at runtime.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "cluster"
+                ],
+                "summary": "Get the current log level",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Sets the log level on this node immediately. Use `debug` to investigate a live problem without restarting and losing the state you are investigating; `debug` also turns on source file:line. Reverts to JETTY_LOG_LEVEL on restart, so a forgotten debug setting cannot persist silently. Admin key required.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "cluster"
+                ],
+                "summary": "Change the log level without restarting",
+                "parameters": [
+                    {
+                        "description": "e.g. {\\",
+                        "name": "level",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Unrecognised level",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Admin key required",
+                        "schema": {
+                            "$ref": "#/definitions/agent.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/nodes": {
             "get": {
                 "description": "Returns all nodes in the cluster (self + peers)",

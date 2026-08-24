@@ -1140,6 +1140,58 @@ paths:
       summary: Liveness and lock-health probe
       tags:
       - cluster
+  /log-level:
+    get:
+      description: Returns the level this node is logging at right now, which may
+        differ from JETTY_LOG_LEVEL if it was changed at runtime.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Get the current log level
+      tags:
+      - cluster
+    post:
+      consumes:
+      - application/json
+      description: Sets the log level on this node immediately. Use `debug` to investigate
+        a live problem without restarting and losing the state you are investigating;
+        `debug` also turns on source file:line. Reverts to JETTY_LOG_LEVEL on restart,
+        so a forgotten debug setting cannot persist silently. Admin key required.
+      parameters:
+      - description: e.g. {\
+        in: body
+        name: level
+        required: true
+        schema:
+          additionalProperties:
+            type: string
+          type: object
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Unrecognised level
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+        "401":
+          description: Admin key required
+          schema:
+            $ref: '#/definitions/agent.ErrorResponse'
+      summary: Change the log level without restarting
+      tags:
+      - cluster
   /nodes:
     get:
       description: Returns all nodes in the cluster (self + peers)

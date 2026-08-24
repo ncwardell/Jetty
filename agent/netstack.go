@@ -374,3 +374,13 @@ func errFromTCPIP(what string, err tcpip.Error) error {
 type netstackSetupError struct{ what, msg string }
 
 func (e *netstackSetupError) Error() string { return "netstack " + e.what + ": " + e.msg }
+
+// activeTunnelStack names the receive-path implementation in force. Exposed on
+// /api/livez because "did netstack actually start, or did it fall back?" is
+// otherwise invisible - and the fallback is silent by design.
+func (a *Agent) activeTunnelStack() string {
+	if a.useNetstackTunnel() {
+		return "netstack"
+	}
+	return "legacy"
+}
