@@ -325,6 +325,23 @@ func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 	// Wrap the websocket connection with a write mutex to prevent concurrent write panics
 	tc := &tunnelConn{conn: conn}
 
+	// The netstack path terminates TCP on a real stack instead of the
+	// hand-rolled one below. Built per connection so replies go back out the
+	// WebSocket they arrived on. Falling back to legacy on a setup error is
+	// deliberate: a stack that will not initialise should degrade to the old
+	// behaviour, not drop the peer's traffic entirely.
+	var ns *netstackProxy
+	if a.useNetstackTunnel() {
+		var err error
+		ns, err = a.newNetstackProxy(tc)
+		if err != nil {
+			logErrorf("netstack: setup failed, falling back to the legacy tunnel: %v", err)
+			ns = nil
+		} else {
+			defer ns.close()
+		}
+	}
+
 	for {
 		msgType, packet, err := conn.ReadMessage()
 		if err != nil {
@@ -365,7 +382,17 @@ func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 			continue
 		}
 
-		logInfof("WS tunnel proxy: %s -> %s (%d bytes)", srcIP, dstIP, len(packet))
+		logDebugf("WS tunnel proxy: %s -> %s (%d bytes)", srcIP, dstIP, len(packet))
+
+		// Hand the whole packet to the stack and let it do the protocol work.
+		// The local-workload check above still gates what gets in - netstack
+		// would happily answer for anything we injected.
+		if ns != nil {
+			pkt := make([]byte, len(packet))
+			copy(pkt, packet)
+			ns.inject(dstIP, pkt)
+			continue
+		}
 
 		// Parse IP header to determine protocol
 		ihl := int(packet[0]&0x0f) * 4
