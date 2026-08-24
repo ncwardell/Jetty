@@ -16,7 +16,7 @@
             "name": "MIT",
             "url": "https://opensource.org/licenses/MIT"
         },
-        "version": "2.0"
+        "version": "0.0.x"
     },
     "basePath": "/api",
     "paths": {
