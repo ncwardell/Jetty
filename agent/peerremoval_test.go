@@ -295,3 +295,51 @@ func TestRemovalStateStillConverges(t *testing.T) {
 		}
 	}
 }
+
+// TestLeaveNeverDestroysVolumes guards an invariant that cannot be exercised
+// in a unit test (it shells out to docker) but is the most dangerous thing on
+// this path.
+//
+// removeWorkload runs `docker compose down -v --remove-orphans`, and the -v
+// destroys every named volume in the project - databases, SQLite state, auth
+// tokens. The first version of apiLeave called it for every workload the node
+// owned, so DELETE /api/nodes/{id} would have told the target to wipe its own
+// data. Being removed from a cluster must never mean losing what is on the
+// node: the operator may be decommissioning it, or may have clicked the wrong
+// row.
+//
+// Stopping is all the leave needs - it exists so two copies of a workload do
+// not run while the cluster fails it over, not to reclaim disk.
+func TestLeaveNeverDestroysVolumes(t *testing.T) {
+	src := readAgentSource(t, "peerremoval.go")
+
+	start := strings.Index(src, "func (a *Agent) apiLeave(")
+	if start == -1 {
+		t.Fatal("apiLeave not found")
+	}
+	end := strings.Index(src[start:], "\n}\n")
+	if end == -1 {
+		t.Fatal("could not find the end of apiLeave")
+	}
+	body := src[start : start+end]
+
+	for _, forbidden := range []string{"removeWorkload", `"down"`, `"-v"`} {
+		// Skip the explanatory comment lines; only real calls matter.
+		for _, line := range strings.Split(body, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			if strings.Contains(line, forbidden) {
+				t.Errorf("apiLeave references %s - leaving a cluster must stop "+
+					"workloads, never destroy their volumes:\n  %s", forbidden, trimmed)
+			}
+		}
+	}
+
+	if !strings.Contains(body, `composeCmd(wl.Name, "stop")`) {
+		t.Error("apiLeave no longer stops the workloads it owns; without that, " +
+			"the removed node keeps serving them while the cluster fails them " +
+			"over - two live copies of the same workload")
+	}
+}

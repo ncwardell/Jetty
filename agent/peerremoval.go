@@ -168,9 +168,24 @@ func (a *Agent) apiLeave(w http.ResponseWriter, r *http.Request) {
 	a.tombstonePeerLocked(a.hwid, a.hostname)
 	a.stateMu.Unlock()
 
+	// STOP, do not remove.
+	//
+	// removeWorkload runs `docker compose down -v --remove-orphans`, and the
+	// -v destroys every named volume in the project - the database files, the
+	// SQLite state, the auth tokens. Being removed from a cluster must never
+	// mean losing the data on the node being removed: the operator may be
+	// decommissioning it, or may simply have clicked the wrong row.
+	//
+	// `stop` gives us everything the leave actually needs. The point is that
+	// this node is no longer serving these workloads while the cluster fails
+	// them over, so two copies never run at once. The containers and their
+	// volumes stay exactly where they are, and `docker compose start` (or a
+	// rejoin) brings them back.
 	for _, wl := range owned {
-		logInfof("Leave: stopping %s", wl.Name)
-		a.removeWorkload(wl)
+		logInfof("Leave: stopping %s (containers and volumes are preserved)", wl.Name)
+		if out, err := a.composeCmd(wl.Name, "stop"); err != nil {
+			logWarnf("Leave: failed to stop %s: %v: %s", wl.Name, err, strings.TrimSpace(out))
+		}
 	}
 
 	if a.memberlist != nil {
