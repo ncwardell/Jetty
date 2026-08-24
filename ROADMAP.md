@@ -153,10 +153,16 @@ enforcing it. Remaining gaps:
 
 ## Phase 3 — Standardization
 
-- [ ] **JSON error envelope.** 172 `http.Error` plain-text responses vs 40 JSON
-      success bodies, and no error helper exists. Clients get JSON on success
-      and `text/plain` on failure with no error-code contract. This is the most
-      visible "not a product" API smell and it blocks decent UI error states.
+- [x] **JSON error envelope.** All 185 error sites now emit
+      `{"error": "..."}` with `application/json`, standardized on the
+      already-present `writeError`/`ErrorResponse` rather than a new shape.
+      Status codes normalized to `net/http` constants. Guarded by
+      `TestNoBareHTTPErrorCalls`. Dashboard gained `apiErrorMessage()` so
+      envelopes don't surface as raw JSON in toasts.
+- [ ] **Machine-readable error codes.** Deliberately deferred — codes invented
+      without a consumer are usually the wrong codes. Adding a `code` field to
+      the envelope is non-breaking, so do it when JettyOS or a client actually
+      needs to branch on error type.
 - [ ] **Structured logging.** 332 `log.Printf`, zero `slog`. No levels, no
       request IDs, ad-hoc per-file prefixes.
 - [ ] **Error wrapping.** `fmt.Errorf` uses `%w` only ~45% of the time; zero
