@@ -396,7 +396,7 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 
 	// Ask allowed peers to pre-pull this workload's image so future
 	// failover doesn't have to download during the outage.
-	go a.triggerPeerPrePull(&wl)
+	goSafe("triggerPeerPrePull", func() { a.triggerPeerPrePull(&wl) })
 
 	// Build response with enriched owner info
 	response := map[string]interface{}{
@@ -771,7 +771,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	// If the compose changed, refresh peer pre-pulls so they cache the
 	// new image before any failover.
 	if needsRedeploy {
-		go a.triggerPeerPrePull(found)
+		goSafe("triggerPeerPrePull", func() { a.triggerPeerPrePull(found) })
 	}
 
 	// Build response

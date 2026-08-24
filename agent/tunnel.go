@@ -63,7 +63,7 @@ func (a *Agent) initUserspaceTunnel() error {
 	}
 
 	// Start packet forwarding goroutine (reads from TUN, sends over WebSocket)
-	go a.tunReadLoop()
+	goSupervised("tunReadLoop", a.tunReadLoop)
 
 	log.Printf("Userspace tunnel initialized (TUN: jetty_tun, WebSocket on API port %d)", a.apiPort)
 	return nil
@@ -175,7 +175,7 @@ func (a *Agent) getTunPeerConn(peerID, peerIP string) (*websocket.Conn, error) {
 
 	// Store connection and start receiver goroutine
 	a.tunPeerConns.Store(peerID, conn)
-	go a.tunWsRecvLoop(peerID, conn)
+	goSafe("tunWsRecvLoop", func() { a.tunWsRecvLoop(peerID, conn) })
 
 	log.Printf("WS tunnel: established connection to %s (%s)", shortID(peerID, 8), peerIP)
 	return conn, nil
@@ -308,7 +308,7 @@ func (a *Agent) apiTunnelWs(w http.ResponseWriter, r *http.Request) {
 	log.Printf("WS tunnel: authenticated connection from %s", remoteAddr)
 
 	// Handle incoming packets from this peer using proxy model
-	go a.handleTunnelProxy(conn, remoteAddr)
+	goSafe("handleTunnelProxy", func() { a.handleTunnelProxy(conn, remoteAddr) })
 }
 
 // handleTunnelProxy proxies packets from a peer to local workloads and captures responses.
@@ -376,7 +376,7 @@ func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 			copy(icmpPacket, packet)
 			icmpSrcIP := net.IP(icmpPacket[12:16])
 			icmpDstIP := net.IP(icmpPacket[16:20])
-			go a.proxyICMP(tc, icmpPacket, icmpSrcIP, icmpDstIP, ihl)
+			goSafe("proxyICMP", func() { a.proxyICMP(tc, icmpPacket, icmpSrcIP, icmpDstIP, ihl) })
 		case 6: // TCP - proxy connections
 			// Process TCP packets synchronously to maintain ordering.
 			// Using goroutines here causes race conditions where packets are
@@ -392,7 +392,7 @@ func (a *Agent) handleTunnelProxy(conn *websocket.Conn, remoteAddr string) {
 			copy(udpPacket, packet)
 			udpSrcIP := net.IP(udpPacket[12:16])
 			udpDstIP := net.IP(udpPacket[16:20])
-			go a.proxyUDP(tc, udpPacket, udpSrcIP, udpDstIP, ihl)
+			goSafe("proxyUDP", func() { a.proxyUDP(tc, udpPacket, udpSrcIP, udpDstIP, ihl) })
 		default:
 			log.Printf("WS tunnel proxy: unsupported protocol %d", protocol)
 		}
@@ -590,7 +590,7 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 		proxyConn.mu.Unlock()
 
 		// Start goroutine to read from TCP and send back via WebSocket
-		go a.tcpProxyReadLoop(flowKey, proxyConn)
+		goSafe("tcpProxyReadLoop", func() { a.tcpProxyReadLoop(flowKey, proxyConn) })
 		return
 	}
 

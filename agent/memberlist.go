@@ -62,6 +62,7 @@ type jettyEventDelegate struct {
 
 // NodeMeta returns metadata about this node (called by memberlist)
 func (d *jettyDelegate) NodeMeta(limit int) []byte {
+	defer recoverPanic("memberlist.NodeMeta")
 	d.metaMu.RLock()
 	defer d.metaMu.RUnlock()
 	if len(d.meta) > limit {
@@ -73,6 +74,7 @@ func (d *jettyDelegate) NodeMeta(limit int) []byte {
 
 // NotifyMsg is called when a broadcast message is received
 func (d *jettyDelegate) NotifyMsg(msg []byte) {
+	defer recoverPanic("memberlist.NotifyMsg")
 	if len(msg) == 0 {
 		return
 	}
@@ -88,12 +90,14 @@ func (d *jettyDelegate) NotifyMsg(msg []byte) {
 
 // GetBroadcasts returns any queued broadcasts (called by memberlist during protocol)
 func (d *jettyDelegate) GetBroadcasts(overhead, limit int) [][]byte {
+	defer recoverPanic("memberlist.GetBroadcasts")
 	return d.broadcasts.GetBroadcasts(overhead, limit)
 }
 
 // LocalState is called for full state sync when a new node joins
 // We return serialized state that MergeRemoteState will process
 func (d *jettyDelegate) LocalState(join bool) []byte {
+	defer recoverPanic("memberlist.LocalState")
 	d.agent.stateMu.RLock()
 	defer d.agent.stateMu.RUnlock()
 
@@ -125,6 +129,7 @@ func (d *jettyDelegate) LocalState(join bool) []byte {
 
 // MergeRemoteState is called to merge state from another node
 func (d *jettyDelegate) MergeRemoteState(buf []byte, join bool) {
+	defer recoverPanic("memberlist.MergeRemoteState")
 	if len(buf) == 0 {
 		return
 	}
@@ -158,6 +163,7 @@ func (d *jettyDelegate) MergeRemoteState(buf []byte, join bool) {
 
 // NotifyJoin is called when a node joins the cluster
 func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
+	defer recoverPanic("memberlist.NotifyJoin")
 	if node.Name == e.agent.hwid {
 		return // Ignore self
 	}
@@ -225,6 +231,7 @@ func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
 // for the periodic failover scan - kick checkFailover immediately so
 // orphaned workloads start moving sub-second after node loss.
 func (e *jettyEventDelegate) NotifyLeave(node *memberlist.Node) {
+	defer recoverPanic("memberlist.NotifyLeave")
 	if node.Name == e.agent.hwid {
 		return // Ignore self
 	}
@@ -255,6 +262,7 @@ func (e *jettyEventDelegate) NotifyLeave(node *memberlist.Node) {
 
 // NotifyUpdate is called when a node's metadata is updated
 func (e *jettyEventDelegate) NotifyUpdate(node *memberlist.Node) {
+	defer recoverPanic("memberlist.NotifyUpdate")
 	if node.Name == e.agent.hwid {
 		return // Ignore self
 	}
@@ -503,7 +511,7 @@ func (a *Agent) handleWorkloadUpdate(wl *Workload) {
 	if existing == nil || wl.Version > existing.Version {
 		if existing != nil && existing.Owner == a.hwid && wl.Owner != a.hwid {
 			log.Printf("Broadcast: lost ownership of %s to %s", existing.Name, shortID(wl.Owner, 12))
-			go a.removeWorkload(existing)
+			goSafe("removeWorkload", func() { a.removeWorkload(existing) })
 		}
 		a.state.Workloads[wl.IP] = wl
 		// Same stale-tombstone retirement as mergeWorkloadState: if
@@ -542,7 +550,7 @@ func (a *Agent) handleWorkloadDelete(dw *DeletedWorkload) {
 	if existing := a.state.Workloads[dw.IP]; existing != nil && dw.Version > existing.Version {
 		log.Printf("Broadcast: removing workload %s (deleted)", existing.Name)
 		if existing.Owner == a.hwid {
-			go a.removeWorkload(existing)
+			goSafe("removeWorkload", func() { a.removeWorkload(existing) })
 		}
 		delete(a.state.Workloads, dw.IP)
 		changed = true
