@@ -321,7 +321,7 @@ func (a *Agent) prePullLocally(wl *Workload) error {
 	}
 	// Best-effort pull. Don't block: failures here just mean the
 	// failover-time pull won't be cache-hit.
-	go a.pullWithRetry(wl.Name)
+	goSafe("pullWithRetry", func() { a.pullWithRetry(wl.Name) })
 	return nil
 }
 

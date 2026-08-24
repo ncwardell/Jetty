@@ -88,5 +88,5 @@ func (a *Agent) apiRotateAdminKey(w http.ResponseWriter, r *http.Request) {
 
 	// Belt-and-suspenders: trigger a state push to peers so they get
 	// the new key faster than the gossip ticker would deliver it.
-	go a.broadcastState()
+	goSafe("broadcastState", a.broadcastState)
 }

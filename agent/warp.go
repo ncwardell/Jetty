@@ -141,7 +141,7 @@ func (a *Agent) ipMonitorLoop() {
 				log.Printf("WARP IP changed: %s -> %s", oldIP, newIP)
 				// Notify memberlist + re-announce so peers rebuild toward us.
 				a.updateMemberlistIP(newIP)
-				go a.announceOurIP()
+				goSafe("announceOurIP", a.announceOurIP)
 			} else {
 				log.Printf("WARP reconnected (IP unchanged %s); re-ensuring tunnels/routes", newIP)
 			}
@@ -320,7 +320,7 @@ func (a *Agent) configureWarpRuntime(token string) error {
 			}
 
 			// Tell peers our address so cross-node routing can begin.
-			go a.announceOurIP()
+			goSafe("announceOurIP", a.announceOurIP)
 
 			return nil
 		}

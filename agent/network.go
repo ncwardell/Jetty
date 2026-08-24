@@ -151,7 +151,7 @@ func (a *Agent) initNetwork() error {
 	// FORWARD rules above ours on daemon restart, which silently breaks
 	// inter-workload mesh traffic. Idempotent: applyMeshIptablesRules is a
 	// no-op when rules already exist.
-	go a.iptablesMaintenanceLoop()
+	goSupervised("iptablesMaintenanceLoop", a.iptablesMaintenanceLoop)
 
 	log.Printf("Network ready: %s (WARP), workload interface: jetty0", a.ip)
 	return nil

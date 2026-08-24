@@ -268,7 +268,7 @@ func (a *Agent) Start() error {
 	}
 
 	// Announce our current IP to peers (handles IP changes during restart/update)
-	go a.announceOurIP()
+	goSafe("announceOurIP", a.announceOurIP)
 
 	// Auto-start owned workloads in the background. `docker compose up`
 	// can be slow (image pulls, init sidecars on network filesystems,
@@ -277,18 +277,18 @@ func (a *Agent) Start() error {
 	// finished deploying. Running it as a goroutine lets the agent come
 	// online immediately; new sync rounds and failover behave correctly
 	// while autostart is still finishing.
-	go a.autostartWorkloads()
+	goSafe("autostartWorkloads", a.autostartWorkloads)
 
 	// Reconcile loop catches workloads that didn't come up cleanly on
 	// first try - cold-boot ordering, transient docker errors, image
 	// pull races. Idempotent against healthy workloads.
-	go a.reconcileWorkloadsLoop()
+	goSupervised("reconcileWorkloadsLoop", a.reconcileWorkloadsLoop)
 
 	// Update hosts file
 	a.updateHosts()
 
 	// Start API first (so cloudflared can connect to it)
-	go a.runAPI()
+	goSupervised("runAPI", a.runAPI)
 
 	// Wait for API to be ready before starting cloudflared
 	a.waitForAPI()
@@ -303,35 +303,35 @@ func (a *Agent) Start() error {
 	if err != nil {
 		log.Printf("Warning: memberlist init failed: %v - falling back to HTTP gossip", err)
 		// Fall back to HTTP-based gossip if memberlist fails
-		go a.gossipLoop()
+		goSupervised("gossipLoop", a.gossipLoop)
 	} else {
 		a.memberlist = ml
 		// Join known peers
 		a.joinMemberlistPeers()
 		// Start sync loop (for periodic full state sync, tombstone GC)
-		go a.memberlistSyncLoop()
+		goSupervised("memberlistSyncLoop", a.memberlistSyncLoop)
 	}
 
 	// Start failover monitor
-	go a.failoverLoop()
+	goSupervised("failoverLoop", a.failoverLoop)
 
 	// Start scheduled-backup ticker (no-op when no schedule is set;
 	// when set, the lowest-HWID healthy node runs each interval)
-	go a.scheduledBackupLoop()
+	goSupervised("scheduledBackupLoop", a.scheduledBackupLoop)
 
 	// Start IP monitor (detects WARP IP changes and re-announces)
-	go a.ipMonitorLoop()
+	goSupervised("ipMonitorLoop", a.ipMonitorLoop)
 
 	// Start CPU sampling (background updates for accurate metrics)
-	go a.cpuSampleLoop()
+	goSupervised("cpuSampleLoop", a.cpuSampleLoop)
 
 	// Keep compose override files (for cross-workload DNS) in sync with the
 	// cluster's workload set. Cheap when the set hasn't changed.
-	go a.hostsOverrideReconcileLoop()
+	goSupervised("hostsOverrideReconcileLoop", a.hostsOverrideReconcileLoop)
 
 	// Reclaim disk from stranded Docker images (self-updates and moving-tag
 	// re-pulls leave the old image behind forever). See prune.go.
-	go a.imagePruneLoop()
+	goSupervised("imagePruneLoop", a.imagePruneLoop)
 
 	mode := "warp (" + a.ip + ")"
 	if a.tunnelDomain != "" {

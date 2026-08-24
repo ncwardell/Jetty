@@ -88,7 +88,7 @@ func (a *Agent) startCloudflared() error {
 	log.Printf("Cloudflare tunnel started (pid: %d)", a.cfCmd.Process.Pid)
 
 	// Monitor process and restart on failure
-	go a.monitorCloudflared()
+	goSafe("monitorCloudflared", a.monitorCloudflared)
 
 	return nil
 }

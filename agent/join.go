@@ -338,7 +338,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Notify other peers
-	go a.announcePeer(peer)
+	goSafe("announcePeer", func() { a.announcePeer(peer) })
 
 	resp := map[string]interface{}{
 		"peers":        allPeers,
