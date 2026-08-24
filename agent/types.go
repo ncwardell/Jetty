@@ -27,6 +27,7 @@ const (
 	FailoverCheckInterval = 5 * time.Second  // How often to scan for orphaned workloads
 	FailoverGracePeriod   = 30 * time.Second // Peer must stay unreachable this long before failover claims its workloads
 	FailoverStartupGrace  = 90 * time.Second // No failover claims for the first N seconds after agent startup - lets memberlist + checkPeers converge so we don't claim based on stale peer-health from before our last shutdown
+	FailoverClaimSettle   = 2 * time.Second  // After announcing a claim, wait this long and re-check before deploying, so a node that lost a concurrent claim never starts the container
 	IPMonitorInterval     = 10 * time.Second // How often to check for WARP IP changes
 	CPUSampleInterval     = 30 * time.Second // How often to sample CPU usage
 	TombstoneMaxAge       = 1 * time.Hour    // How long to keep deletion tombstones
