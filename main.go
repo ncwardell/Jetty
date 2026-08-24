@@ -22,7 +22,11 @@ import (
 // @license.name MIT
 // @license.url https://opensource.org/licenses/MIT
 
-// @host localhost:6880
+// Deliberately no @host: the spec is served from whichever node you reached,
+// which may be a WARP IP, a LAN address, or a Cloudflare tunnel hostname.
+// Pinning it to localhost:6880 made generated clients point at the wrong place
+// everywhere except a local dev box. With host omitted, clients use the host
+// they fetched the spec from.
 // @BasePath /api
 
 // @schemes https http
@@ -33,6 +37,13 @@ import (
 // @description API key for authentication (JETTY_SECRET)
 
 // @Security ApiKeyAuth
+
+// Keep docs/ in step with the @Router annotations. Version-pinned so the
+// generator matches the swaggo/swag version in go.mod - a mismatch produces a
+// spec the embedded UI cannot render. CI runs go generate and fails if
+// anything under docs/ changes, so a new endpoint cannot land undocumented.
+//
+//go:generate go run github.com/swaggo/swag/cmd/swag@v1.16.6 init -g main.go -o docs --parseDependency --parseInternal
 
 func main() {
 	// First thing, so nothing logs before the level and format are settled.

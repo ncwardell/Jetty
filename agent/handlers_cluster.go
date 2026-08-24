@@ -211,6 +211,14 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
+
+// apiSync godoc
+// @Summary Full replicated state dump (internal)
+// @Description Node-to-node pull used as the backstop when memberlist gossip is unavailable. Returns every workload, deletion tombstone, env value and env tombstone so a peer can merge by highest-version-wins. Peer API key required.
+// @Tags internal
+// @Produce json
+// @Success 200 {object} SyncResponse
+// @Router /sync [get]
 func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 	// Return all workloads, deleted workloads (tombstones), and env data for sync
 	// This allows other nodes to get a complete view of cluster state including deletions
@@ -250,6 +258,16 @@ func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
+
+// apiPeerAnnounce godoc
+// @Summary Announce a peer's current address and state (internal)
+// @Description Node-to-node. A peer reports its identity, WARP IP, version and architecture so the receiver can add or refresh it in the peer table. Peer API key required.
+// @Tags internal
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} ErrorResponse "Invalid request"
+// @Router /peer-announce [post]
 func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Peer Peer `json:"peer"`
@@ -350,6 +368,15 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 
 // apiHeartbeat receives heartbeats from peers in tunnel-only mode.
 // This allows peers to track each other's health through the Cloudflare tunnel.
+// apiHeartbeat godoc
+// @Summary Peer liveness ping (internal)
+// @Description Node-to-node liveness used in tunnel mode, where peers cannot reach each other directly over WARP. Refreshes the sender's LastSeen. Peer API key required.
+// @Tags internal
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} ErrorResponse "Invalid request"
+// @Router /heartbeat [post]
 func (a *Agent) apiHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID   string `json:"id"`
@@ -428,6 +455,17 @@ func (a *Agent) broadcastTunnelToken(token string) {
 		resp.Body.Close()
 	}
 }
+
+// apiTunnelSync godoc
+// @Summary Receive a tunnel token broadcast (internal)
+// @Description Node-to-node. Accepts the cluster CFToken from a peer and starts or stops cloudflared to match. A node that has opted out via DELETE /tunnel?scope=node accepts the token but stays stopped. Peer API key required.
+// @Tags internal
+// @Accept json
+// @Produce json
+// @Param token body TunnelRequest true "Cluster tunnel token; empty string tears the tunnel down"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} ErrorResponse "Invalid request"
+// @Router /tunnel/sync [post]
 func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Token string `json:"token"`
