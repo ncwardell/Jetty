@@ -347,8 +347,10 @@ DELETE /api/env/{key}         # Delete env variable
 ### Cloudflare Tunnel
 ```bash
 GET    /api/tunnel            # Get tunnel status
-POST   /api/tunnel            # Configure tunnel with token
-DELETE /api/tunnel            # Remove tunnel
+POST   /api/tunnel            # ?scope=cluster sets the token; default re-attaches this node
+DELETE /api/tunnel            # Default detaches this node only; ?scope=cluster removes it everywhere
+
+# Both mutating endpoints accept ?node=<id|name> to target a peer.
 ```
 
 ### Backup / Restore (admin only)

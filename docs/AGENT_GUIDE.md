@@ -267,7 +267,7 @@ ID or name.
 ### Tunnel, host, backup, proxy
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET/POST/DELETE` | `/api/tunnel` | Manage the Cloudflare tunnel config. |
+| `GET/POST/DELETE` | `/api/tunnel` | Manage the Cloudflare tunnel. Defaults to `?scope=node` (this node only); `?scope=cluster` affects every node. `?node=<id\|name>` targets a peer. |
 | `WS` | `/api/tunnel/ws` | Userspace packet tunnel between peers (internal). |
 | `GET` | `/api/host/containers` | All Docker containers on this node, including ones Jetty didn't deploy. |
 | `GET` | `/api/host/compose` | Host-level compose projects. |

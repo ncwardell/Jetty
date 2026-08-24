@@ -154,9 +154,24 @@ type State struct {
 	Workloads        map[string]*Workload        `json:"workloads"`                   // IP -> Workload
 	DeletedWorkloads map[string]*DeletedWorkload `json:"deleted_workloads,omitempty"` // IP -> tombstone (for sync propagation)
 	CFToken          string                      `json:"cf_token,omitempty"`          // Cloudflare tunnel token (shared cluster-wide)
-	WarpToken        string                      `json:"warp_token,omitempty"`        // Cloudflare WARP connector token (shared cluster-wide)
-	EnvData          map[string]string           `json:"env_data,omitempty"`          // Encrypted environment variables (key -> encrypted value)
-	DeletedEnvKeys   map[string]*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`  // Key -> tombstone (for sync propagation)
+
+	// CFTunnelDisabled opts THIS node out of running a cloudflared
+	// connector while leaving the cluster-wide CFToken intact. It is
+	// node-local and deliberately never broadcast or merged - the whole
+	// point is to detach one node without touching the others.
+	//
+	// Motivating incident: every node running a connector on the same
+	// Cloudflare tunnel means Cloudflare load-balances public requests
+	// across all of them. When one node could not reach a workload, that
+	// share of requests stalled. The only available remedy was DELETE
+	// /api/tunnel, which broadcast an empty token and tore down every
+	// connector in the cluster - taking all public sites down with
+	// Cloudflare 530/1033 until the token was re-POSTed.
+	CFTunnelDisabled bool `json:"cf_tunnel_disabled,omitempty"`
+
+	WarpToken      string                    `json:"warp_token,omitempty"`       // Cloudflare WARP connector token (shared cluster-wide)
+	EnvData        map[string]string         `json:"env_data,omitempty"`         // Encrypted environment variables (key -> encrypted value)
+	DeletedEnvKeys map[string]*DeletedEnvKey `json:"deleted_env_keys,omitempty"` // Key -> tombstone (for sync propagation)
 
 	// AdminKey is the cluster-wide operator/dashboard credential.
 	// Bootstrapped from JETTY_SECRET on the first node, persisted, and

@@ -55,10 +55,18 @@ func (a *Agent) startCloudflared() error {
 
 	a.stateMu.RLock()
 	token := a.state.CFToken
+	disabled := a.state.CFTunnelDisabled
 	a.stateMu.RUnlock()
 
 	if token == "" {
 		return nil // No token configured
+	}
+	if disabled {
+		// Node-local opt-out. Checked here rather than at the call sites so
+		// restarts, token syncs, and the monitor's restart loop all honour
+		// it - otherwise the connector resurrects itself.
+		log.Printf("Cloudflare tunnel not started: disabled on this node")
+		return nil
 	}
 
 	a.cfStopCh = make(chan struct{})
@@ -181,9 +189,10 @@ func (a *Agent) monitorCloudflared() {
 		a.cfMu.Lock()
 		a.stateMu.RLock()
 		token := a.state.CFToken
+		disabled := a.state.CFTunnelDisabled
 		a.stateMu.RUnlock()
 
-		if token == "" {
+		if token == "" || disabled {
 			a.cfMu.Unlock()
 			return
 		}
