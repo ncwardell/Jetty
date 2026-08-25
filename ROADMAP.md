@@ -880,6 +880,28 @@ strictly better, but the nesting is structural.
       different questions and only the first was tested. Worth knowing before
       the number gets quoted again as settled.
 
+**Relaying is not hole punching**, and the two get conflated. A relay has both
+parties dial *out* to a middleman which forwards between them — every byte
+crosses the middle box, permanently. That is TURN, Tailscale's DERP, an SSH
+`-R`/`-L` jump box, and Jetty's own WS TUN fallback. Hole punching uses the
+middleman *only* to swap observed external addresses and agree on timing, after
+which the two sides talk directly and the middleman leaves the path entirely.
+
+**Cloudflare is already the jump box.** `cloudflared` dials out; the edge is
+the box both sides reach; node↔node traffic goes node → edge → node. That is
+also why a NAT'd node can be the join/bootstrap endpoint at all: Tunnel makes
+it publicly *addressable* without being publicly *reachable*, which is the
+single property that removes the public-node requirement. The limit is that it
+gives TCP/HTTP addressability, not UDP — fine for signalling, not a UDP
+rendezvous.
+
+Relaying normally costs a detour through the middle. **Measured here, it does
+not:** raw internet Hetzner↔Radxa was 112–130ms, over WARP 118–122ms. Both
+nodes reach nearby PoPs and the backbone is fast, so the edge relay adds
+essentially nothing. Which is the argument against chasing punching at all —
+it would buy direct paths for the ~85–90% of punchable pairs, reclaiming
+roughly zero.
+
 - [ ] **UDP hole punching — needed later than it looks.** An existing HTTP/TCP
       path to the cluster is a perfectly good *signalling* channel, and the
       worker's control socket from stage B already is one: the sponsor is on
