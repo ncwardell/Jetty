@@ -547,16 +547,15 @@ delegation-over-agreement principle at the top of this file.
    creating a CNAME per node to that node's `<uuid>.cfargotunnel.com`. Making
    attach depend on that would put a manual DNS step in front of "rent a box".
 
-   *Data:* the worker opens **direct** tunnels to whichever nodes it actually
-   needs to exchange traffic with, dialled outbound, on demand. Workload
-   traffic never transits the sponsor. An earlier draft of this section had
-   the sponsor relaying, which made it both a bottleneck and a SPOF; that was
-   a mistake born of assuming "dials out" meant "dials one".
+   *Data:* **the worker joins the WARP mesh with its own connector token.** It
+   gets a mesh IP and is reachable like any other node; routing, `/etc/hosts`
+   and the existing tunnel/route machinery all work unchanged, and owner is
+   next hop as it always was. See "transport choice" below — this reverses two
+   earlier drafts.
 
-   Because every connection is outbound, **nothing ever has to reach in** — no
-   DNS record for the worker, no inbound port, no NAT traversal, no mesh
-   membership. That is what makes "doesn't touch the public WARP" true by
-   construction rather than by policy.
+   Note this is orthogonal to everything else in this section. The trust model
+   — separate map, no gossip, no admin key, per-placement envelopes, attach
+   epoch, drop-on-loss — is unchanged by it. Only the transport moves.
 
    **Sponsorship is incidental and movable.** A worker's placements live in
    ordinary cluster state (owner = worker ID, gossiped among the real nodes),
@@ -567,14 +566,47 @@ delegation-over-agreement principle at the top of this file.
    already has. A worker costs its sponsor one socket, so capacity spreads by
    construction: rent twenty boxes and they attach wherever they land.
 
-   This also beats giving each worker its own Cloudflare connector token, and
-   for a reason worth recording: **a node terminating its own tunnel can
-   filter.** It sees every packet, so it can enforce that a worker only
-   sources from the mesh IPs of workloads actually placed on it and only
-   reaches IPs those placements are permitted to reach. On the WARP mesh the
-   worker can address everything and enforcement is Cloudflare's, at
-   Cloudflare's granularity. Owning the tunnel is what makes least-privilege
-   possible at all.
+   **Transport choice: mesh, not bespoke tunnels.** Two earlier drafts had the
+   worker off the mesh, dialling its own outbound tunnel to each node, on the
+   argument that a node terminating its own tunnel can filter, and that owning
+   the tunnel is what makes least-privilege possible. That argument was too
+   strong, and the design it justified was worse:
+
+   - **The filtering claim does not hold.** Jetty already manages iptables
+     extensively — DNAT, FORWARD ACCEPT, MASQUERADE, with an idempotent
+     maintenance loop that re-applies them because Docker stomps them. A worker
+     on the mesh has a known mesh IP, so per-worker filter rules are the *same*
+     enforcement point, reusing machinery that exists. The real difference is
+     default-closed versus default-open — no tunnel means no path, whereas on
+     the mesh the path exists and must be denied — which is a meaningful
+     difference in failure mode, not in capability.
+   - **It did not solve NAT, which is what it was for.** The Radxa is behind
+     home NAT with no public address and cannot be dialled, so the bespoke
+     design needed a relay fallback anyway. WARP solves NAT traversal for free;
+     declining it here and reinventing a worse version is precisely the trap
+     the guiding principles warn about.
+   - **It cost a whole second data plane** — lazy dialling, a reachability
+     list, N real sockets per worker, relay for unreachable nodes — where the
+     mesh costs one connection and reuses every existing route path.
+
+   What is being accepted, explicitly:
+
+   - The worker can address the whole mesh at L3: every node's API port, every
+     workload IP, and gossip on 6881. Application auth is the only barrier
+     until filter rules are added.
+   - **Memberlist is the sharp edge.** It binds to the WARP IP with no CIDR
+     allowlist, and the trust boundary today is literally "you are on the
+     mesh". This promotes Stage A from worthwhile hardening to **mandatory**,
+     and adds an explicit requirement to refuse gossip sourced from worker
+     mesh IPs.
+   - Revocation is slower: closing a socket is instant and local, revoking a
+     connector token is an API call with propagation. Application-level
+     revocation stays instant, so this is bounded rather than fatal.
+   - It needs the agent's **first Cloudflare API integration** — there is none
+     today — to mint and revoke a connector token per worker.
+
+   Revisit the bespoke-tunnel design if workers ever run alongside genuinely
+   sensitive workloads, where default-closed is worth its cost.
 
 3. **The socket is the lease. Expiry is optional.** A worker usually knows
    better than the cluster when it is going away, so an open-ended attachment
@@ -643,13 +675,19 @@ transcode, scrapes. The UI should say so at placement time, not bury it in docs.
 
 **Stages.** Each stands alone and lands in order:
 
-- [ ] **A. `Peer.Role` + receive-side enforcement.** The load-bearing one, and
-      valuable on its own regardless of the rest: "this peer may not mutate
-      cluster state" is an invariant worth having. Enforcement belongs on the
-      *receiving* side of every path a peer can write through —
-      `MergeRemoteState`, `apiPeerAnnounce`, broadcast handling, the workload
-      and key-rotation endpoints. Default-deny for unknown roles, so a future
-      role cannot silently inherit full rights.
+- [ ] **A. Receive-side enforcement (`Peer.Role`), and gossip that refuses
+      strangers.** Mandatory, not optional, once workers are on the mesh: the
+      trust boundary today is literally "you are on the mesh", memberlist binds
+      to the WARP IP with no CIDR allowlist, and a worker will be on that mesh.
+
+      Enforcement belongs on the *receiving* side of every path a peer can
+      write through — `MergeRemoteState`, `apiPeerAnnounce`, broadcast
+      handling, the workload and key-rotation endpoints — with default-deny for
+      unknown roles, so a future role cannot silently inherit full rights. Plus
+      an explicit refusal of gossip sourced from a worker's mesh IP.
+
+      Valuable on its own regardless of workers: any peer on the mesh can
+      currently rewrite cluster state just by gossiping it.
 - [ ] **B. Attach: worker tokens and the control socket.** A second token type
       granting worker role only, and `/api/worker/attach` — a long-lived
       WebSocket carrying placements down and status up. The worker is handed
@@ -672,48 +710,23 @@ transcode, scrapes. The UI should say so at placement time, not bury it in docs.
       `RemovedPeerMaxAge` (30 days) is wrong here — a worker ID never recurs,
       so its tombstone can be short. Keep planned release and disconnect as
       distinct paths: one drains cleanly, the other is failover.
-- [ ] **E. Direct data tunnels + per-worker packet filtering.** The worker
-      dials a tunnel to a node the first time it has traffic for it, using the
-      reachability the sponsor supplied — which should cover only the nodes it
-      genuinely needs, not the full topology. Nodes route the worker's workload
-      IPs down that tunnel directly, so this stays inside the existing
-      owner-is-next-hop model and no relay is involved.
+- [ ] **E. Mesh membership + per-worker packet filtering.** Mint a scoped
+      Cloudflare connector token per worker, hand it over at attach, revoke it
+      on detach. This is the agent's first Cloudflare API integration, so the
+      credential handling for it is new surface worth reviewing on its own.
 
-      The filtering is the point, not a nicety: the terminating node drops any
-      packet whose source is not a mesh IP placed on that worker, or whose
-      destination that worker's placements are not permitted to reach. Do it
-      here, while the tunnel is new — retrofitting enforcement onto an
-      already-trusted path is how it ends up never happening.
+      The worker then gets a mesh IP and everything existing works unchanged —
+      routes, `/etc/hosts`, tunnel setup, owner-is-next-hop. No new data plane.
 
-      **Connection count — a worker costs more than a peer, not less.** An
-      earlier draft claimed the opposite by miscounting what a peer's tunnels
-      are. `ensurePeerTunnel` runs `ip tunnel add ... mode ipip`: a *stateless
-      encapsulation interface*, no socket, no handshake, no keepalive. So a
-      peer holds exactly **one** real connection — WARP WireGuard to the
-      Cloudflare edge — plus N cheap encaps, and node-to-node packets go
-      node → edge → node. The edge is the rendezvous, which is what makes that
-      one connection independent of cluster size.
-
-      A worker has no edge to rendezvous through, so every path is its own real
-      socket: 1 control + N data. That is the price of being off-mesh, and it
-      is the *same* property that makes filtering possible — we terminate the
-      tunnel, so we can inspect it.
-
-      Which makes the connector-token question a genuine trade, not a settled
-      one. On WARP: one connection, but the worker can address the whole mesh
-      and enforcement is Cloudflare's, at Cloudflare's granularity. Off WARP: N
-      connections, but per-placement filtering is ours to enforce. For a small
-      cluster N is trivial and off-WARP wins. At many workers × many nodes,
-      N×W real sockets is a real cost and this should be revisited rather than
-      assumed.
-
-      **NAT is the open problem here, and it is not hypothetical.** The worker
-      dials node B directly, which requires B to be reachable. The Radxa is
-      behind home NAT with no public address and cannot be dialled at all. So:
-      direct where the node is reachable, relay via a reachable node where it
-      is not. Much narrower than relaying everything through the sponsor, but
-      not nothing — and it means the reachability list the sponsor supplies has
-      to say *how* to reach each node, not merely which ones exist.
+      **The filtering is the part that must not be deferred**, because the mesh
+      is default-open: on attach, install iptables rules on each node that drop
+      traffic from the worker's mesh IP to anything its placements do not
+      justify — other nodes' API ports, gossip on 6881, and workload IPs it has
+      no business reaching. Jetty already runs an idempotent iptables
+      maintenance loop (Docker stomps rules), so these belong in it rather than
+      applied once and forgotten. Ship the rules in the same change as
+      membership; a worker that is on the mesh and unfiltered is a rented box
+      with cluster-wide L3 reach.
 - [ ] **F. Placement gating and worker-loss policy.** Two directions, and the
       inbound one is a trap verified in the current code, not a hypothetical.
 
@@ -755,9 +768,14 @@ transcode, scrapes. The UI should say so at placement time, not bury it in docs.
       release on demand. Attachment state is the product; a worker you cannot
       see attached or gone is one you will be surprised by.
 
-Start at A. It is the only stage the others cannot be built without, and it
-closes a real gap today: any peer on the mesh can currently rewrite cluster
-state by gossiping it.
+Start at A, and treat it as a hard prerequisite rather than a first step: with
+workers on the mesh, shipping any later stage without it puts a rented box
+inside the current trust boundary, which is "you are on the mesh". It also
+closes a real gap today, workers or not — any peer on the mesh can rewrite
+cluster state just by gossiping it.
+
+The same is true of E's filter rules, for the same reason: mesh membership is
+default-open, so membership and filtering ship together or not at all.
 
 ## Known scaling limits
 
