@@ -872,6 +872,34 @@ strictly better, but the nesting is structural.
       different questions and only the first was tested. Worth knowing before
       the number gets quoted again as settled.
 
+- [ ] **UDP hole punching — needed later than it looks.** An existing HTTP/TCP
+      path to the cluster is a perfectly good *signalling* channel, and the
+      worker's control socket from stage B already is one: the sponsor is on
+      the mesh, so it can relay punch coordination (addresses, and a "fire at
+      T" for the rough simultaneity punching needs) to whichever node is the
+      target. No new signalling infrastructure.
+
+      But a TCP-observed address does not give the UDP mapping. A node seeing
+      an HTTP request from `203.0.113.5:54321` has that host's public IP and a
+      NAT entry for *that TCP connection*; a UDP socket from the same host gets
+      a different external port. So a UDP reflexive probe is still required —
+      which is what STUN is, and which needs no STUN server or library: a node
+      listening on one UDP port and echoing the source it observed is ~20
+      lines, on a box we already need for the lighthouse role.
+
+      **The reason this is not urgent:** punching is only required when *both*
+      ends are behind NAT. A rented VPS has a public IP — that is what is being
+      paid for. So worker↔Hetzner is direct, and worker↔Radxa and
+      Hetzner↔Radxa both work under the simple rule "whoever is behind NAT
+      initiates, keepalive holds the mapping open". Every pair in the current
+      cluster is covered. This becomes necessary on the *second* NAT'd node —
+      a friend's box, a second site, a laptop — which is a real case but not
+      today's.
+
+      When it does land, a relay fallback is mandatory: cone NATs punch ~85–90%
+      of the time, symmetric-to-symmetric essentially never. The WS TUN is
+      already that fallback.
+
 - [ ] **QUIC datagrams (RFC 9221) if the WS TUN ever stops being a fallback.**
       Unreliable datagram frames inside a QUIC connection: the outer layer
       never retransmits, so there is nothing for the inner TCP to fight with.
