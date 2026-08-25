@@ -456,15 +456,24 @@ main finding: JettyOS mostly needs Jetty to be *finished*, not extended.
 
 **New, and specific to JettyOS:**
 
-- [ ] **Wire up `JETTY_TUNNEL_HOST`.** The per-node subdomain is already read
-      from the environment and stored on the agent, then never used anywhere.
-      It is exactly the per-node addressing §4 needs, half-built.
+- [x] **Wire up `JETTY_TUNNEL_HOST`.** ~~The per-node subdomain is already read
+      from the environment and stored on the agent, then never used anywhere.~~
+      Done. `Peer.TunnelHost` now rides `NodeMeta` and `peerWire`, is ingested in
+      `NotifyJoin`/`NotifyUpdate`, and `getPeerAPIURL` prefers it over the
+      cluster-wide domain. The bug this closed: before WARP attaches, the
+      fallback used the *shared* domain, which Cloudflare resolves to an
+      arbitrary node — so `rotate-key`, `leave` and `move`, all of which mutate
+      peer-specific state, could land on the wrong node. Validated harder than
+      `Version`/`Arch` because it becomes the authority of an authenticated URL.
 - [ ] **WebSocket upgrade in `/api/proxy/`.** Currently `httpClient.Do()` with
       no hijack and no `websocket.Dialer`, so browser upgrade requests fail.
       The single concrete blocker for browser↔container streams.
-- [ ] **Lift `bridgeWebSockets()` out of `handlers_terminal.go`.** It is already
-      payload-agnostic — forwards message type and data verbatim, unbuffered.
-      It just needs to stop living in the terminal handler.
+- [x] **Lift `bridgeWebSockets()` out of `handlers_terminal.go`.** Done — now
+      `agent/wsbridge.go`. Pure code motion; it forwards message type and data
+      verbatim and inspects neither, so it was never terminal-specific. Picked
+      up its first tests on the way, including the goroutine-leak property
+      (both conns must close before the second wait, or one pump leaks per
+      proxied session).
 - [ ] **Extract `rankCandidates()` from `shouldClaim`, add launch-time
       placement.** Worth doing regardless of JettyOS: today a workload lands on
       whichever node received the POST, and the not-allowed fallback
@@ -483,6 +492,90 @@ main finding: JettyOS mostly needs Jetty to be *finished*, not extended.
       unconditionally; a flag needs a guard in every one of them and in every
       future feature. A separate map keyed by window/session ID, never
       persisted or gossiped, needs zero changes to any of them.
+
+## Worker nodes (ephemeral, untrusted capacity)
+
+Rent a box for 30 minutes, have it run workloads, let it vanish. It never holds
+the admin key, never joins the WARP mesh, and everything it touched is gone
+when the lease ends.
+
+This is the largest single item on the roadmap and it is worth being precise
+about why: **Jetty currently has exactly one trust tier.** `/api/join` hands the
+joiner the complete state — every workload, the whole env store, the admin key,
+and every peer's `APIKey`. Being on the mesh *is* the authentication, and
+`MergeRemoteState` merges whatever a peer sends. There is no smaller thing a
+node can be. So this is not a flag; it is a second kind of participant.
+
+Naming: **worker**, not "unprivileged". The distinction is role, not permission
+level — a worker is a node that executes but does not decide, which is the same
+delegation-over-agreement principle at the top of this file.
+
+**The four decisions that shape everything else:**
+
+1. **A worker is not a gossip peer.** It does not run memberlist. Filtering an
+   untrusted peer's merges is the hard, easy-to-get-wrong version of this
+   problem: today a peer can gossip "I own vaultwarden now" or "these workloads
+   are deleted" and every node takes it. A worker is pushed work by its sponsor
+   and reports status back — a much smaller surface, and it matches what the
+   feature actually is.
+2. **It reaches the cluster over the existing userspace WS tunnel, outbound.**
+   No mesh connector token, no Cloudflare account changes, no inbound ports,
+   and a NAT'd rented box works untouched. `jetty_tun` already does this. This
+   is also what makes "doesn't connect to the public WARP" true by construction
+   rather than by policy. (The alternative — minting a scoped connector token
+   per worker and revoking it on expiry — is possible via the Cloudflare API,
+   but it is strictly more moving parts for strictly less isolation.)
+3. **The sponsor holds the clock.** A node that decides its own expiry is a node
+   that never expires. The sponsor stores the deadline and drives drain →
+   tombstone → revoke. The worker self-terminates too, as belt and braces, but
+   its clock is not authoritative.
+4. **Worker state is memory-only.** Cluster state never gets written to a rented
+   disk, so there is nothing to wipe and nothing left behind if the box is
+   imaged after you release it.
+
+**The honest limitation, stated up front:** a worker running a workload needs
+that workload's env vars. You cannot run vaultwarden without its secrets. The
+reduction is real — no admin key, no env store at large, no ability to
+enumerate anything, no gossip authority — but it is not zero. **Do not place a
+secret-bearing workload on a box you don't trust.** The workloads this is for
+are stateless compute: batch jobs, builds, transcode, scrapes. The UI should
+say so at placement time, not bury it in docs.
+
+**Stages.** Each stands alone and lands in order:
+
+- [ ] **A. `Peer.Role` + receive-side enforcement.** The load-bearing one, and
+      valuable on its own regardless of the rest: "this peer may not mutate
+      cluster state" is an invariant worth having. Enforcement belongs on the
+      *receiving* side of every path a peer can write through —
+      `MergeRemoteState`, `apiPeerAnnounce`, broadcast handling, the workload
+      and key-rotation endpoints. Default-deny for unknown roles, so a future
+      role cannot silently inherit full rights.
+- [ ] **B. Lease tokens and a filtered join.** A second token type: single-use,
+      carries a TTL, grants worker role only. The `/api/join` response for a
+      worker excludes `AdminKey`, excludes `EnvData` beyond the keys its own
+      placements reference, and excludes other peers' `APIKey`s. Worth writing
+      the filter as an allowlist over an explicit worker-visible struct rather
+      than as deletions from the full response — a field added later must not
+      leak by default.
+- [ ] **C. Lease lifecycle.** Sponsor-side deadline; on expiry *or* unplanned
+      loss: drain placements, tombstone the peer, revoke the credential. Reuses
+      the `RemovedPeer` machinery, but `RemovedPeerMaxAge` (30 days) is wrong
+      here — a worker's ID never recurs, so its tombstone can be short. Expiry
+      and disappearance must stay distinct events: one is planned and drains
+      cleanly, the other is failover.
+- [ ] **D. Placement gating.** Workers are ineligible for failover targets by
+      default. A permanent node dying and its workload landing on a box with 12
+      minutes left is worse than the outage. Opt-in per workload; `isNodeAllowed`
+      is the existing hook. Also: refuse (or loudly warn on) workloads with named
+      volumes — `docker compose down -v` at lease end is correct here and
+      destructive everywhere else, and that hazard has already bitten once.
+- [ ] **E. Rent flow in the UI.** Issue lease → copy one command → watch the
+      clock → release early. The clock is the product; a lease you cannot see
+      expiring is a lease you will be surprised by.
+
+Start at A. It is the only stage the others cannot be built without, and it
+closes a real gap today: any peer on the mesh can currently rewrite cluster
+state by gossiping it.
 
 ## Known scaling limits
 
