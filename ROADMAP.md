@@ -791,11 +791,61 @@ Gossip itself is not the bottleneck; SWIM handles 10k-node pools comfortably.
 
 ## Deliberately not doing (yet)
 
-- **Replacing WARP.** It solves NAT traversal, stable addressing, and transport
-  encryption in one dependency. Replacing it means STUN + UDP hole punching
+- **Replacing WARP by hand.** Rolling our own means STUN + UDP hole punching
   (~85–90% of NAT pairs; symmetric-to-symmetric essentially never) plus a relay
   fallback for the rest, plus Noise for encryption. Real work with a real payoff
-  — but Phase 1 correctness matters more.
+  — but Phase 1 correctness matters more, and adopting an existing overlay
+  (below) gets most of the benefit for a fraction of the work.
+
+  Two premises worth correcting, since they have shaped several decisions:
+
+  - *"WireGuard needs a privileged server."* True, and **we have one** —
+    Hetzner is publicly reachable with a static IP. This was never the blocker
+    it was treated as.
+  - *"WARP avoids a relay."* It does not. Every node→node packet goes
+    node → Cloudflare edge → node; the edge *is* the relay. Self-hosting does
+    not add a hop, it changes whose hop it is.
+
+  And the coupling is shallow: the entire mesh-layer dependency on Cloudflare
+  is the interface name `"CloudflareWARP"` (~6 sites) and the CIDR
+  `100.96.0.0/12` (2 sites). Everything downstream consumes `a.warpIP()`, an
+  opaque string read off a named interface.
+
+- [ ] **`JETTY_MESH_IFACE` / `JETTY_MESH_CIDR`.** Make those two constants
+      config. Cheap, and it converts "which overlay are we on" from a rewrite
+      into a setting — the concrete form of the third guiding principle
+      (providers, not assumptions).
+
+- [ ] **Trial a Cloudflare-free underlay on workers first.** Workers need not
+      share an underlay with permanent nodes; a mesh IP is just an address, and
+      anything the nodes can route to works with the existing machinery. So
+      keep WARP for Hetzner and the Radxa and run workers on something else.
+
+      This is the right place to test it precisely *because* workers are
+      disposable: a failure costs a rented box, not the cluster. Do it and
+      "replacing WARP" stops being a big-bang rewrite and becomes something
+      already running in production on real traffic.
+
+      **Nebula** is the strongest fit, and not narrowly. Its certificates embed
+      the IP, group membership and expiry, and its firewall rules key on those
+      groups and travel *in* the cert. A 30-minute cert scoped to a worker IP
+      range therefore **is** the worker token — identity, scoping, filtering
+      and auto-expiry all fall out of one mechanism instead of four, and it
+      replaces both the bespoke token work in stage B and the iptables work in
+      stage E. Lighthouses do discovery and hole punching rather than relaying,
+      so most pairs go direct; a lighthouse must be publicly reachable, which
+      is Hetzner again. Single small Go binary.
+
+      **Headscale** is the alternative: self-hosted Tailscale control plane,
+      the most mature NAT traversal available (hole punching plus DERP
+      fallback). Heavier — a control plane and DERP nodes to operate — and the
+      better answer if the goal is replacing WARP generally rather than serving
+      workers.
+
+      **Plain WireGuard** with the worker peering only to Hetzner, which
+      kernel-forwards it into the existing mesh, is the zero-new-dependency
+      version. Static config, no hole punching, Hetzner as chokepoint — but it
+      works today and the forwarding is cheap.
 - **Crypto-addressed IPv6** (`address = hash(pubkey)`). Removes the allocation
   authority, makes source addresses unspoofable, and is the prerequisite for
   cross-cluster peering. Requires IPv6 — 16 bits of host space in a `/16` hits
