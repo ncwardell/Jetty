@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -53,6 +54,11 @@ const (
 	CloudflaredMaxFailures    = 10
 	CloudflaredSuccessReset   = 30 * time.Second
 
+	// MoveDeployTimeout bounds a workload move. Generous because the deploy on
+	// the far side may restore gigabytes; still bounded so a wedged target
+	// cannot hang the caller forever.
+	MoveDeployTimeout = 30 * time.Minute
+
 	// memberlistLeaveTimeout bounds how long a departing node waits for its
 	// leave to propagate. Short: the removal already happened, this is just
 	// courtesy notice so peers mark us gone promptly rather than by timeout.
@@ -81,6 +87,12 @@ var (
 	httpClient          = &http.Client{Timeout: DefaultHTTPTimeout, Transport: newClusterTransport()}   // General requests (30s)
 	peerClient          = &http.Client{Timeout: PeerHTTPTimeout, Transport: newClusterTransport()}      // Peer communication (5s)
 	unhealthyPeerClient = &http.Client{Timeout: UnhealthyPeerTimeout, Transport: newClusterTransport()} // Known-unhealthy peers (1s)
+	// moveClient is for operations that relocate DATA, not just control
+	// messages. A stateful workload restores on arrival - a vaultwarden move
+	// spent 17 minutes pulling from cluster-storage over a 120ms link - and
+	// against the 30s general client every such move reported failure while
+	// succeeding.
+	moveClient = &http.Client{Timeout: MoveDeployTimeout, Transport: newClusterTransport()}
 )
 
 // =============================================================================
@@ -349,7 +361,12 @@ type Agent struct {
 	// Identity
 	hwid     string
 	hostname string
-	ip       string // WARP IP (100.96.x.x) - primary node address
+	// warpIPVal is the node WARP IP. Atomic because it is written by the WARP
+	// monitor goroutine and read from ~40 places across the agent, none of
+	// which held a common lock - a real data race that -race would eventually
+	// surface on an unrelated change. Reads are lock-free and it composes with
+	// stateMu without any lock-ordering question.
+	warpIPVal atomic.Pointer[string]
 
 	// Cloudflare
 	cfTunnelID string // WARP connector tunnel ID (for workload route management)
@@ -433,6 +450,10 @@ type Agent struct {
 	// Failover tracking (prevents duplicate claims during deployment)
 	failoverInProgress   map[string]time.Time // workload IP -> claim start time
 	failoverInProgressMu sync.Mutex
+	// deployInProgress guards against concurrent deploys of the same workload.
+	// See deployWorkload: the reconcile loop once launched a second compose up
+	// on top of an in-flight move and Docker failed both.
+	deployInProgress sync.Map
 
 	// peerUnhealthySince records when each peer first appeared
 	// unreachable; used to debounce failover so a brief network blip

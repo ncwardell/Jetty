@@ -42,7 +42,7 @@ import (
 func (a *Agent) detectWarpIP() {
 	// Check environment variable first (set by entrypoint script)
 	if ip := os.Getenv("JETTY_WARP_IP"); ip != "" {
-		a.ip = ip
+		a.setWarpIP(ip)
 		logInfof("WARP IP from environment: %s", ip)
 		return
 	}
@@ -61,8 +61,8 @@ func (a *Agent) detectWarpIP() {
 
 	for _, addr := range addrs {
 		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
-			a.ip = ipnet.IP.String()
-			logInfof("WARP IP detected: %s", a.ip)
+			a.setWarpIP(ipnet.IP.String())
+			logInfof("WARP IP detected: %s", a.warpIP())
 			return
 		}
 	}
@@ -118,7 +118,7 @@ func (a *Agent) ipMonitorLoop() {
 				continue
 			}
 
-			ipChanged := newIP != a.ip
+			ipChanged := newIP != a.warpIP()
 			reconnected := warpDown
 			warpDown = false
 			if !ipChanged && !reconnected {
@@ -135,8 +135,8 @@ func (a *Agent) ipMonitorLoop() {
 			unhealthyPeerClient.CloseIdleConnections()
 
 			if ipChanged {
-				oldIP := a.ip
-				a.ip = newIP
+				oldIP := a.warpIP()
+				a.setWarpIP(newIP)
 				logInfof("WARP IP changed: %s -> %s", oldIP, newIP)
 				// Notify memberlist + re-announce so peers rebuild toward us.
 				a.updateMemberlistIP(newIP)
@@ -312,7 +312,7 @@ func (a *Agent) configureWarpRuntime(token string) error {
 		output, _ := exec.Command("warp-cli", "--accept-tos", "status").CombinedOutput()
 		if strings.Contains(strings.ToLower(string(output)), "connected") {
 			a.detectWarpIP()
-			logInfof("WARP connected successfully: %s", a.ip)
+			logInfof("WARP connected successfully: %s", a.warpIP())
 
 			if err := a.initWarpRules(); err != nil {
 				logWarnf("failed to init WARP rules: %v", err)
@@ -326,4 +326,23 @@ func (a *Agent) configureWarpRuntime(token string) error {
 	}
 
 	return fmt.Errorf("WARP connection timeout")
+}
+
+// warpIP returns this node's WARP address, or "" if WARP is not connected.
+//
+// Lock-free. The value is written by the WARP monitor goroutine on connect and
+// on IP change, and read from ~40 places across the agent - none of which
+// previously held a common lock, which made every one of those reads a data
+// race. An atomic keeps reads free and avoids introducing a lock-ordering
+// relationship with stateMu.
+func (a *Agent) warpIP() string {
+	if p := a.warpIPVal.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// setWarpIP records a new WARP address.
+func (a *Agent) setWarpIP(ip string) {
+	a.warpIPVal.Store(&ip)
 }

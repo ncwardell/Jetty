@@ -241,14 +241,14 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 // announceOurIP sends our current IP to all known peers.
 // Called after WARP connects so peers can update our address.
 func (a *Agent) announceOurIP() {
-	if a.ip == "" {
+	if a.warpIP() == "" {
 		return
 	}
 
 	self := &Peer{
 		ID:       a.hwid,
 		Name:     a.hostname,
-		IP:       a.ip,
+		IP:       a.warpIP(),
 		Healthy:  true,
 		LastSeen: time.Now(),
 		// Carry version/arch: apiPeerAnnounce stores the announced
@@ -258,6 +258,6 @@ func (a *Agent) announceOurIP() {
 		Arch:    runtime.GOARCH,
 	}
 
-	logInfof("Announcing our IP (%s) to cluster...", a.ip)
+	logInfof("Announcing our IP (%s) to cluster...", a.warpIP())
 	a.announcePeer(self)
 }

@@ -242,7 +242,27 @@ func (a *Agent) Start() error {
 
 	// Check if we need to join a cluster first (before WARP is configured)
 	a.stateMu.RLock()
-	hasClusterState := a.state.CFToken != "" || a.state.WarpToken != "" || len(a.state.Peers) > 0
+	// What counts as "already part of a cluster", and what deliberately does
+	// not.
+	//
+	// A WARP connector token is NODE IDENTITY - it is how this machine
+	// authenticates to Cloudflare Mesh - and says nothing about whether we
+	// have joined a Jetty cluster. It used to be treated as cluster state,
+	// which meant setting JETTY_WARP_CONNECTOR_TOKEN silently suppressed the
+	// join: the node bootstrapped itself as a brand-new single-node cluster,
+	// came up unauthenticated, and never contacted the cluster it was handed
+	// a token for. Nothing logged an error, because from its point of view
+	// nothing failed.
+	//
+	// That was latent until the generated join command started including the
+	// per-node Mesh token (which it must, or the node joins as a passive
+	// replica and drops all traffic). The two correct fixes collided.
+	//
+	// CFToken stays: JETTY_CF_TOKEN is documented as bootstrap-node-only, so
+	// finding one in the environment really does mean "I am the first node".
+	// Peers and AdminKey are the real evidence of a completed join, and are
+	// what stop a restart from trying to redeem an already-burned token.
+	hasClusterState := a.state.CFToken != "" || len(a.state.Peers) > 0 || a.state.AdminKey != ""
 	needsJoin := a.joinURL != "" && !hasClusterState
 	a.stateMu.RUnlock()
 
@@ -258,7 +278,7 @@ func (a *Agent) Start() error {
 	}
 
 	// Now we should have WARP IP (either from startup or after join)
-	if a.ip == "" {
+	if a.warpIP() == "" {
 		return fmt.Errorf("WARP IP not detected - ensure WARP is connected")
 	}
 
@@ -347,11 +367,11 @@ func (a *Agent) Start() error {
 	// re-pulls leave the old image behind forever). See prune.go.
 	goSupervised("imagePruneLoop", a.imagePruneLoop)
 
-	mode := "warp (" + a.ip + ")"
+	mode := "warp (" + a.warpIP() + ")"
 	if a.tunnelDomain != "" {
 		mode += " + tunnel (" + a.tunnelDomain + ")"
 	}
-	logInfof("Jetty started: %s (%s) @ %s [mode: %s]", a.hostname, shortID(a.hwid, 12), a.ip, mode)
+	logInfof("Jetty started: %s (%s) @ %s [mode: %s]", a.hostname, shortID(a.hwid, 12), a.warpIP(), mode)
 	a.logEffectiveConfig()
 	return nil
 }

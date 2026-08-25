@@ -108,10 +108,58 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       netstacks over an in-memory wire, so a real handshake and an 8MB
       transfer run through the actual receive path (~0.12s). Binary 29M -> 33M.
 
-      NOT yet verified against real hardware, real workloads, or a real
-      WebSocket - see "Verify under load" above, which is still the gate.
+      VERIFIED ON REAL HARDWARE (2026-08-25). A vaultwarden move from Hetzner
+      to the Radxa restored ~5.5MB over CIFS from cluster-storage across the
+      mesh - the exact workload that deadlocked the legacy path - and
+      completed with the sqlite passing PRAGMA integrity_check on arrival.
+      Also verified: cross-node TCP, container-target translation
+      (10.100.0.5:80 -> 172.20.0.2:80), RST on closed ports, native ICMP, and
+      no goroutine leak after 253 connections (35 -> 33).
 
 ### 1b. Correctness
+
+- [ ] **Operations report the wrong outcome. This is a theme, not four bugs.**
+      Every failure found on 2026-08-25 has the same shape: an operation
+      succeeds or fails while reporting the opposite.
+
+      1. `DELETE /api/nodes/{id}` returned 200 and did not stick (fixed).
+      2. The generated join command produced a node that looked healthy and
+         dropped all traffic (fixed).
+      3. `JETTY_WARP_CONNECTOR_TOKEN` silently turned a join into a bootstrap;
+         no error, because nothing had failed from the node's point of view
+         (fixed).
+      4. `apiMoveWorkload` returned `context deadline exceeded` while the
+         deploy continued and completed successfully (open, below).
+
+      The common cause is that Jetty has no habit of **verifying that an
+      operation achieved its intent** - it reports what it attempted. Worth a
+      deliberate pass over every mutating endpoint asking "how would this
+      know it worked?", rather than fixing them one at a time as they bite.
+
+- [x] **`apiMoveWorkload` no longer reports failure on a successful move.** The
+      deploy call used `httpClient` (30s); a vaultwarden move spent 17 minutes
+      restoring ~5.5MB over CIFS across a 120ms link, so it was guaranteed to
+      report `context deadline exceeded` while succeeding. Now uses a
+      `moveClient` sized for data movement (30m, still bounded) - and, more
+      importantly, a timeout no longer *means* failure: the move asks the
+      target whether the workload is actually running before deciding, because
+      "the request did not come back" and "the deploy failed" are different
+      facts.
+
+- [x] **The reconcile loop no longer collides with an in-flight deploy.** It
+      saw `docker ps -q` return nothing (containers created, not yet running),
+      concluded the workload was down, and started a second `compose up` on
+      top of the move - Docker failed both with `container name already in
+      use`. `deployWorkload` now holds a per-workload in-flight slot, so every
+      path (move, failover, create, reconcile, autostart) is covered by one
+      rule rather than each caller remembering.
+
+- [ ] **Tune the netstack receive window for high-latency paths.** Measured
+      267 KB/s single-stream at 132ms RTT (Radxa to Hetzner over WARP). A
+      64KB window caps that path at ~484 KB/s, so the window is the limit, not
+      the link. Bulk transfers over the mesh would benefit from a larger
+      receive buffer. Not a bug - the transfer completes, which is the part
+      that used to fail.
 
 - [x] **`stateMu` deadlock: fork/exec under the lock froze the whole control
       plane.** Almost certainly the cause of the "everything is up but nothing
@@ -149,13 +197,11 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       failing command cannot demonstrate the property, and an earlier version
       of the test passed against the reintroduced bug for exactly that reason.
 
-- [ ] **`a.ip` is written without holding `stateMu`** (`warp.go:45,64,139`)
-      while being read under it elsewhere — a genuine data race, pre-existing
-      and unrelated to the deadlock above. `ensurePeerTunnel` reads it from
-      five call sites. The clean fix is to pass the local WARP IP and tunnel
-      mode in as parameters rather than re-reading agent fields, which also
-      makes the dependency explicit. Deliberately not bundled into the
-      deadlock fix.
+- [x] **`a.ip` is no longer a data race.** It was a plain string written by the
+      WARP monitor goroutine and read from ~40 places with no common lock. Now
+      an `atomic.Pointer[string]` behind `warpIP()` / `setWarpIP()`: lock-free
+      reads, and no lock-ordering relationship with `stateMu` (which a mutex
+      would have introduced).
 
 - [x] **A wedged control plane can now say so.** Two subtractions rather than
       new machinery, which is why there is no watchdog goroutine:
@@ -304,13 +350,12 @@ mount hangs and 10–15s stalls on ~21% of public requests.
 - [ ] Collapse the three overlapping sync paths (memberlist broadcast + 30s
       full sync + 10s HTTP pull) to one. Three paths that can disagree is not
       redundancy.
-- [ ] **`NodeMeta` truncation corrupts gossip.** memberlist caps node metadata
-      at 512 bytes; on overflow `jettyDelegate.NodeMeta` does
-      `return d.meta[:limit]`, slicing JSON mid-string and publishing a payload
-      every peer fails to parse — with only a log line to say so. It should
-      drop optional fields to fit, or refuse to publish, rather than ship
-      corrupt data. Latent today, and a live hazard the moment anything is
-      added to `NodeMeta` (see JettyOS enablers).
+- [x] **`NodeMeta` no longer publishes invalid JSON.** Overflow used to slice
+      the payload mid-string, so every peer failed to parse it - the node
+      vanished from gossip while appearing to participate. Now sheds optional
+      fields (Version, then Name) and publishes nothing at all rather than a
+      truncated payload. ID, IP, Arch, APIPort and APIKey never shed: they
+      drive identity, reachability, arch-gated placement and peer auth.
 
 ### 1c. Test coverage
 
@@ -1137,3 +1182,22 @@ way.
 - **Replicated storage.** Failover moves ownership, not volumes, so "no
   downtime" currently holds only for stateless workloads. This is a second
   product of comparable difficulty and needs a deliberate decision, not drift.
+
+  Measured 2026-08-25: inter-node RTT is ~120ms (Radxa to Hetzner), and it is
+  geography, not overhead - raw internet measures the same as the WARP mesh,
+  which adds essentially zero. At that distance **synchronous shared storage
+  is not viable at all**: every CIFS file operation costs a round trip, and
+  `rsync -a` spends 15-20 of them per file. That is a property of the design,
+  not something tuning fixes.
+
+  Which leaves data locality (pin stateful workloads - `allowed_nodes`, and
+  the argument in docs/JETTYOS.md 5) or async replication (what the vaultwarden
+  sync sidecars already do). Both are already the answer.
+
+  So the gap is not "we need shared storage" - it is that **Jetty has no
+  first-class notion of workload data**. `move` and `failover` relocate a
+  workload without relocating, or even acknowledging, its volumes; every
+  stateful workload hand-rolls an init container that CIFS-mounts a
+  well-known share. Worth knowing which volumes matter and where their backup
+  lives, so a move consults it instead of each app reimplementing the
+  convention. Noted, not scheduled.

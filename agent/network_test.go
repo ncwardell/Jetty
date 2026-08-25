@@ -79,7 +79,7 @@ func TestIsNodeAllowedAllowedNodes(t *testing.T) {
 func TestAllocateServiceIPSkipsTaken(t *testing.T) {
 	a := newTestAgent("s")
 	a.serviceCIDR = "10.100.0.0/30" // only .1 and .2 are usable
-	a.ip = "10.100.0.1"             // we own .1
+	a.setWarpIP("10.100.0.1")       // we own .1
 	a.state.Peers["p1"] = &Peer{ID: "p1", IP: "10.100.0.2"}
 
 	got := a.allocateServiceIP()

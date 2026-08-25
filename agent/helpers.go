@@ -196,7 +196,7 @@ func buildOwnerInfo(id, name, ip string) OwnerInfo {
 
 // selfOwnerInfo returns owner info for this node
 func (a *Agent) selfOwnerInfo() OwnerInfo {
-	return buildOwnerInfo(a.hwid, a.hostname, a.ip)
+	return buildOwnerInfo(a.hwid, a.hostname, a.warpIP())
 }
 
 // peerOwnerInfo returns owner info for a peer, or unknown info if peer is nil

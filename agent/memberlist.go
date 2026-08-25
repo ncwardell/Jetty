@@ -64,6 +64,7 @@ type jettyEventDelegate struct {
 // Delegate Implementation
 // =============================================================================
 
+// NodeMeta returns metadata about this node (called by memberlist)
 // NodeMeta returns metadata about this node (called by memberlist).
 //
 // memberlist caps node metadata (512 bytes by default) and this used to
@@ -730,9 +731,9 @@ func (a *Agent) initMemberlist() (*memberlist.Memberlist, error) {
 	config.AdvertisePort = MemberlistPort
 
 	// Bind to WARP IP if available, otherwise all interfaces
-	if a.ip != "" {
-		config.BindAddr = a.ip
-		config.AdvertiseAddr = a.ip
+	if a.warpIP() != "" {
+		config.BindAddr = a.warpIP()
+		config.AdvertiseAddr = a.warpIP()
 	}
 
 	// Create delegate
@@ -749,7 +750,7 @@ func (a *Agent) initMemberlist() (*memberlist.Memberlist, error) {
 	}
 
 	// Set initial node metadata
-	delegate.updateNodeMeta(a.ip)
+	delegate.updateNodeMeta(a.warpIP())
 
 	config.Delegate = delegate
 	config.Events = &jettyEventDelegate{agent: a}

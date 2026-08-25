@@ -13,7 +13,7 @@ func e2eAgentForPortable(t *testing.T) *Agent {
 	a := newTestAgentWithDir(t)
 	a.hwid = "self-hwid"
 	a.hostname = "selfhost"
-	a.ip = "100.96.0.1"
+	a.setWarpIP("100.96.0.1")
 	a.composeDir = t.TempDir()
 	a.hostsFile = t.TempDir() + "/hosts"
 	a.serviceCIDR = "10.100.0.0/16"

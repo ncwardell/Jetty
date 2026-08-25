@@ -227,3 +227,45 @@ func TestNoBareLogPrintf(t *testing.T) {
 			strings.Join(offenders, "\n  "))
 	}
 }
+
+// TestDataPathDoesNotLogPerPacketAtInfo guards against a regression that was
+// live in production: tunReadLoop and tunWsRecvLoop logged one INFO line per
+// PACKET. A near-idle Radxa produced 30,225 lines in 782 seconds (~38/s), and
+// sat at 6.3% CPU against 0.9% on the busier amd64 node.
+//
+// The cost is not just noise. Per-packet logging burns CPU and disk on the
+// weakest node in the cluster, and buries the handful of lines that actually
+// mean something. Anything on the data path - per packet, per flow, per
+// accepted connection - belongs at debug, where JETTY_LOG_LEVEL=debug (or
+// POST /api/log-level) can turn it on for as long as an investigation needs.
+func TestDataPathDoesNotLogPerPacketAtInfo(t *testing.T) {
+	// Substrings that identify a message emitted once per packet, per flow, or
+	// per accepted connection.
+	perUnitOfWork := []string{
+		`"WS tunnel send: %s -> %s via %s`,
+		`"WS tunnel recv: from %s, packet`,
+		`"WS tunnel proxy TCP SYN:`,
+		`"WS tunnel proxy TCP FIN:`,
+		`"WS tunnel proxy UDP: %s:%d`,
+		`"WS tunnel proxy: translated`,
+		`"WS tunnel proxy: got ICMP reply`,
+		`"netstack: TCP %s:%d -> %s`,
+		`"netstack: UDP %s:%d -> %s`,
+	}
+
+	for _, file := range []string{"tunnel.go", "netstack.go"} {
+		src := readAgentSource(t, file)
+		for _, line := range strings.Split(src, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "//") || !strings.Contains(trimmed, "logInfof(") {
+				continue
+			}
+			for _, needle := range perUnitOfWork {
+				if strings.Contains(trimmed, needle) {
+					t.Errorf("%s logs at INFO once per packet/flow - use logDebugf:\n  %s",
+						file, trimmed)
+				}
+			}
+		}
+	}
+}
