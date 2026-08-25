@@ -37,6 +37,26 @@ var envKeyPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 // carry markup. Empty is allowed (older agents don't send them).
 var validVersionArchPattern = regexp.MustCompile(`^[a-zA-Z0-9._+-]{0,64}$`)
 
+// Valid tunnel hostname pattern. Unlike version/arch this is not display-only:
+// it is interpolated directly into an https:// URL that we then send
+// authenticated requests to. So the charset has to exclude everything that
+// could change what the URL means - '/' (path/authority injection), '@'
+// (userinfo, which relocates the host), ':' (port/scheme), and whitespace.
+// A bare DNS name is all this field is ever meant to hold.
+var validTunnelHostPattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$`)
+
+// sanitizeTunnelHost blanks a peer-supplied tunnel hostname that is not a
+// plain DNS name. Sanitize-not-reject, like version/arch: getPeerAPIURL just
+// falls back to the cluster-wide domain, which is where we were before this
+// field existed. Rejecting the peer outright would turn a cosmetic misconfig
+// into a node dropping out of the cluster.
+func sanitizeTunnelHost(id string, host *string) {
+	if !validTunnelHostPattern.MatchString(*host) && *host != "" {
+		logInfof("Sync: blanking invalid tunnel host %q from peer %q", *host, id)
+		*host = ""
+	}
+}
+
 // sanitizePeerMeta blanks peer-supplied version/arch fields that do not
 // match the safe charset. Sanitize-not-reject: a peer with a weird build
 // string should stay in the cluster, just without the unsafe metadata.
@@ -315,13 +335,33 @@ func shortID(id string, n int) string {
 // URL Helpers
 // =============================================================================
 
-// getPeerAPIURL returns the URL to reach a peer's API via WARP.
+// getPeerAPIURL returns the URL to reach a specific peer's API.
+//
+// The ordering matters. WARP is direct and unambiguous, so it wins when
+// available. The interesting case is the fallback, used before WARP comes up:
+// a.tunnelDomain is the *cluster-wide* hostname, and Cloudflare resolves it to
+// whichever node it feels like. So the shared-domain fallback does not address
+// the peer we asked for - it addresses some node, possibly ourselves. Requests
+// that mutate peer-specific state (rotate-key, leave, move) silently land on
+// the wrong node.
+//
+// peer.TunnelHost is that peer's own hostname, gossiped in NodeMeta, and it
+// resolves to exactly one node. Prefer it. The shared domain stays as a
+// last-ditch fallback rather than being removed, because for read-only calls
+// against a single-node cluster it is still better than returning "".
 func (a *Agent) getPeerAPIURL(peer *Peer, path string) string {
+	if peer == nil {
+		return ""
+	}
 	// Use WARP IP for direct node-to-node communication
 	if peer.IP != "" {
 		return fmt.Sprintf("http://%s:%d%s", peer.IP, a.apiPort, path)
 	}
-	// Fall back to tunnel domain if peer IP unknown (WARP not yet connected)
+	// This peer's own hostname: resolves to this peer and no other.
+	if peer.TunnelHost != "" {
+		return fmt.Sprintf("https://%s%s", peer.TunnelHost, path)
+	}
+	// Cluster-wide domain: reaches *a* node, not necessarily this one.
 	if a.tunnelDomain != "" {
 		return fmt.Sprintf("https://%s%s", a.tunnelDomain, path)
 	}

@@ -623,38 +623,3 @@ func (a *Agent) proxyHostShell(w http.ResponseWriter, r *http.Request, nodeID st
 	logInfof("Host shell proxy: %s -> peer %s (%s)", r.RemoteAddr, peer.Name, shortID(nodeID, 12))
 	bridgeWebSockets(clientConn, peerConn)
 }
-
-// bridgeWebSockets shuffles messages between two WebSockets until either
-// side closes. Forwards message types (binary/text/control) verbatim so
-// the terminal frame protocol passes through unchanged.
-//
-// The two ReadMessage loops can race against each other on the writes;
-// gorilla/websocket's NextWriter is not safe for concurrent use, but
-// each goroutine writes to a different connection so this is fine.
-func bridgeWebSockets(a, b *websocket.Conn) {
-	done := make(chan struct{}, 2)
-
-	pump := func(src, dst *websocket.Conn) {
-		defer func() { done <- struct{}{} }()
-		for {
-			msgType, data, err := src.ReadMessage()
-			if err != nil {
-				return
-			}
-			if err := dst.WriteMessage(msgType, data); err != nil {
-				return
-			}
-		}
-	}
-
-	go pump(a, b)
-	go pump(b, a)
-
-	<-done
-	// Closing both connections wakes the still-blocked pump's
-	// ReadMessage so the second goroutine exits and the deferred
-	// closes (clientConn/peerConn) run cleanly.
-	a.Close()
-	b.Close()
-	<-done
-}

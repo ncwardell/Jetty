@@ -474,6 +474,12 @@ definitions:
       name:
         description: Hostname
         type: string
+      tunnel_host:
+        description: |-
+          TunnelHost is this peer's own tunnel hostname, if it has one. Lets us
+          reach THIS peer through Cloudflare when its WARP IP is unknown; the
+          cluster-wide domain would land on whichever node Cloudflare picks.
+        type: string
       version:
         description: Agent version
         type: string
