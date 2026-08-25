@@ -664,13 +664,51 @@ transcode, scrapes. The UI should say so at placement time, not bury it in docs.
       destination that worker's placements are not permitted to reach. Do it
       here, while the tunnel is new — retrofitting enforcement onto an
       already-trusted path is how it ends up never happening.
-- [ ] **F. Placement gating.** Workers are ineligible as failover targets by
-      default — a permanent node dying and its workload landing on a box that
-      may leave in minutes is worse than the outage. Opt-in per workload;
-      `isNodeAllowed` is the existing hook. Also refuse (or loudly warn on)
-      workloads with named volumes — `docker compose down -v` on detach is
-      correct here and destructive everywhere else, and that hazard has
-      already bitten once.
+
+      On connection count: a worker holds one control socket plus one data
+      tunnel per node it actually exchanges traffic with — so 1+0 for a batch
+      job that talks to nothing, converging on 1+N for a workload wired into
+      the cluster. That is *less* than a peer already costs: `applyRoutes`
+      refreshes a tunnel to every known peer, healthy or not, which is the
+      eager O(n²) mesh listed under scaling limits. Each node holds only one
+      tunnel per worker; the worker bears the whole fan-out, which is the right
+      place for it. Worth backporting lazy dialling to peers eventually.
+- [ ] **F. Placement gating and worker-loss policy.** Two directions, and the
+      inbound one is a trap verified in the current code, not a hypothetical.
+
+      *Workloads must not land on a worker by accident.* Workers are ineligible
+      as failover targets by default — a permanent node dying and its workload
+      landing on a box that may leave in minutes is worse than the outage.
+      Opt-in per workload; `isNodeAllowed` is the existing hook.
+
+      *Workloads placed on a worker must not be stolen back.* `checkFailover`
+      resolves owner health through `isPeerHealthyInMemberlist`, which walks
+      `memberlist.Members()`. A worker is never in that set — it does not
+      gossip, by design — so its ID reads as **dead permanently, from the
+      moment of placement**. Any worker placement with `Revive: true` is
+      claimed by a permanent node on the next scan. Not on worker loss:
+      immediately, and repeatedly. **This has to land in the same change as
+      placement itself**, or the first worker placement is stolen before it
+      starts running.
+
+      *On genuine worker loss, default to drop, not reschedule.* A workload is
+      put on rented capacity deliberately; silently relocating it to permanent
+      nodes when that capacity vanishes is the exact surprise renting was meant
+      to avoid — "the rented box died and now the Radxa is pegged". Dropping
+      fails visibly instead, which is what ephemeral capacity already implies.
+      Make it explicit per placement (`on_worker_loss: drop | reschedule`),
+      reschedule opt-in. The workload record stays in state marked *unplaced*
+      rather than being deleted: losing the capacity and discarding the intent
+      are different things.
+
+      Note this is **derived, not decided** — any node can compute "worker past
+      its grace window ⇒ its placements are unplaced" from state it already
+      holds. No claim race, no agreement, and no dependency on the sponsor
+      surviving.
+
+      Also refuse (or loudly warn on) workloads with named volumes —
+      `docker compose down -v` on detach is correct here and destructive
+      everywhere else, and that hazard has already bitten once.
 - [ ] **G. Rent flow in the UI.** Issue token → copy one command → see the
       worker attach, with its placements and whether a deadline is set →
       release on demand. Attachment state is the product; a worker you cannot
