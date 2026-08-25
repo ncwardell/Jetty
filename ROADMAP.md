@@ -23,8 +23,16 @@ partitioned instead.
 
 **Third-party services are providers, not assumptions.** Cloudflare should stay
 fully supported — it is genuinely excellent, and WARP solves NAT traversal for
-free. The goal is that it is *selectable*, not *load-bearing*. The test:
+free. The goal is that it is *swappable*, not *load-bearing*. The test:
 can the agent boot and serve internal traffic with `JETTY_CF_TOKEN` unset?
+
+Swappable, and deliberately not *removable*. The operating assumption is that
+no Jetty node accepts inbound connections from the internet — that is the whole
+reason Cloudflare is here. Given that, some publicly reachable third party must
+exist to terminate ingress and to act as rendezvous between NAT'd nodes; the
+only question is which one. Internal traffic can run unaided, and a LAN-local
+cluster needs nobody. Multi-site mesh and public ingress cannot. See "What
+leaving Cloudflare actually requires".
 
 **Don't reimplement transport protocols.** Every hand-rolled TCP feature is a
 bug with a long tail.
@@ -924,16 +932,50 @@ connection, or over the LAN, and neither implies an inbound listener.
 Reachability must be *probed* rather than inferred from a public IP, because
 CGNAT lies.
 
-**Entry node and lighthouse are the same machine.** WireGuard alone does not
-hole-punch, so a NAT'd pair needs a publicly reachable rendezvous — which is
-the box already required for ingress. Self-hosting is therefore *one* piece of
-infrastructure serving two roles, not two. This is the piece that makes the
-picture close.
+**Entry node and lighthouse are the same machine** — WireGuard does not
+hole-punch, so a NAT'd pair needs a publicly reachable rendezvous, and that is
+the same box ingress requires. Self-hosting is one piece of infrastructure
+serving two roles rather than two.
+
+**But with no publicly reachable node, that machine does not exist, and the
+third party is structural rather than optional.** Someone with a public IP must
+accept the inbound connection — for a browser reaching a workload, or for two
+NAT'd nodes to find each other. That is physics, not architecture, and every
+alternative collapses to *which* public party:
+
+| Option | The public component |
+|---|---|
+| Cloudflare | WARP edge + Tunnel (current) |
+| Tailscale / Headscale | DERP relays + control plane — self-hosting Headscale moves the requirement, it does not remove it |
+| Nebula | lighthouses, which must be publicly reachable |
+| Public STUN + a relay | still a third party, just less integrated |
+
+So the goal is **not locked to one provider**, not *no provider*. Worth stating
+because the guiding principle above implies removability: internal traffic can
+genuinely run unaided (a LAN-local cluster needs nobody), but multi-site mesh
+and public ingress cannot.
+
+Which reprioritises the rest of this section:
+
+- **The `JETTY_MESH_IFACE` / `JETTY_MESH_CIDR` seam matters more, not less.**
+  If the provider cannot be eliminated, the cheap change that lets it be
+  *swapped* is the entire practical goal — and it is two constants.
+- **Entry-node work is conditional.** Useful only if a node is ever exposed.
+  Worth building eventually, since it is what makes the swap possible, but it
+  is not on the path to anything usable under the current posture.
+- **Hole punching moves further out** than the note below suggests: with no
+  public node there is no rendezvous to punch *with*, so it needs third-party
+  STUN regardless — and WARP already solves the problem it would solve.
+
+One inversion worth noting: **a rented worker has a public IP.** Workers are
+the one class of node here that *is* publicly reachable, so a live worker could
+serve as rendezvous or ingress while it exists. Ephemeral by definition, so it
+cannot be a stable bootstrap point — interesting, not dependable.
 
 **What Cloudflare is actually buying**, stated honestly so the trade is
 explicit rather than sentimental. Not "it saves us a box" — these four:
 
-- **DDoS absorption.** Cloudflare eats attacks; a Hetzner box does not.
+- **DDoS absorption.** Cloudflare eats attacks; a self-hosted entry node does not.
 - **Zero inbound exposure.** `cloudflared` is outbound-only. An entry node
   means a permanent public listener, the exact surface Tunnel removes.
 - **Anycast.** A distributed edge versus one box in one datacenter — the
@@ -942,9 +984,15 @@ explicit rather than sentimental. Not "it saves us a box" — these four:
 - **Cert automation and in-network failover.** Otherwise ACME to run, and DNS
   TTLs mean minutes of outage when an entry node dies.
 
-The goal stays what the guiding principles say: Cloudflare fully supported and
-genuinely excellent, but *selectable* rather than load-bearing. The above is
-what "selectable" cashes out to.
+And the first of those four is not a feature we are declining to build — under
+the current posture it is the *reason* for the arrangement. `cloudflared` is
+outbound-only, so there is no listener to attack. Self-hosting ingress does not
+just add DDoS exposure, it creates the attack surface from nothing.
+
+The goal stays what the guiding principles say, with one correction: Cloudflare
+fully supported and genuinely excellent, but *swappable* rather than
+load-bearing. Not removable — see above — and the principle should be read that
+way.
 
 - **Replacing WARP by hand.** Rolling our own means STUN + UDP hole punching
   (~85–90% of NAT pairs; symmetric-to-symmetric essentially never) plus a relay
@@ -954,9 +1002,12 @@ what "selectable" cashes out to.
 
   Two premises worth correcting, since they have shaped several decisions:
 
-  - *"WireGuard needs a privileged server."* True, and **we have one** —
-    Hetzner is publicly reachable with a static IP. This was never the blocker
-    it was treated as.
+  - *"WireGuard needs a privileged server."* True — **and the operating
+    assumption is that we do not have one.** No Jetty node accepts inbound
+    connections from the internet, which is precisely why Cloudflare is in the
+    picture. Hetzner *could* be exposed, but choosing not to is a defensible
+    posture (zero inbound attack surface) and the architecture should not
+    quietly assume otherwise. Earlier drafts of this section did.
   - *"WARP avoids a relay."* It does not. Every node→node packet goes
     node → Cloudflare edge → node; the edge *is* the relay. Self-hosting does
     not add a hop, it changes whose hop it is.
@@ -988,8 +1039,12 @@ what "selectable" cashes out to.
       and auto-expiry all fall out of one mechanism instead of four, and it
       replaces both the bespoke token work in stage B and the iptables work in
       stage E. Lighthouses do discovery and hole punching rather than relaying,
-      so most pairs go direct; a lighthouse must be publicly reachable, which
-      is Hetzner again. Single small Go binary.
+      so most pairs go direct. Single small Go binary.
+
+      The catch under the no-public-node posture: a lighthouse must be
+      publicly reachable, so it would have to be a rented box or a hosted
+      service — which is the swap-the-provider point above, not an escape from
+      it. Nebula's appeal here is the cert model, not independence.
 
       **Headscale** is the alternative: self-hosted Tailscale control plane,
       the most mature NAT traversal available (hole punching plus DERP
@@ -997,10 +1052,17 @@ what "selectable" cashes out to.
       better answer if the goal is replacing WARP generally rather than serving
       workers.
 
-      **Plain WireGuard** with the worker peering only to Hetzner, which
-      kernel-forwards it into the existing mesh, is the zero-new-dependency
-      version. Static config, no hole punching, Hetzner as chokepoint — but it
-      works today and the forwarding is cheap.
+      **Plain WireGuard** is the zero-new-dependency version, and it *inverts*
+      under the no-public-node posture: the worker is the box with a public IP,
+      so the worker is the one that gets dialled. A NAT'd node initiates to it,
+      keepalive holds the mapping, and no rendezvous is needed for that pair at
+      all. Static config, no hole punching, and it works today — the price
+      being one node acting as chokepoint into the rest of the mesh, though
+      the forwarding itself is cheap kernel work.
+
+      That inversion is the reason this option is more interesting than it
+      looks: it is the only one on this list that needs no publicly reachable
+      *Jetty* node, because the rented box supplies the public address itself.
 - **Crypto-addressed IPv6** (`address = hash(pubkey)`). Removes the allocation
   authority, makes source addresses unspoofable, and is the prerequisite for
   cross-cluster peering. Requires IPv6 — 16 bits of host space in a `/16` hits
