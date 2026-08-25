@@ -429,9 +429,22 @@ manual dispatch defaulting to version `dev`. Meanwhile `agent.go` hardcodes
       and the same publicly-reachable node is also the rendezvous a self-hosted
       WireGuard mesh needs for hole punching. Entry node and lighthouse are one
       machine playing two roles — see "What leaving Cloudflare actually
-      requires" below. It is also the first asymmetry between nodes in a
-      design that has none: a role, not a hierarchy, since entry nodes
-      terminate ingress without deciding anything.
+      requires" below.
+
+      **"Role" overstates it — this is a capability, not a node type.** Every
+      node runs the same binary and the same code paths; an entry node is just
+      one that is reachable and holds a cert. Enumerated, almost nothing
+      changes: listening on 443 is not a new concept, and dialling a workload
+      over the mesh is something every node already does. Only two things are
+      real work — **TLS termination** (ACME, storage, renewal — the one job
+      Cloudflare is doing for us here), and **`Workload.Hostname` in gossiped
+      state**, which is already its own item above and pays off regardless.
+
+      What the cluster does need is to *know* which nodes are reachable, for
+      DNS and for placement. That is an observation, like health, RTT or arch —
+      so it belongs with the capability labels below, just probed rather than
+      declared. Note this is not a new kind of asymmetry: `isNodeAllowed`
+      already gates placement on arch and `AllowedNodes` today.
 - [ ] DNS resolver per node, served from gossiped state, replacing
       `/etc/hosts` + `extra_hosts`. Today adding a workload anywhere requires
       container recreation elsewhere to make it resolvable. Split-horizon also
@@ -502,7 +515,14 @@ main finding: JettyOS mostly needs Jetty to be *finished*, not extended.
       Non-deterministic placement is a bug on its own.
 - [ ] **Node capability labels** (`gpu`, `nvme`, `bigmem`) in `NodeMeta`, so a
       workload can require a capability instead of naming a hostname. Cheap
-      now, annoying once a catalog is full of hostnames.
+      now, annoying once a catalog is full of hostnames. Not a new concept —
+      `isNodeAllowed` already gates on arch and `AllowedNodes`; this
+      generalises it.
+
+      `publicly_reachable` belongs in the same mechanism, and is what the
+      entry-node work actually needs from the cluster. The one difference: it
+      must be **probed by a peer**, not declared, because a node with a public
+      IP behind CGNAT will declare it truthfully and still be unreachable.
 - [ ] **Gossip node resource metrics on a channel that is not `NodeMeta`.**
       Memory/CPU/disk are already sampled and thrown away, but memberlist caps
       node metadata at 512 bytes and the current payload already spends a few
@@ -818,13 +838,28 @@ agent supervises `warp-svc` as a subprocess today; it would stop managing the
 underlay and start being it. Note what this does *not* buy: the send path still
 captures kernel-routed packets off a TUN, so `NET_ADMIN` stays.
 
-**Nodes are identically configured but not identically reachable.** That
-asymmetry is the whole design constraint. The Radxa is behind home NAT and no
-config makes it a WireGuard endpoint — reachability is a property of where a
-node sits. Hence a role, though a role and not a hierarchy: entry nodes
-terminate ingress, they do not decide anything. See the Phase 5 entry, including
-the trap that reachability must be *probed* rather than inferred from a public
-IP, because CGNAT lies.
+**We are already on WireGuard.** WARP *is* WireGuard (MASQUE now, WireGuard
+historically) with Cloudflare's anycast edge as the rendezvous. So this is not
+"switch to WireGuard" — it is "change who runs the rendezvous", which is a far
+smaller change than it sounds. (What Cloudflare will not do is proxy arbitrary
+UDP on our behalf: `cloudflared` is TCP/HTTP, and UDP is Spectrum, which is
+enterprise. So we cannot tunnel our own WireGuard through it.)
+
+**Nodes are identically configured but not identically reachable**, and the
+distinction is narrower than an earlier draft claimed. A NAT'd peer is a
+perfectly good WireGuard participant — it initiates, and `PersistentKeepalive`
+holds the mapping open so the far side can reach it afterwards. What a NAT'd
+node cannot be, absent port forwarding, is the **rendezvous**: the fixed
+endpoint others dial before any mapping exists.
+
+So the Radxa is not excluded from the mesh; it is excluded from being the
+bootstrap point, and even that is a router-config constraint rather than a
+physical one (CGNAT being the case where it genuinely cannot). Serving the
+dashboard is not evidence either way — that runs over an *outbound* cloudflared
+connection, or over the LAN, and neither implies an inbound listener.
+
+Reachability must be *probed* rather than inferred from a public IP, because
+CGNAT lies.
 
 **Entry node and lighthouse are the same machine.** WireGuard alone does not
 hole-punch, so a NAT'd pair needs a publicly reachable rendezvous — which is
