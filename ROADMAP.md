@@ -841,9 +841,44 @@ captures kernel-routed packets off a TUN, so `NET_ADMIN` stays.
 **We are already on WireGuard.** WARP *is* WireGuard (MASQUE now, WireGuard
 historically) with Cloudflare's anycast edge as the rendezvous. So this is not
 "switch to WireGuard" — it is "change who runs the rendezvous", which is a far
-smaller change than it sounds. (What Cloudflare will not do is proxy arbitrary
-UDP on our behalf: `cloudflared` is TCP/HTTP, and UDP is Spectrum, which is
-enterprise. So we cannot tunnel our own WireGuard through it.)
+smaller change than it sounds.
+
+`cloudflared` will not proxy arbitrary UDP for us (that is Spectrum, which is
+enterprise) — but that is not the blocker it first appears, because UDP can be
+encapsulated in a socket, and **we already do exactly that**. `tunnel.go` reads
+raw IP packets off `jetty_tun` and ships them as WebSocket binary frames to
+`ws://peer:6880/api/tunnel/ws`. That is a general packet relay: UDP, ICMP,
+anything. It is structurally what Tailscale's DERP does when hole punching
+fails. So carrying our own WireGuard through a Cloudflare Tunnel is possible.
+
+**Before doing that, though: TCP-over-TCP.** Tunnelling TCP inside TCP is a
+known pathology — both layers retransmit and run congestion control, their
+timers back off against each other, and throughput collapses non-linearly under
+loss. It is why WireGuard upstream says do not run over TCP and why DERP is an
+explicitly degraded fallback rather than a path.
+
+The current userspace stack is `workload TCP → WebSocket (TCP) → WARP (UDP)`.
+The outer layer being UDP does not help; the interaction is between the
+innermost workload TCP and the WebSocket carrying it. So **this exists today**,
+on the userspace path only — the IPIP primary path is IP-in-IP with no inner
+stack and is unaffected. The netstack migration did not introduce it and does
+not fix it: it made the inner TCP *correct* rather than hand-rolled, which is
+strictly better, but the nesting is structural.
+
+- [ ] **Measure throughput under loss on the userspace tunnel path.** A
+      plausible-but-untested contributor to the 17-minute vaultwarden restore
+      noted under "Replicated storage" below. That was attributed to CIFS
+      round-trips on measured RTT — but RTT and throughput-under-loss are
+      different questions and only the first was tested. Worth knowing before
+      the number gets quoted again as settled.
+
+- [ ] **QUIC datagrams (RFC 9221) if the WS TUN ever stops being a fallback.**
+      Unreliable datagram frames inside a QUIC connection: the outer layer
+      never retransmits, so there is nothing for the inner TCP to fight with.
+      That is what MASQUE is, and it is what Cloudflare moved WARP onto — they
+      hit this exact problem and that was the answer. Carrying WireGuard
+      through a Cloudflare Tunnel would promote the WS TUN to a real transport,
+      at which point WebSocket is the wrong frame.
 
 **Nodes are identically configured but not identically reachable**, and the
 distinction is narrower than an earlier draft claimed. A NAT'd peer is a
