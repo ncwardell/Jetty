@@ -519,28 +519,42 @@ delegation-over-agreement principle at the top of this file.
    and reports status back — a much smaller surface, and it matches what the
    feature actually is.
 
-2. **It attaches to one named sponsor, outbound, and the socket is the
-   connection.** The worker's run command carries the sponsor's *own* hostname
-   — `JETTY_TUNNEL_HOST`, resolving to exactly one node — not the cluster-wide
-   domain, which Cloudflare points at whichever node it likes. The worker dials
-   `wss://<sponsor-host>/api/worker/attach`, presents its token, and that
-   socket stays up: placements down, status up.
+2. **Control plane and data plane are separate. Only the control plane is
+   hub-and-spoke, and even that hub is incidental.**
 
-   Because the worker dials out, **nothing ever has to reach in**. No DNS
-   record for the worker, no inbound port, no NAT traversal, no mesh
+   *Control:* the worker holds one WebSocket to one node — dialled outbound to
+   that node's *own* `JETTY_TUNNEL_HOST`, which resolves to exactly one node,
+   unlike the cluster-wide domain that Cloudflare points wherever it likes.
+   Placements down, status up. That node is its sponsor.
+
+   *Data:* the worker opens **direct** tunnels to whichever nodes it actually
+   needs to exchange traffic with, dialled outbound, on demand. Workload
+   traffic never transits the sponsor. An earlier draft of this section had
+   the sponsor relaying, which made it both a bottleneck and a SPOF; that was
+   a mistake born of assuming "dials out" meant "dials one".
+
+   Because every connection is outbound, **nothing ever has to reach in** — no
+   DNS record for the worker, no inbound port, no NAT traversal, no mesh
    membership. That is what makes "doesn't touch the public WARP" true by
-   construction rather than by policy. (The alternative — minting a scoped
-   Cloudflare connector token per worker and revoking it on release — is
-   possible, but it is more moving parts for less isolation.)
+   construction rather than by policy.
 
-   The consequence to design for, not discover: **the sponsor relays its
-   workers' workload traffic.** A workload on a worker still gets a mesh IP,
-   and every other node must route to that IP via the sponsor, because the
-   sponsor holds the only path. Today *owner is next hop* everywhere in the
-   route code; this is the first case where they differ, so `routeTarget`
-   grows a next-hop distinct from `ownerID`. It also makes the sponsor a
-   bottleneck and a single point of failure for its workers — fine for burst
-   capacity, not fine if workers ever become load-bearing.
+   **Sponsorship is incidental and movable.** A worker's placements live in
+   ordinary cluster state (owner = worker ID, gossiped among the real nodes),
+   and every node has the env store, so any node can mint that worker's
+   envelopes. The sponsor therefore holds no unique state — it is just
+   whichever node currently has the socket. If it dies, the worker re-attaches
+   elsewhere with the same token and the new sponsor reconciles from state it
+   already has. A worker costs its sponsor one socket, so capacity spreads by
+   construction: rent twenty boxes and they attach wherever they land.
+
+   This also beats giving each worker its own Cloudflare connector token, and
+   for a reason worth recording: **a node terminating its own tunnel can
+   filter.** It sees every packet, so it can enforce that a worker only
+   sources from the mesh IPs of workloads actually placed on it and only
+   reaches IPs those placements are permitted to reach. On the WARP mesh the
+   worker can address everything and enforcement is Cloudflare's, at
+   Cloudflare's granularity. Owning the tunnel is what makes least-privilege
+   possible at all.
 
 3. **The socket is the lease. Expiry is optional.** A worker usually knows
    better than the cluster when it is going away, so an open-ended attachment
@@ -582,12 +596,14 @@ transcode, scrapes. The UI should say so at placement time, not bury it in docs.
       `MergeRemoteState`, `apiPeerAnnounce`, broadcast handling, the workload
       and key-rotation endpoints. Default-deny for unknown roles, so a future
       role cannot silently inherit full rights.
-- [ ] **B. Attach: worker tokens and the sponsor socket.** A second token type
-      granting worker role only, and `/api/worker/attach` on the sponsor side —
-      a long-lived WebSocket carrying placements down and status up. The worker
-      is handed one sponsor hostname, dials it, and stays. Reconnect with
-      backoff, since the socket is now the lifecycle signal and a blip must not
-      read as a departure. No join response, no state transfer.
+- [ ] **B. Attach: worker tokens and the control socket.** A second token type
+      granting worker role only, and `/api/worker/attach` — a long-lived
+      WebSocket carrying placements down and status up. The worker is handed
+      one or more node hostnames and attaches to whichever answers; that node
+      becomes its sponsor. Reconnect with backoff, and **re-attach to a
+      different node if the current one goes away** — the token is not bound to
+      a node, because nothing about sponsorship is. No join response, no state
+      transfer.
 - [ ] **C. Placement envelopes.** The sponsor mints, per placement, a bundle of
       compose file + exactly the env keys that compose file references. Nothing
       else crosses. Build the reference-extraction carefully: the failure mode
@@ -602,15 +618,26 @@ transcode, scrapes. The UI should say so at placement time, not bury it in docs.
       `RemovedPeerMaxAge` (30 days) is wrong here — a worker ID never recurs,
       so its tombstone can be short. Keep planned release and disconnect as
       distinct paths: one drains cleanly, the other is failover.
-- [ ] **E. Placement gating and relay routing.** Workers are ineligible as
-      failover targets by default — a permanent node dying and its workload
-      landing on a box that may leave in minutes is worse than the outage.
-      Opt-in per workload; `isNodeAllowed` is the existing hook. This is also
-      where next-hop stops equalling owner: other nodes route a worker's
-      workload IPs via the sponsor. Also refuse (or loudly warn on) workloads
-      with named volumes — `docker compose down -v` on detach is correct here
-      and destructive everywhere else, and that hazard has already bitten once.
-- [ ] **F. Rent flow in the UI.** Issue token → copy one command → see the
+- [ ] **E. Direct data tunnels + per-worker packet filtering.** The worker
+      dials a tunnel to a node the first time it has traffic for it, using the
+      reachability the sponsor supplied — which should cover only the nodes it
+      genuinely needs, not the full topology. Nodes route the worker's workload
+      IPs down that tunnel directly, so this stays inside the existing
+      owner-is-next-hop model and no relay is involved.
+
+      The filtering is the point, not a nicety: the terminating node drops any
+      packet whose source is not a mesh IP placed on that worker, or whose
+      destination that worker's placements are not permitted to reach. Do it
+      here, while the tunnel is new — retrofitting enforcement onto an
+      already-trusted path is how it ends up never happening.
+- [ ] **F. Placement gating.** Workers are ineligible as failover targets by
+      default — a permanent node dying and its workload landing on a box that
+      may leave in minutes is worse than the outage. Opt-in per workload;
+      `isNodeAllowed` is the existing hook. Also refuse (or loudly warn on)
+      workloads with named volumes — `docker compose down -v` on detach is
+      correct here and destructive everywhere else, and that hazard has
+      already bitten once.
+- [ ] **G. Rent flow in the UI.** Issue token → copy one command → see the
       worker attach, with its placements and whether a deadline is set →
       release on demand. Attachment state is the product; a worker you cannot
       see attached or gone is one you will be surprised by.
