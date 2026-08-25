@@ -495,9 +495,9 @@ main finding: JettyOS mostly needs Jetty to be *finished*, not extended.
 
 ## Worker nodes (ephemeral, untrusted capacity)
 
-Rent a box for 30 minutes, have it run workloads, let it vanish. It never holds
-the admin key, never joins the WARP mesh, and everything it touched is gone
-when the lease ends.
+Rent a box, have it run workloads, let it vanish whenever it likes. It never
+holds the admin key, never joins the WARP mesh, and everything it touched is
+gone when it goes.
 
 This is the largest single item on the roadmap and it is worth being precise
 about why: **Jetty currently has exactly one trust tier.** `/api/join` hands the
@@ -510,7 +510,7 @@ Naming: **worker**, not "unprivileged". The distinction is role, not permission
 level — a worker is a node that executes but does not decide, which is the same
 delegation-over-agreement principle at the top of this file.
 
-**The four decisions that shape everything else:**
+**The five decisions that shape everything else:**
 
 1. **A worker is not a gossip peer.** It does not run memberlist. Filtering an
    untrusted peer's merges is the hard, easy-to-get-wrong version of this
@@ -518,28 +518,60 @@ delegation-over-agreement principle at the top of this file.
    are deleted" and every node takes it. A worker is pushed work by its sponsor
    and reports status back — a much smaller surface, and it matches what the
    feature actually is.
-2. **It reaches the cluster over the existing userspace WS tunnel, outbound.**
-   No mesh connector token, no Cloudflare account changes, no inbound ports,
-   and a NAT'd rented box works untouched. `jetty_tun` already does this. This
-   is also what makes "doesn't connect to the public WARP" true by construction
-   rather than by policy. (The alternative — minting a scoped connector token
-   per worker and revoking it on expiry — is possible via the Cloudflare API,
-   but it is strictly more moving parts for strictly less isolation.)
-3. **The sponsor holds the clock.** A node that decides its own expiry is a node
-   that never expires. The sponsor stores the deadline and drives drain →
-   tombstone → revoke. The worker self-terminates too, as belt and braces, but
-   its clock is not authoritative.
-4. **Worker state is memory-only.** Cluster state never gets written to a rented
+
+2. **It attaches to one named sponsor, outbound, and the socket is the
+   connection.** The worker's run command carries the sponsor's *own* hostname
+   — `JETTY_TUNNEL_HOST`, resolving to exactly one node — not the cluster-wide
+   domain, which Cloudflare points at whichever node it likes. The worker dials
+   `wss://<sponsor-host>/api/worker/attach`, presents its token, and that
+   socket stays up: placements down, status up.
+
+   Because the worker dials out, **nothing ever has to reach in**. No DNS
+   record for the worker, no inbound port, no NAT traversal, no mesh
+   membership. That is what makes "doesn't touch the public WARP" true by
+   construction rather than by policy. (The alternative — minting a scoped
+   Cloudflare connector token per worker and revoking it on release — is
+   possible, but it is more moving parts for less isolation.)
+
+   The consequence to design for, not discover: **the sponsor relays its
+   workers' workload traffic.** A workload on a worker still gets a mesh IP,
+   and every other node must route to that IP via the sponsor, because the
+   sponsor holds the only path. Today *owner is next hop* everywhere in the
+   route code; this is the first case where they differ, so `routeTarget`
+   grows a next-hop distinct from `ownerID`. It also makes the sponsor a
+   bottleneck and a single point of failure for its workers — fine for burst
+   capacity, not fine if workers ever become load-bearing.
+
+3. **The socket is the lease. Expiry is optional.** A worker usually knows
+   better than the cluster when it is going away, so an open-ended attachment
+   is the default: it stays until it disconnects. A deadline is an *optional*
+   upper bound for when a hard stop is genuinely wanted, not the mechanism.
+
+   Disconnect therefore has to be the primary lifecycle signal, which needs a
+   **grace window** before teardown — otherwise a three-second blip tears down
+   and re-places everything. Same shape as `FailoverClaimSettle`. And the
+   credential must survive reconnect inside that window, so it is not strictly
+   single-use; the tombstone lands only once the window closes.
+
+4. **The sponsor mints per-placement permission; the worker never sees state.**
+   This replaces filtering the join response, because there *is* no join
+   response. A worker receives a placement envelope per workload — the compose
+   file plus exactly the env keys that placement references — and its total
+   knowledge is the union of what it has been handed. A field added to `State`
+   later cannot leak, because `State` is never sent. That is a much stronger
+   property than an allowlist somebody has to remember to maintain.
+
+5. **Worker state is memory-only.** Cluster state never gets written to a rented
    disk, so there is nothing to wipe and nothing left behind if the box is
    imaged after you release it.
 
 **The honest limitation, stated up front:** a worker running a workload needs
-that workload's env vars. You cannot run vaultwarden without its secrets. The
-reduction is real — no admin key, no env store at large, no ability to
-enumerate anything, no gossip authority — but it is not zero. **Do not place a
-secret-bearing workload on a box you don't trust.** The workloads this is for
-are stateless compute: batch jobs, builds, transcode, scrapes. The UI should
-say so at placement time, not bury it in docs.
+that workload's env vars. You cannot run vaultwarden without its secrets. Per-
+placement minting bounds the blast radius to exactly what was placed there —
+no admin key, no env store at large, nothing enumerable, no gossip authority —
+but it is not zero. **Do not place a secret-bearing workload on a box you don't
+trust.** The workloads this is for are stateless compute: batch jobs, builds,
+transcode, scrapes. The UI should say so at placement time, not bury it in docs.
 
 **Stages.** Each stands alone and lands in order:
 
@@ -550,28 +582,38 @@ say so at placement time, not bury it in docs.
       `MergeRemoteState`, `apiPeerAnnounce`, broadcast handling, the workload
       and key-rotation endpoints. Default-deny for unknown roles, so a future
       role cannot silently inherit full rights.
-- [ ] **B. Lease tokens and a filtered join.** A second token type: single-use,
-      carries a TTL, grants worker role only. The `/api/join` response for a
-      worker excludes `AdminKey`, excludes `EnvData` beyond the keys its own
-      placements reference, and excludes other peers' `APIKey`s. Worth writing
-      the filter as an allowlist over an explicit worker-visible struct rather
-      than as deletions from the full response — a field added later must not
-      leak by default.
-- [ ] **C. Lease lifecycle.** Sponsor-side deadline; on expiry *or* unplanned
-      loss: drain placements, tombstone the peer, revoke the credential. Reuses
-      the `RemovedPeer` machinery, but `RemovedPeerMaxAge` (30 days) is wrong
-      here — a worker's ID never recurs, so its tombstone can be short. Expiry
-      and disappearance must stay distinct events: one is planned and drains
-      cleanly, the other is failover.
-- [ ] **D. Placement gating.** Workers are ineligible for failover targets by
-      default. A permanent node dying and its workload landing on a box with 12
-      minutes left is worse than the outage. Opt-in per workload; `isNodeAllowed`
-      is the existing hook. Also: refuse (or loudly warn on) workloads with named
-      volumes — `docker compose down -v` at lease end is correct here and
-      destructive everywhere else, and that hazard has already bitten once.
-- [ ] **E. Rent flow in the UI.** Issue lease → copy one command → watch the
-      clock → release early. The clock is the product; a lease you cannot see
-      expiring is a lease you will be surprised by.
+- [ ] **B. Attach: worker tokens and the sponsor socket.** A second token type
+      granting worker role only, and `/api/worker/attach` on the sponsor side —
+      a long-lived WebSocket carrying placements down and status up. The worker
+      is handed one sponsor hostname, dials it, and stays. Reconnect with
+      backoff, since the socket is now the lifecycle signal and a blip must not
+      read as a departure. No join response, no state transfer.
+- [ ] **C. Placement envelopes.** The sponsor mints, per placement, a bundle of
+      compose file + exactly the env keys that compose file references. Nothing
+      else crosses. Build the reference-extraction carefully: the failure mode
+      is silently shipping the whole env store because a `${VAR}` form was not
+      recognised, and that failure is invisible until someone audits it. A test
+      that asserts the envelope contains *only* the expected keys, not merely
+      that it contains them, is the one that matters here.
+- [ ] **D. Detach lifecycle.** Disconnect starts a grace window; reconnect
+      inside it resumes; expiry of the window drains placements, tombstones the
+      worker, and invalidates the token. An *optional* deadline layers on top
+      as a hard stop. Reuses the `RemovedPeer` machinery, but
+      `RemovedPeerMaxAge` (30 days) is wrong here — a worker ID never recurs,
+      so its tombstone can be short. Keep planned release and disconnect as
+      distinct paths: one drains cleanly, the other is failover.
+- [ ] **E. Placement gating and relay routing.** Workers are ineligible as
+      failover targets by default — a permanent node dying and its workload
+      landing on a box that may leave in minutes is worse than the outage.
+      Opt-in per workload; `isNodeAllowed` is the existing hook. This is also
+      where next-hop stops equalling owner: other nodes route a worker's
+      workload IPs via the sponsor. Also refuse (or loudly warn on) workloads
+      with named volumes — `docker compose down -v` on detach is correct here
+      and destructive everywhere else, and that hazard has already bitten once.
+- [ ] **F. Rent flow in the UI.** Issue token → copy one command → see the
+      worker attach, with its placements and whether a deadline is set →
+      release on demand. Attachment state is the product; a worker you cannot
+      see attached or gone is one you will be surprised by.
 
 Start at A. It is the only stage the others cannot be built without, and it
 closes a real gap today: any peer on the mesh can currently rewrite cluster
