@@ -746,6 +746,28 @@ transcode, scrapes. The UI should say so at placement time, not bury it in docs.
       `RemovedPeerMaxAge` (30 days) is wrong here — a worker ID never recurs,
       so its tombstone can be short. Keep planned release and disconnect as
       distinct paths: one drains cleanly, the other is failover.
+      *Rejected alternative — WS TUN as a jump box.* The worker dials
+      `wss://<tunnel-domain>/api/tunnel/ws`, lands on whichever node answers,
+      and that node relays its packets into the mesh. Attractive because it
+      needs no Cloudflare account state at all and appears to reuse machinery
+      that already exists. It does not, quite: `handleTunnelProxy` accepts
+      packets only for *local* workloads and refuses to forward onward, by
+      design and with a comment saying so. So this needs onward forwarding
+      (widening a deliberate security check), worker-token auth on that
+      endpoint, mesh IP allocation, and routes on every other node pointing at
+      the sponsor — reintroducing next-hop ≠ owner, which mesh membership
+      removes. Plus the sponsor then carries every byte, and it is
+      TCP-over-TCP.
+
+      It is more new code than mesh membership, not less, and it is the
+      hub-and-spoke shape rejected earlier. The "but Cloudflare relays too"
+      defence does not hold: the edge relays at ~zero measured cost because it
+      is globally distributed anycast, whereas one node relaying N workers is
+      a different thing entirely. Its only genuine advantage is keeping the
+      worker off the mesh — and since the isolation that matters comes from
+      filtering rather than from absence, and iptables provides that either
+      way, it pays a bottleneck for isolation it does not uniquely provide.
+
 - [ ] **E. Mesh membership + per-worker packet filtering.** Mint a scoped
       Cloudflare connector token per worker, hand it over at attach, revoke it
       on detach. This is the agent's first Cloudflare API integration, so the
