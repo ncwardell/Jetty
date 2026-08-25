@@ -2,7 +2,6 @@ package agent
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"strings"
 )
@@ -39,7 +38,7 @@ import (
 // @Router /admin-key/rotate [post]
 func (a *Agent) apiRotateAdminKey(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required")
 		return
 	}
 
@@ -48,7 +47,7 @@ func (a *Agent) apiRotateAdminKey(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 			return
 		}
 	}
@@ -60,13 +59,13 @@ func (a *Agent) apiRotateAdminKey(w http.ResponseWriter, r *http.Request) {
 	if newKey == "" {
 		k, err := generateAPIKey()
 		if err != nil {
-			http.Error(w, "generate key: "+err.Error(), 500)
+			writeError(w, http.StatusInternalServerError, "generate key: "+err.Error())
 			return
 		}
 		newKey = k
 	}
 	if len(newKey) < 16 {
-		http.Error(w, "new_key must be at least 16 characters", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "new_key must be at least 16 characters")
 		return
 	}
 
@@ -78,7 +77,7 @@ func (a *Agent) apiRotateAdminKey(w http.ResponseWriter, r *http.Request) {
 	// Broadcast to peers so they all flip to the new key together.
 	a.broadcastAdminKey(newKey)
 
-	log.Printf("AdminKey rotated by %s (gossiping to peers)", r.RemoteAddr)
+	logInfof("AdminKey rotated by %s (gossiping to peers)", r.RemoteAddr)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":  "rotated",
@@ -88,5 +87,5 @@ func (a *Agent) apiRotateAdminKey(w http.ResponseWriter, r *http.Request) {
 
 	// Belt-and-suspenders: trigger a state push to peers so they get
 	// the new key faster than the gossip ticker would deliver it.
-	go a.broadcastState()
+	goSafe("broadcastState", a.broadcastState)
 }

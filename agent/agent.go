@@ -5,7 +5,6 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -22,7 +21,16 @@ import (
 var dashboardHTML []byte
 
 // Version is the current Jetty agent version (set at build time via -ldflags or defaults to "dev")
-var Version = "2.0.0"
+// Version is stamped at build time by the Dockerfile's
+// -ldflags "-X github.com/ncwardell/jetty/agent.Version=...".
+//
+// The default is "dev" on purpose. It used to be a version number, which
+// meant any binary built without the ldflag - a local `go build`, or a
+// release pipeline whose stamping silently broke - confidently reported
+// itself as a release it was not. A node claiming the wrong version is worse
+// than one admitting it does not know, because it is the field an operator
+// uses to decide whether a fix is deployed.
+var Version = "dev"
 
 func New() (*Agent, error) {
 	dataDir := getEnv("JETTY_DATA_DIR", "/data")
@@ -31,20 +39,22 @@ func New() (*Agent, error) {
 	}
 
 	a := &Agent{
-		hostname:        getHostname(),
-		dataDir:         dataDir,
-		apiPort:         getEnvInt("JETTY_API_PORT", 6880),
-		serviceCIDR:     getEnv("JETTY_SERVICE_CIDR", "10.100.0.0/16"), // CIDR for workload IPs
-		joinURL:         getEnv("JETTY_JOIN", ""),
-		joinToken:       getEnv("JETTY_JOIN_TOKEN", ""),
-		clusterSecret:   getEnv("JETTY_SECRET", ""),
-		tunnelDomain:    getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - Cloudflare tunnel for API access
-		tunnelHost:      getEnv("JETTY_TUNNEL_HOST", ""),   // e.g., "node1.cluster.example.com" - this node's specific subdomain
-		hostShellEnabled: strings.EqualFold(getEnv("JETTY_HOST_SHELL", "false"), "true"),
-		cfTunnelID:      getEnv("JETTY_CF_TUNNEL_ID", ""),  // WARP connector tunnel ID for route management
-		composeDir:      filepath.Join(dataDir, "compose"),
-		hostsFile:       "/etc/hosts",
+		hostname:           getHostname(),
+		dataDir:            dataDir,
+		apiPort:            getEnvInt("JETTY_API_PORT", 6880),
+		serviceCIDR:        getEnv("JETTY_SERVICE_CIDR", "10.100.0.0/16"), // CIDR for workload IPs
+		joinURL:            getEnv("JETTY_JOIN", ""),
+		joinToken:          getEnv("JETTY_JOIN_TOKEN", ""),
+		clusterSecret:      getEnv("JETTY_SECRET", ""),
+		tunnelDomain:       getEnv("JETTY_TUNNEL_DOMAIN", ""), // e.g., "cluster.example.com" - Cloudflare tunnel for API access
+		tunnelHost:         getEnv("JETTY_TUNNEL_HOST", ""),   // e.g., "node1.cluster.example.com" - this node's specific subdomain
+		tunnelStack:        getEnv("JETTY_TUNNEL_STACK", "netstack"),
+		hostShellEnabled:   strings.EqualFold(getEnv("JETTY_HOST_SHELL", "false"), "true"),
+		cfTunnelID:         getEnv("JETTY_CF_TUNNEL_ID", ""), // WARP connector tunnel ID for route management
+		composeDir:         filepath.Join(dataDir, "compose"),
+		hostsFile:          "/etc/hosts",
 		workloadRoutes:     make(map[string]string),
+		routeReconcileCh:   make(chan struct{}, 1),
 		ipipWarnedPeers:    make(map[string]bool),
 		failoverInProgress: make(map[string]time.Time),
 		peerUnhealthySince: make(map[string]time.Time),
@@ -81,9 +91,9 @@ func (a *Agent) cleanupOrphanedState() {
 	if err == nil {
 		for _, name := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 			if name != "" && strings.HasSuffix(name, "-old") {
-				log.Printf("Removing old container from previous update: %s", name)
+				logInfof("Removing old container from previous update: %s", name)
 				if err := exec.Command("docker", "rm", "-f", name).Run(); err != nil {
-					log.Printf("Warning: failed to remove old container %s: %v", name, err)
+					logWarnf("failed to remove old container %s: %v", name, err)
 				}
 			}
 		}
@@ -91,9 +101,9 @@ func (a *Agent) cleanupOrphanedState() {
 
 	// Check if there's orphaned jetty0 interface from previous run
 	if err := exec.Command("ip", "link", "show", "jetty0").Run(); err == nil {
-		log.Printf("Found orphaned jetty0 interface from previous run, cleaning up...")
+		logInfof("Found orphaned jetty0 interface from previous run, cleaning up...")
 		if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
-			log.Printf("Warning: failed to delete orphaned jetty0 interface: %v", err)
+			logWarnf("failed to delete orphaned jetty0 interface: %v", err)
 		}
 	}
 
@@ -105,9 +115,9 @@ func (a *Agent) cleanupOrphanedState() {
 			if len(parts) > 0 {
 				tunName := strings.TrimSuffix(parts[0], ":")
 				if err := exec.Command("ip", "tunnel", "del", tunName).Run(); err != nil {
-					log.Printf("Warning: failed to delete orphaned tunnel %s: %v", tunName, err)
+					logWarnf("failed to delete orphaned tunnel %s: %v", tunName, err)
 				} else {
-					log.Printf("Cleaned up orphaned tunnel: %s", tunName)
+					logInfof("Cleaned up orphaned tunnel: %s", tunName)
 				}
 			}
 		}
@@ -118,7 +128,7 @@ func (a *Agent) cleanupOrphanedState() {
 	// software on the host may own.
 	_, svcNet, err := net.ParseCIDR(a.serviceCIDR)
 	if err != nil {
-		log.Printf("Warning: invalid service CIDR %q, skipping orphaned route cleanup: %v", a.serviceCIDR, err)
+		logWarnf("invalid service CIDR %q, skipping orphaned route cleanup: %v", a.serviceCIDR, err)
 	} else {
 		output, _ = exec.Command("ip", "route", "show").CombinedOutput()
 		for _, line := range strings.Split(string(output), "\n") {
@@ -135,9 +145,9 @@ func (a *Agent) cleanupOrphanedState() {
 				continue
 			}
 			if err := exec.Command("ip", "route", "del", parts[0]).Run(); err != nil {
-				log.Printf("Warning: failed to delete orphaned route %s: %v", parts[0], err)
+				logWarnf("failed to delete orphaned route %s: %v", parts[0], err)
 			} else {
-				log.Printf("Cleaned up orphaned route: %s", parts[0])
+				logInfof("Cleaned up orphaned route: %s", parts[0])
 			}
 		}
 	}
@@ -169,9 +179,9 @@ func (a *Agent) cleanupLegacyNftRules() {
 				handle := strings.TrimSpace(parts[1])
 				if handle != "" {
 					if err := exec.Command("nft", "delete", "rule", "ip", "nat", "POSTROUTING", "handle", handle).Run(); err != nil {
-						log.Printf("Warning: failed to delete legacy nft rule handle %s: %v", handle, err)
+						logWarnf("failed to delete legacy nft rule handle %s: %v", handle, err)
 					} else {
-						log.Printf("Cleaned up legacy nft rule handle %s", handle)
+						logInfof("Cleaned up legacy nft rule handle %s", handle)
 					}
 				}
 			}
@@ -192,19 +202,19 @@ func (a *Agent) Start() error {
 	hasPeers := len(a.state.Peers) > 0
 	a.stateMu.RUnlock()
 	if !hasAdmin && !hasPeers && a.joinURL == "" && a.clusterSecret == "" {
-		log.Printf("!!! WARNING: JETTY_SECRET is not set and no cluster state exists - the API will be UNAUTHENTICATED. !!!")
-		log.Printf("!!! Set JETTY_SECRET to a strong random value before exposing this node to a network.              !!!")
+		logWarnf("!!! WARNING: JETTY_SECRET is not set and no cluster state exists - the API will be UNAUTHENTICATED. !!!")
+		logWarnf("!!! Set JETTY_SECRET to a strong random value before exposing this node to a network.              !!!")
 	}
 
 	if a.hostShellEnabled {
-		log.Printf("!!! Host shell endpoint /api/host/shell is ENABLED - anyone with the cluster admin key can run shell commands on this host. !!!")
+		logWarnf("!!! Host shell endpoint /api/host/shell is ENABLED - anyone with the cluster admin key can run shell commands on this host. !!!")
 	}
 
 	// Record whether WARP was already running before we touched anything.
 	// If it was, the operator owns it and we must not tear it down on Stop().
 	if _, err := net.InterfaceByName("CloudflareWARP"); err == nil {
 		a.warpPreexisting = true
-		log.Printf("CloudflareWARP interface already present - Jetty will not tear it down on shutdown")
+		logInfof("CloudflareWARP interface already present - Jetty will not tear it down on shutdown")
 	}
 
 	// Clean up any orphaned state from previous unclean shutdown
@@ -239,7 +249,7 @@ func (a *Agent) Start() error {
 	if needsJoin {
 		// Join cluster first - this will give us the WARP token
 		// We join via the tunnel URL, which doesn't require WARP
-		log.Printf("Joining cluster to obtain WARP configuration...")
+		logInfof("Joining cluster to obtain WARP configuration...")
 		if err := a.joinCluster(); err != nil {
 			return fmt.Errorf("join: %w", err)
 		}
@@ -259,7 +269,7 @@ func (a *Agent) Start() error {
 
 	// Init WARP nft rules
 	if err := a.initWarpRules(); err != nil {
-		log.Printf("Warning: failed to init WARP rules: %v", err)
+		logWarnf("failed to init WARP rules: %v", err)
 	}
 
 	// Sync with existing peers if not a fresh join
@@ -268,7 +278,7 @@ func (a *Agent) Start() error {
 	}
 
 	// Announce our current IP to peers (handles IP changes during restart/update)
-	go a.announceOurIP()
+	goSafe("announceOurIP", a.announceOurIP)
 
 	// Auto-start owned workloads in the background. `docker compose up`
 	// can be slow (image pulls, init sidecars on network filesystems,
@@ -277,69 +287,103 @@ func (a *Agent) Start() error {
 	// finished deploying. Running it as a goroutine lets the agent come
 	// online immediately; new sync rounds and failover behave correctly
 	// while autostart is still finishing.
-	go a.autostartWorkloads()
+	goSafe("autostartWorkloads", a.autostartWorkloads)
 
 	// Reconcile loop catches workloads that didn't come up cleanly on
 	// first try - cold-boot ordering, transient docker errors, image
 	// pull races. Idempotent against healthy workloads.
-	go a.reconcileWorkloadsLoop()
+	goSupervised("reconcileWorkloadsLoop", a.reconcileWorkloadsLoop)
+
+	// Route programming runs here and nowhere else. Callers only signal, so
+	// no fork/exec ever happens under stateMu - see routereconcile.go.
+	goSupervised("routeReconcileLoop", a.routeReconcileLoop)
 
 	// Update hosts file
 	a.updateHosts()
 
 	// Start API first (so cloudflared can connect to it)
-	go a.runAPI()
+	goSupervised("runAPI", a.runAPI)
 
 	// Wait for API to be ready before starting cloudflared
 	a.waitForAPI()
 
 	// Start Cloudflare tunnel if configured
 	if err := a.startCloudflared(); err != nil {
-		log.Printf("Warning: failed to start cloudflared: %v", err)
+		logWarnf("failed to start cloudflared: %v", err)
 	}
 
 	// Initialize memberlist for cluster membership and failure detection
 	ml, err := a.initMemberlist()
 	if err != nil {
-		log.Printf("Warning: memberlist init failed: %v - falling back to HTTP gossip", err)
+		logWarnf("memberlist init failed: %v - falling back to HTTP gossip", err)
 		// Fall back to HTTP-based gossip if memberlist fails
-		go a.gossipLoop()
+		goSupervised("gossipLoop", a.gossipLoop)
 	} else {
 		a.memberlist = ml
 		// Join known peers
 		a.joinMemberlistPeers()
 		// Start sync loop (for periodic full state sync, tombstone GC)
-		go a.memberlistSyncLoop()
+		goSupervised("memberlistSyncLoop", a.memberlistSyncLoop)
 	}
 
 	// Start failover monitor
-	go a.failoverLoop()
+	goSupervised("failoverLoop", a.failoverLoop)
 
 	// Start scheduled-backup ticker (no-op when no schedule is set;
 	// when set, the lowest-HWID healthy node runs each interval)
-	go a.scheduledBackupLoop()
+	goSupervised("scheduledBackupLoop", a.scheduledBackupLoop)
 
 	// Start IP monitor (detects WARP IP changes and re-announces)
-	go a.ipMonitorLoop()
+	goSupervised("ipMonitorLoop", a.ipMonitorLoop)
 
 	// Start CPU sampling (background updates for accurate metrics)
-	go a.cpuSampleLoop()
+	goSupervised("cpuSampleLoop", a.cpuSampleLoop)
 
 	// Keep compose override files (for cross-workload DNS) in sync with the
 	// cluster's workload set. Cheap when the set hasn't changed.
-	go a.hostsOverrideReconcileLoop()
+	goSupervised("hostsOverrideReconcileLoop", a.hostsOverrideReconcileLoop)
+
+	// Reclaim disk from stranded Docker images (self-updates and moving-tag
+	// re-pulls leave the old image behind forever). See prune.go.
+	goSupervised("imagePruneLoop", a.imagePruneLoop)
 
 	mode := "warp (" + a.ip + ")"
 	if a.tunnelDomain != "" {
 		mode += " + tunnel (" + a.tunnelDomain + ")"
 	}
-	log.Printf("Jetty started: %s (%s) @ %s [mode: %s]", a.hostname, shortID(a.hwid, 12), a.ip, mode)
+	logInfof("Jetty started: %s (%s) @ %s [mode: %s]", a.hostname, shortID(a.hwid, 12), a.ip, mode)
+	a.logEffectiveConfig()
 	return nil
 }
 
+// logEffectiveConfig prints the settings that decide how this node behaves.
+//
+// Worth its own line because "which code path am I actually on" is the first
+// question during any incident or rollout, and the answer was previously
+// invisible: JETTY_TUNNEL_STACK selects between a brand-new TCP stack and the
+// old hand-rolled one, and nothing logged which had been chosen - including
+// when netstack failed to initialise and silently fell back.
+func (a *Agent) logEffectiveConfig() {
+	tunnelStack := "legacy"
+	if a.useNetstackTunnel() {
+		tunnelStack = "netstack"
+	}
+	transport := a.tunnelMode
+	if transport == "" {
+		if a.tunDevice != nil {
+			transport = "userspace"
+		} else {
+			transport = "none"
+		}
+	}
+	logInfof("Config: tunnel_stack=%s transport=%s api_port=%d service_cidr=%s "+
+		"host_shell=%v log_level=%s cf_tunnel=%v",
+		tunnelStack, transport, a.apiPort, a.serviceCIDR,
+		a.hostShellEnabled, levelVar.Level().String(), a.tunnelDomain != "")
+}
 
 func (a *Agent) Stop() {
-	log.Printf("Shutting down Jetty...")
+	logInfof("Shutting down Jetty...")
 
 	// Hand off owned, revivable workloads to peers BEFORE we tear down the
 	// network. Each workload is "released" by clearing our ownership and
@@ -392,22 +436,22 @@ func (a *Agent) gracefulDrain() {
 
 	if a.memberlist == nil {
 		if ownedRevivable > 0 {
-			log.Printf("Graceful drain: %d revivable workload(s) will be picked up by peers via gossip (memberlist unavailable)", ownedRevivable)
+			logInfof("Graceful drain: %d revivable workload(s) will be picked up by peers via gossip (memberlist unavailable)", ownedRevivable)
 		}
 		return
 	}
 
 	if ownedRevivable > 0 {
-		log.Printf("Graceful drain: announcing departure to peers (%d revivable workload(s) to hand off)", ownedRevivable)
+		logInfof("Graceful drain: announcing departure to peers (%d revivable workload(s) to hand off)", ownedRevivable)
 	} else {
-		log.Printf("Graceful drain: announcing departure (no revivable workloads to hand off)")
+		logInfof("Graceful drain: announcing departure (no revivable workloads to hand off)")
 	}
 
 	// Leave() blocks until the broadcast is sent to a few peers; bounded
 	// by the deadline. After this returns, peers have already received
 	// our departure and started claiming.
 	if err := a.memberlist.Leave(2 * time.Second); err != nil {
-		log.Printf("Graceful drain: memberlist Leave failed: %v (peers will detect via timeout)", err)
+		logErrorf("Graceful drain: memberlist Leave failed: %v (peers will detect via timeout)", err)
 		return
 	}
 
@@ -420,13 +464,13 @@ func (a *Agent) gracefulDrain() {
 
 // cleanupNetwork removes all Jetty-created network resources
 func (a *Agent) cleanupNetwork() {
-	log.Printf("Cleaning up network resources...")
+	logInfof("Cleaning up network resources...")
 
 	// Clean up workload routes first
 	a.workloadRoutesMu.Lock()
 	for wlIP := range a.workloadRoutes {
 		exec.Command("ip", "route", "del", wlIP+"/32").Run()
-		log.Printf("Removed route for %s", wlIP)
+		logInfof("Removed route for %s", wlIP)
 	}
 	a.workloadRoutes = make(map[string]string)
 	a.workloadRoutesMu.Unlock()
@@ -436,7 +480,7 @@ func (a *Agent) cleanupNetwork() {
 	for _, peer := range a.state.Peers {
 		tunName := a.getTunnelName(peer.ID)
 		if err := exec.Command("ip", "tunnel", "del", tunName).Run(); err == nil {
-			log.Printf("Removed tunnel %s", tunName)
+			logInfof("Removed tunnel %s", tunName)
 		}
 	}
 
@@ -453,7 +497,7 @@ func (a *Agent) cleanupNetwork() {
 					if containerIP != "" {
 						exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run()
 						exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run()
-						log.Printf("Removed iptables rules for %s (%s -> %s)", wl.Name, wl.IP, containerIP)
+						logInfof("Removed iptables rules for %s (%s -> %s)", wl.Name, wl.IP, containerIP)
 					}
 				}
 			}
@@ -469,24 +513,24 @@ func (a *Agent) cleanupNetwork() {
 
 	// Remove jetty0 interface (this also removes all IPs bound to it)
 	if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
-		log.Printf("Warning: could not remove jetty0 interface: %v", err)
+		logWarnf("could not remove jetty0 interface: %v", err)
 	} else {
-		log.Printf("Removed jetty0 interface")
+		logInfof("Removed jetty0 interface")
 	}
 
 	// If WARP was already running before Jetty started, the operator owns it -
 	// leave it alone. Otherwise, tear down the WARP state we set up.
 	if a.warpPreexisting {
-		log.Printf("Leaving WARP intact (was already running before Jetty started)")
+		logInfof("Leaving WARP intact (was already running before Jetty started)")
 		return
 	}
 
 	// Disconnect WARP (don't delete registration - state is persisted in /data/warp and reused on restart)
-	log.Printf("Disconnecting WARP...")
+	logInfof("Disconnecting WARP...")
 	if output, err := exec.Command("warp-cli", "--accept-tos", "disconnect").CombinedOutput(); err != nil {
-		log.Printf("WARP disconnect: %v (%s)", err, strings.TrimSpace(string(output)))
+		logInfof("WARP disconnect: %v (%s)", err, strings.TrimSpace(string(output)))
 	} else {
-		log.Printf("WARP disconnected")
+		logInfof("WARP disconnected")
 	}
 	// Registration is preserved in /data/warp for reuse across restarts/updates
 
@@ -495,7 +539,7 @@ func (a *Agent) cleanupNetwork() {
 	exec.Command("ip", "link", "delete", "CloudflareWARP").Run()
 	exec.Command("nft", "delete", "table", "inet", "cloudflare-warp").Run()
 	exec.Command("ip", "route", "del", "100.96.0.0/12").Run()
-	log.Printf("Removed WARP network modifications")
+	logInfof("Removed WARP network modifications")
 }
 
 // =============================================================================
@@ -524,43 +568,3 @@ func (a *Agent) loadOrCreateHWID() string {
 	os.WriteFile(hwidFile, []byte(hwid), 0600)
 	return hwid
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

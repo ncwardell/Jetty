@@ -267,7 +267,7 @@ ID or name.
 ### Tunnel, host, backup, proxy
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET/POST/DELETE` | `/api/tunnel` | Manage the Cloudflare tunnel config. |
+| `GET/POST/DELETE` | `/api/tunnel` | Manage the Cloudflare tunnel. Defaults to `?scope=node` (this node only); `?scope=cluster` affects every node. `?node=<id\|name>` targets a peer. |
 | `WS` | `/api/tunnel/ws` | Userspace packet tunnel between peers (internal). |
 | `GET` | `/api/host/containers` | All Docker containers on this node, including ones Jetty didn't deploy. |
 | `GET` | `/api/host/compose` | Host-level compose projects. |
@@ -377,6 +377,7 @@ Set on the `docker run`/compose of the **agent** container itself (not workloads
 | `JETTY_TUNNEL_HOST` | — | This node's tunnel subdomain. |
 | `JETTY_CF_TOKEN` | — | Cloudflare tunnel token (usually delivered via join). |
 | `JETTY_WARP_CONNECTOR_TOKEN` | — | Per-node Cloudflare Mesh node token. One per machine — a shared token makes Cloudflare register nodes as active-passive replicas of one identity (mesh breaks). Env overrides state; join-delivered shared token is only a fallback. |
+| `JETTY_IMAGE_PRUNE` | `true` | Daily prune of stranded Docker images; `false` disables. `JETTY_IMAGE_PRUNE_UNTIL` (default `168h`) sets the age cutoff for unused tagged images. |
 | `JETTY_HOST_SHELL` | `false` | Enables `/api/host/exec` + `/api/host/shell`. Dangerous (host RCE for any AdminKey holder); requires `--pid=host`. |
 
 The agent container must run `--privileged --net host` with

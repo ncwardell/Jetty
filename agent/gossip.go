@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"runtime"
 	"strings"
 	"time"
@@ -52,6 +51,9 @@ func (a *Agent) gcTombstones() {
 			removedWorkloads++
 		}
 	}
+	// Node tombstones expire on their own, much longer horizon - a removed
+	// node can legitimately be powered off for weeks.
+	a.gcRemovedPeers()
 	removedEnvKeys := 0
 	for key, dek := range a.state.DeletedEnvKeys {
 		if dek.Version < cutoff {
@@ -62,7 +64,7 @@ func (a *Agent) gcTombstones() {
 	a.stateMu.Unlock()
 
 	if removedWorkloads > 0 || removedEnvKeys > 0 {
-		log.Printf("GC: removed %d workload tombstones, %d env key tombstones", removedWorkloads, removedEnvKeys)
+		logInfof("GC: removed %d workload tombstones, %d env key tombstones", removedWorkloads, removedEnvKeys)
 		a.saveState()
 	}
 }
@@ -144,7 +146,7 @@ func (a *Agent) tunnelModeHealthCheck() {
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			if time.Since(a.lastHeartbeatErrLog) > time.Minute {
-				log.Printf("Heartbeat failed: %v (suppressing further errors for 1 min)", err)
+				logErrorf("Heartbeat failed: %v (suppressing further errors for 1 min)", err)
 				a.lastHeartbeatErrLog = time.Now()
 			}
 		} else {
@@ -163,7 +165,7 @@ func (a *Agent) tunnelModeHealthCheck() {
 		wasHealthy := peer.Healthy
 		if now.Sub(peer.LastSeen) > staleThreshold {
 			if peer.Healthy {
-				log.Printf("Peer %s marked unhealthy (no heartbeat for %v)", peer.Name, now.Sub(peer.LastSeen))
+				logInfof("Peer %s marked unhealthy (no heartbeat for %v)", peer.Name, now.Sub(peer.LastSeen))
 			}
 			peer.Healthy = false
 		} else {
@@ -177,7 +179,7 @@ func (a *Agent) tunnelModeHealthCheck() {
 	// Update routes if any peer health status changed
 	// This ensures routes to unhealthy peers are removed immediately
 	if healthChanged {
-		a.updateWorkloadRoutes()
+		a.triggerRouteReconcile()
 	}
 	a.stateMu.Unlock()
 }
@@ -207,12 +209,12 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 		url := fmt.Sprintf("http://%s:%d/api/peer-announce", peer.IP, a.apiPort)
 		req, err := a.peerRequest("POST", url, strings.NewReader(string(data)))
 		if err != nil {
-			log.Printf("Failed to build announce request to %s: %v", peer.Name, err)
+			logErrorf("Failed to build announce request to %s: %v", peer.Name, err)
 			continue
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			log.Printf("Failed to announce peer to %s via direct IP: %v", peer.Name, err)
+			logErrorf("Failed to announce peer to %s via direct IP: %v", peer.Name, err)
 			continue
 		}
 		resp.Body.Close()
@@ -224,12 +226,12 @@ func (a *Agent) announcePeer(newPeer *Peer) {
 		url := a.getTunnelAPIURL("/api/peer-announce")
 		req, err := a.peerRequest("POST", url, strings.NewReader(string(data)))
 		if err != nil {
-			log.Printf("Failed to build announce request via tunnel: %v", err)
+			logErrorf("Failed to build announce request via tunnel: %v", err)
 			return
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			log.Printf("Failed to announce peer via tunnel: %v", err)
+			logErrorf("Failed to announce peer via tunnel: %v", err)
 		} else {
 			resp.Body.Close()
 		}
@@ -256,6 +258,6 @@ func (a *Agent) announceOurIP() {
 		Arch:    runtime.GOARCH,
 	}
 
-	log.Printf("Announcing our IP (%s) to cluster...", a.ip)
+	logInfof("Announcing our IP (%s) to cluster...", a.ip)
 	a.announcePeer(self)
 }

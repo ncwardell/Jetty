@@ -202,10 +202,26 @@ docker run -d \
   -v jetty-data:/data \
   -e JETTY_JOIN=https://your-tunnel-domain.com \
   -e JETTY_JOIN_TOKEN=8h2y...the-token-from-above...kf9 \
+  -e JETTY_WARP_CONNECTOR_TOKEN=...this-machine-s-mesh-token... \
   ghcr.io/ncwardell/jetty:latest
 ```
 
-> **That's it.** Joining nodes get the WARP token, tunnel config, admin key, and per-node API key automatically. No manual token copying after the join. The join token is consumed and can never be reused.
+Joining nodes get the tunnel config, admin key, and per-node API key
+automatically. The join token is consumed and can never be reused.
+
+> ### ⚠️ `JETTY_WARP_CONNECTOR_TOKEN` is per machine
+>
+> Create one **per node** in Cloudflare: Zero Trust → Networking → Mesh → Add a
+> node. It is the one value that cannot be handed out at join time, because
+> it identifies *this machine* to Cloudflare.
+>
+> **Omit it and the node still joins and still looks healthy** — it inherits
+> the cluster-shared token, and Cloudflare Mesh registers shared-token nodes as
+> active-passive replicas of a single identity. The passive ones **drop all
+> traffic** while gossiping normally and showing green in the dashboard.
+>
+> The agent logs a warning at startup when it falls back. If a node joins
+> cleanly but nothing can reach its workloads, check this first.
 
 ### Verify
 
@@ -347,8 +363,10 @@ DELETE /api/env/{key}         # Delete env variable
 ### Cloudflare Tunnel
 ```bash
 GET    /api/tunnel            # Get tunnel status
-POST   /api/tunnel            # Configure tunnel with token
-DELETE /api/tunnel            # Remove tunnel
+POST   /api/tunnel            # ?scope=cluster sets the token; default re-attaches this node
+DELETE /api/tunnel            # Default detaches this node only; ?scope=cluster removes it everywhere
+
+# Both mutating endpoints accept ?node=<id|name> to target a peer.
 ```
 
 ### Backup / Restore (admin only)
@@ -532,8 +550,13 @@ volumes:
 | `JETTY_WARP_CONNECTOR_TOKEN` | **Per-node** Cloudflare Mesh node token (create one node per machine: Zero Trust → Networking → Mesh → Add a node). Env always overrides saved state. Joiners without one fall back to the cluster-shared token, but shared tokens make Cloudflare treat nodes as active-passive replicas of ONE identity (passive replicas drop traffic) — always prefer per-node. | - |
 | `JETTY_CF_TOKEN` | Cloudflare Tunnel token. Bootstrap node only — joiners get it from the join response. | - |
 | `JETTY_HOST_SHELL` | Set to `true` to enable the `/api/host/shell` web terminal endpoint (admin-only, dangerous). For a *real* host shell — one that sees the host's `/home`, `/etc`, processes — also pass `--pid=host` to `docker run`; without it the endpoint works but returns a shell scoped to the container. | `false` |
+| `JETTY_IMAGE_PRUNE` | Auto-prune stranded Docker images daily (dangling images, unused images older than the cutoff, old build cache). Self-updates and moving-tag re-pulls otherwise leak the previous image forever. Set to `false` to disable. | `true` |
+| `JETTY_IMAGE_PRUNE_UNTIL` | Age cutoff for pruning unused *tagged* images and build cache (Go duration). Images newer than this are kept (protects fresh pre-pulls). | `168h` |
 | `JETTY_DATA_DIR` | Where state lives. | `/data` |
 | `JETTY_API_PORT` | API port. | `6880` |
+| `JETTY_TUNNEL_STACK` | Which TCP implementation terminates the userspace tunnel's *receive* side: `netstack` (gVisor — real TCP, with retransmission and congestion control) or `legacy` (the older hand-rolled proxy, kept only as a rollback). Only affects nodes that fall back to the userspace tunnel; kernel IPIP/GRE paths are unaffected. | `netstack` |
+| `JETTY_LOG_LEVEL` | Startup log level: `debug`, `info`, `warn`, or `error`. `debug` also turns on source file:line. An unrecognised value falls back to `info` rather than failing startup. Change it on a **running** node with `POST /api/log-level` — restarting to enable debug destroys the state you wanted to debug. | `info` |
+| `JETTY_LOG_FORMAT` | `text` (logfmt — readable in `docker logs`) or `json` (for shipping to a log collector). | `text` |
 | `JETTY_SERVICE_CIDR` | Mesh network CIDR for workload IPs. | `10.100.0.0/16` |
 | `JETTY_TUNNEL_DOMAIN` | Cloudflare tunnel domain (e.g., `cluster.example.com`). | - |
 | `JETTY_TUNNEL_HOST` | This node's specific subdomain. | - |

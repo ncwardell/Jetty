@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,9 +64,9 @@ func (a *Agent) reconcileWorkloads() {
 		if len(strings.TrimSpace(string(out))) > 0 {
 			continue // at least one container running - liveness handled by heal pass below
 		}
-		log.Printf("Reconcile: %s has no running containers, retrying deploy", wl.Name)
+		logInfof("Reconcile: %s has no running containers, retrying deploy", wl.Name)
 		if err := a.deployWorkload(wl); err != nil {
-			log.Printf("Reconcile: deploy of %s failed: %v", wl.Name, err)
+			logErrorf("Reconcile: deploy of %s failed: %v", wl.Name, err)
 		}
 	}
 
@@ -116,9 +115,9 @@ func (a *Agent) healUnhealthyContainers() {
 			if !a.claimHeal(cid) {
 				continue // healed recently; give it time to come back
 			}
-			log.Printf("Autoheal: restarting unhealthy container %s (workload %s)", cname, name)
+			logInfof("Autoheal: restarting unhealthy container %s (workload %s)", cname, name)
 			if rout, err := exec.Command("docker", "restart", cid).CombinedOutput(); err != nil {
-				log.Printf("Autoheal: restart of %s failed: %v (%s)", cname, err, strings.TrimSpace(string(rout)))
+				logErrorf("Autoheal: restart of %s failed: %v (%s)", cname, err, strings.TrimSpace(string(rout)))
 			}
 		}
 	}
@@ -163,10 +162,10 @@ func (a *Agent) autostartWorkloads() {
 		return
 	}
 
-	log.Printf("Auto-starting %d workload(s)...", len(toStart))
+	logInfof("Auto-starting %d workload(s)...", len(toStart))
 	for _, wl := range toStart {
 		if err := a.deployWorkload(wl); err != nil {
-			log.Printf("Failed to auto-start %s: %v", wl.Name, err)
+			logErrorf("Failed to auto-start %s: %v", wl.Name, err)
 		}
 	}
 }
@@ -229,7 +228,7 @@ func (a *Agent) deployWorkload(wl *Workload) error {
 	// workloads by name. See agent/composeoverride.go for the why.
 	if err := a.refreshHostsOverride(wl.Name, []byte(composeContent)); err != nil {
 		// Non-fatal: workload still works, just no cross-workload DNS.
-		log.Printf("Warning: failed to write hosts override for %s: %v", wl.Name, err)
+		logWarnf("failed to write hosts override for %s: %v", wl.Name, err)
 	}
 
 	// Validate
@@ -254,7 +253,7 @@ func (a *Agent) deployWorkload(wl *Workload) error {
 		a.setupWorkloadIP(wl)
 	}
 
-	log.Printf("Deployed: %s @ %s", wl.Name, wl.IP)
+	logInfof("Deployed: %s @ %s", wl.Name, wl.IP)
 	return nil
 }
 
@@ -293,7 +292,7 @@ func (a *Agent) triggerPeerPrePull(wl *Workload) {
 			req, _ := a.peerRequest("POST", url, nil)
 			resp, err := httpClient.Do(req)
 			if err != nil {
-				log.Printf("Pre-pull request to %s failed: %v", peer.Name, err)
+				logErrorf("Pre-pull request to %s failed: %v", peer.Name, err)
 				return
 			}
 			resp.Body.Close()
@@ -321,7 +320,7 @@ func (a *Agent) prePullLocally(wl *Workload) error {
 	}
 	// Best-effort pull. Don't block: failures here just mean the
 	// failover-time pull won't be cache-hit.
-	go a.pullWithRetry(wl.Name)
+	goSafe("pullWithRetry", func() { a.pullWithRetry(wl.Name) })
 	return nil
 }
 
@@ -343,13 +342,13 @@ func (a *Agent) pullWithRetry(workloadName string) (string, bool) {
 		lastOut = out
 		if err == nil {
 			if i > 0 {
-				log.Printf("Pull for %s succeeded on attempt %d", workloadName, i+1)
+				logInfof("Pull for %s succeeded on attempt %d", workloadName, i+1)
 			}
 			return out, true
 		}
-		log.Printf("Pull for %s attempt %d failed: %v", workloadName, i+1, err)
+		logErrorf("Pull for %s attempt %d failed: %v", workloadName, i+1, err)
 	}
-	log.Printf("Warning: pull for %s failed after retries; will rely on cached image", workloadName)
+	logWarnf("pull for %s failed after retries; will rely on cached image", workloadName)
 	return lastOut, false
 }
 
@@ -412,7 +411,7 @@ func (a *Agent) refreshAllOwnedHostsOverrides() {
 			continue
 		}
 		if err := a.refreshHostsOverride(name, composeBytes); err != nil {
-			log.Printf("Warning: failed to refresh hosts override for %s: %v", name, err)
+			logWarnf("failed to refresh hosts override for %s: %v", name, err)
 		}
 	}
 }
@@ -476,7 +475,7 @@ func (a *Agent) removeWorkload(wl *Workload) {
 	dir := filepath.Join(a.composeDir, wl.Name)
 	os.RemoveAll(dir)
 
-	log.Printf("Removed: %s", wl.Name)
+	logInfof("Removed: %s", wl.Name)
 }
 
 func (a *Agent) cleanupWorkloadIP(wl *Workload) {
@@ -519,7 +518,7 @@ func (a *Agent) setupWorkloadIP(wl *Workload) {
 	// Add IP to interface
 	if err := exec.Command("ip", "addr", "add", wl.IP+"/32", "dev", "jetty0").Run(); err != nil {
 		// Ignore "already exists" errors
-		log.Printf("Note: adding %s to jetty0: %v (may already exist)", wl.IP, err)
+		logInfof("Note: adding %s to jetty0: %v (may already exist)", wl.IP, err)
 	}
 
 	// Tear down any pre-existing DNAT rules for this mesh IP - on a redeploy
@@ -560,11 +559,11 @@ func (a *Agent) setupWorkloadIP(wl *Workload) {
 					"-d", wl.IP, "-p", p.proto, "--dport", strconv.Itoa(p.port),
 					"-j", "DNAT", "--to", target).Run()
 				if err != nil {
-					log.Printf("Error: %s DNAT for %s %s/%d -> %s: %v",
+					logErrorf("%s DNAT for %s %s/%d -> %s: %v",
 						chain, wl.IP, p.proto, p.port, target, err)
 				}
 			}
-			log.Printf("Routed: %s:%d/%s -> %s", wl.IP, p.port, p.proto, target)
+			logInfof("Routed: %s:%d/%s -> %s", wl.IP, p.port, p.proto, target)
 		}
 		return
 	}
@@ -574,16 +573,16 @@ func (a *Agent) setupWorkloadIP(wl *Workload) {
 	// for worker-only workloads that don't expose anything explicitly).
 	containerIP := a.getWorkloadContainerIP(wl.Name)
 	if containerIP == "" {
-		log.Printf("Error: couldn't get container IP for %s after %d retries", wl.Name, maxRetries)
+		logErrorf("couldn't get container IP for %s after %d retries", wl.Name, maxRetries)
 		return
 	}
 	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
 		if err := exec.Command("iptables", "-t", "nat", "-I", chain, "1",
 			"-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run(); err != nil {
-			log.Printf("Error: %s DNAT for %s: %v", chain, wl.IP, err)
+			logErrorf("%s DNAT for %s: %v", chain, wl.IP, err)
 		}
 	}
-	log.Printf("Routed: %s -> %s (catch-all, no published ports)", wl.IP, containerIP)
+	logInfof("Routed: %s -> %s (catch-all, no published ports)", wl.IP, containerIP)
 }
 
 // containerPort describes one published port owned by one container in a workload.
@@ -821,7 +820,7 @@ func (a *Agent) composeCmd(name string, args ...string) (string, error) {
 	// Add decrypted Jetty env vars (these can be used in docker-compose.yml)
 	envData, err := a.getDecryptedEnv()
 	if err != nil {
-		log.Printf("Warning: failed to decrypt env data: %v", err)
+		logWarnf("failed to decrypt env data: %v", err)
 	} else {
 		for key, value := range envData {
 			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, value))
@@ -836,7 +835,7 @@ func (a *Agent) composeCmd(name string, args ...string) (string, error) {
 	// twice. No-op (and DOCKER_CONFIG untouched) when registry_auth is unset.
 	if wl := a.workloadByName(name); wl != nil && wl.RegistryAuth != nil {
 		if cfgDir, cfgErr := writeRegistryConfig(wl.RegistryAuth, envData); cfgErr != nil {
-			log.Printf("Warning: registry auth for %s: %v", name, cfgErr)
+			logWarnf("registry auth for %s: %v", name, cfgErr)
 		} else {
 			defer os.RemoveAll(cfgDir)
 			cmd.Env = append(cmd.Env, "DOCKER_CONFIG="+cfgDir)

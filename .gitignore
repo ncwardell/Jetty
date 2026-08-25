@@ -1,6 +1,13 @@
 # Binary
 jetty
 
+# Test/coverage artifacts
+coverage.out
+
+# Local scratch (not part of the project)
+graphify-out/
+hetzner
+
 # IDE
 .idea/
 .vscode/
@@ -8,3 +15,6 @@ jetty
 
 # OS
 .DS_Store
+
+# Claude Code writes transient settings files here
+.claude/settings.local.json.tmp*

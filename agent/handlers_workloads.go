@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os/exec"
@@ -235,6 +234,7 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(workloads)
 }
+
 // apiCreateWorkload godoc
 // @Summary Deploy a new workload
 // @Description Creates and deploys a new Docker Compose workload with a mesh IP
@@ -253,30 +253,30 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 
 	var wl Workload
 	if err := json.NewDecoder(r.Body).Decode(&wl); err != nil {
-		http.Error(w, err.Error(), 400)
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	// Require at least one compose file (default or architecture-specific)
 	if wl.Name == "" {
-		http.Error(w, "name required", 400)
+		writeError(w, http.StatusBadRequest, "name required")
 		return
 	}
 	if wl.Compose == "" && wl.ComposeAmd64 == "" && wl.ComposeArm64 == "" {
-		http.Error(w, "at least one compose file required (compose, compose_amd64, or compose_arm64)", 400)
+		writeError(w, http.StatusBadRequest, "at least one compose file required (compose, compose_amd64, or compose_arm64)")
 		return
 	}
 
 	// Validate workload name (prevent path traversal attacks)
 	if !validNamePattern.MatchString(wl.Name) {
-		http.Error(w, "invalid name: must be alphanumeric with dash/underscore only", 400)
+		writeError(w, http.StatusBadRequest, "invalid name: must be alphanumeric with dash/underscore only")
 		return
 	}
 
 	// Normalize tags so the wire form is canonical (lower-cased, sorted,
 	// deduped) before we hash/compare anywhere downstream.
 	if normTags, badTag := normalizeTags(wl.Tags); badTag != "" {
-		http.Error(w, fmt.Sprintf("invalid tag %q: must match %s", badTag, validTagPattern.String()), 400)
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid tag %q: must match %s", badTag, validTagPattern.String()))
 		return
 	} else {
 		wl.Tags = normTags
@@ -286,7 +286,7 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	// the operator may add the env secret after; pull-time surfaces a clear
 	// error if it's still missing then).
 	if err := validateRegistryAuth(wl.RegistryAuth); err != nil {
-		http.Error(w, err.Error(), 400)
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -298,7 +298,7 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		a.stateMu.RUnlock()
 
 		if targetPeer == nil {
-			http.Error(w, "no allowed nodes available for this workload", 503)
+			writeError(w, http.StatusServiceUnavailable, "no allowed nodes available for this workload")
 			return
 		}
 
@@ -311,7 +311,7 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		req, _ := a.peerRequest("POST", url, strings.NewReader(string(data)))
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to proxy to allowed node: %v", err), 502)
+			writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to proxy to allowed node: %v", err))
 			return
 		}
 		defer resp.Body.Close()
@@ -329,7 +329,7 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	// Check for duplicate workload name (skip during move operation)
 	if !isMove && a.isWorkloadNameTaken(wl.Name) {
 		a.stateMu.Unlock()
-		http.Error(w, "workload name already in use", 409)
+		writeError(w, http.StatusConflict, "workload name already in use")
 		return
 	}
 
@@ -338,28 +338,28 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		wl.IP = a.allocateServiceIP()
 		if wl.IP == "" {
 			a.stateMu.Unlock()
-			http.Error(w, "no available IPs in mesh CIDR", 507)
+			writeError(w, http.StatusInsufficientStorage, "no available IPs in mesh CIDR")
 			return
 		}
 	} else {
 		// Validate provided mesh IP format
 		if net.ParseIP(wl.IP) == nil {
 			a.stateMu.Unlock()
-			http.Error(w, "invalid mesh_ip: must be valid IP address", 400)
+			writeError(w, http.StatusBadRequest, "invalid mesh_ip: must be valid IP address")
 			return
 		}
 
 		// Validate IP is within mesh CIDR
 		if !a.isIPInCIDR(wl.IP) {
 			a.stateMu.Unlock()
-			http.Error(w, fmt.Sprintf("mesh_ip must be within %s", a.serviceCIDR), 400)
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("mesh_ip must be within %s", a.serviceCIDR))
 			return
 		}
 
 		// Check if IP is already taken (skip during move for blue-green deployment)
 		if !isMove && a.isIPTaken(wl.IP) {
 			a.stateMu.Unlock()
-			http.Error(w, "mesh_ip already in use", 409)
+			writeError(w, http.StatusConflict, "mesh_ip already in use")
 			return
 		}
 	}
@@ -383,7 +383,7 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		a.stateMu.Lock()
 		delete(a.state.Workloads, wl.IP)
 		a.stateMu.Unlock()
-		http.Error(w, err.Error(), 500)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -395,7 +395,7 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 
 	// Ask allowed peers to pre-pull this workload's image so future
 	// failover doesn't have to download during the outage.
-	go a.triggerPeerPrePull(&wl)
+	goSafe("triggerPeerPrePull", func() { a.triggerPeerPrePull(&wl) })
 
 	// Build response with enriched owner info
 	response := map[string]interface{}{
@@ -417,6 +417,7 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
+
 // apiGetWorkload godoc
 // @Summary Get workload details
 // @Description Returns details for a specific workload by name
@@ -445,7 +446,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found", 404)
+		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
 
@@ -474,7 +475,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 				"revive":        found.Revive,
 				"autostart":     found.Autostart,
 				"allowed_nodes": found.AllowedNodes,
-		"tags":          found.Tags,
+				"tags":          found.Tags,
 				"owner":         ownerInfo,
 				"version":       found.Version,
 				"is_local":      false,
@@ -497,7 +498,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 				"revive":        found.Revive,
 				"autostart":     found.Autostart,
 				"allowed_nodes": found.AllowedNodes,
-		"tags":          found.Tags,
+				"tags":          found.Tags,
 				"owner":         ownerInfo,
 				"version":       found.Version,
 				"is_local":      false,
@@ -543,6 +544,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
+
 // apiUpdateWorkload godoc
 // @Summary Update a workload
 // @Description Updates workload configuration. Some fields require redeploy.
@@ -575,13 +577,13 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		RegistryAuth **RegistryAuth `json:"registry_auth,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-		http.Error(w, err.Error(), 400)
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	// Validate registry_auth shape when provided (and non-null).
 	if update.RegistryAuth != nil {
 		if err := validateRegistryAuth(*update.RegistryAuth); err != nil {
-			http.Error(w, err.Error(), 400)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
@@ -589,7 +591,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	if update.Tags != nil {
 		normTags, badTag := normalizeTags(*update.Tags)
 		if badTag != "" {
-			http.Error(w, fmt.Sprintf("invalid tag %q: must match %s", badTag, validTagPattern.String()), 400)
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid tag %q: must match %s", badTag, validTagPattern.String()))
 			return
 		}
 		update.Tags = &normTags
@@ -613,14 +615,14 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found", 404)
+		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
 
 	// If workload is remote, proxy to owner
 	if found.Owner != a.hwid {
 		if ownerPeer == nil || !ownerPeer.Healthy {
-			http.Error(w, "owner node unreachable", 502)
+			writeError(w, http.StatusBadGateway, "owner node unreachable")
 			return
 		}
 
@@ -630,7 +632,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		req, _ := a.peerRequest("PATCH", url, strings.NewReader(string(body)))
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach owner: %v", err))
 			return
 		}
 		defer resp.Body.Close()
@@ -654,17 +656,17 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		// Validate new IP
 		if net.ParseIP(newIP) == nil {
 			a.stateMu.Unlock()
-			http.Error(w, "invalid mesh_ip: must be valid IP address", 400)
+			writeError(w, http.StatusBadRequest, "invalid mesh_ip: must be valid IP address")
 			return
 		}
 		if !a.isIPInCIDR(newIP) {
 			a.stateMu.Unlock()
-			http.Error(w, fmt.Sprintf("mesh_ip must be within %s", a.serviceCIDR), 400)
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("mesh_ip must be within %s", a.serviceCIDR))
 			return
 		}
 		if a.isIPTaken(newIP) {
 			a.stateMu.Unlock()
-			http.Error(w, "mesh_ip already in use", 409)
+			writeError(w, http.StatusConflict, "mesh_ip already in use")
 			return
 		}
 
@@ -754,7 +756,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 				a.state.Workloads[foundIP] = found
 			}
 			a.stateMu.Unlock()
-			http.Error(w, fmt.Sprintf("redeploy failed: %v", err), 500)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("redeploy failed: %v", err))
 			return
 		}
 	}
@@ -768,7 +770,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	// If the compose changed, refresh peer pre-pulls so they cache the
 	// new image before any failover.
 	if needsRedeploy {
-		go a.triggerPeerPrePull(found)
+		goSafe("triggerPeerPrePull", func() { a.triggerPeerPrePull(found) })
 	}
 
 	// Build response
@@ -789,10 +791,11 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		"redeployed": needsRedeploy,
 	}
 
-	log.Printf("Updated workload %s (redeploy=%v)", found.Name, needsRedeploy)
+	logInfof("Updated workload %s (redeploy=%v)", found.Name, needsRedeploy)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
+
 // getContainerInfo retrieves Docker container details for a workload
 // computeWorkloadStatus returns a richer per-workload status string than
 // the legacy "running" / "stopped" check, by reading every container's
@@ -1002,6 +1005,7 @@ func (a *Agent) getContainerInfo(workloadName string) []map[string]interface{} {
 
 	return containers
 }
+
 // apiDeleteWorkload godoc
 // @Summary Delete a workload
 // @Description Stops and removes a workload from the cluster
@@ -1030,7 +1034,7 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found", 404)
+		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
 
@@ -1042,7 +1046,7 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 			req, _ := a.peerRequest("DELETE", url, nil)
 			resp, err := httpClient.Do(req)
 			if err != nil {
-				http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+				writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach owner: %v", err))
 				return
 			}
 			defer resp.Body.Close()
@@ -1056,7 +1060,7 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Owner is dead - allow cleanup of orphaned workload from our state
-		log.Printf("Cleaning up orphaned workload %s (owner %s unreachable)", name, found.Owner)
+		logInfof("Cleaning up orphaned workload %s (owner %s unreachable)", name, found.Owner)
 	}
 
 	// Distinguish a real deletion from the source-side cleanup half of a
@@ -1081,9 +1085,9 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.Unlock()
 
 	if isMove {
-		log.Printf("Move: stopping local %s (IP %s); new owner already recorded", name, foundIP)
+		logInfof("Move: stopping local %s (IP %s); new owner already recorded", name, foundIP)
 	} else {
-		log.Printf("Deleted workload %s (IP %s), created tombstone for sync propagation", name, foundIP)
+		logInfof("Deleted workload %s (IP %s), created tombstone for sync propagation", name, foundIP)
 	}
 
 	// Remove if we're running it
@@ -1103,6 +1107,7 @@ func (a *Agent) apiDeleteWorkload(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(204)
 }
+
 // apiMoveWorkload godoc
 // @Summary Move workload to another node
 // @Description Migrates a workload to a different node in the cluster
@@ -1121,7 +1126,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		To string `json:"to"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), 400)
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON: %v", err))
 		return
 	}
 
@@ -1182,15 +1187,15 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "workload not found", 404)
+		writeError(w, http.StatusNotFound, "workload not found")
 		return
 	}
 	if target == nil {
-		http.Error(w, "target not found", 404)
+		writeError(w, http.StatusNotFound, "target not found")
 		return
 	}
 	if !target.Healthy {
-		http.Error(w, "target node is not healthy", 503)
+		writeError(w, http.StatusServiceUnavailable, "target node is not healthy")
 		return
 	}
 
@@ -1210,9 +1215,9 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	if !a.isNodeAllowed(found, target.ID, target.Name, target.Arch) {
 		// Provide a more specific error message
 		if !found.canRunOnArch(target.Arch) {
-			http.Error(w, fmt.Sprintf("workload has no compose file for target architecture (%s)", target.Arch), 400)
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("workload has no compose file for target architecture (%s)", target.Arch))
 		} else {
-			http.Error(w, "target node is not in allowed_nodes for this workload", 403)
+			writeError(w, http.StatusForbidden, "target node is not in allowed_nodes for this workload")
 		}
 		return
 	}
@@ -1231,7 +1236,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		localWl.Version = newVersion
 
 		if err := a.deployWorkload(&localWl); err != nil {
-			http.Error(w, fmt.Sprintf("local deploy failed: %v", err), 500)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("local deploy failed: %v", err))
 			return
 		}
 
@@ -1250,7 +1255,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 			delReq, _ := a.peerRequest("DELETE", deleteURL, nil)
 			delResp, err := httpClient.Do(delReq)
 			if err != nil {
-				log.Printf("Warning: failed to remove workload from original owner (will reconcile via gossip): %v", err)
+				logWarnf("failed to remove workload from original owner (will reconcile via gossip): %v", err)
 			} else {
 				delResp.Body.Close()
 			}
@@ -1262,14 +1267,14 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		deployReq, _ := a.peerRequest("POST", url, strings.NewReader(string(data)))
 		resp, err := httpClient.Do(deployReq)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to deploy on target: %v", err), 502)
+			writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to deploy on target: %v", err))
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != 200 {
 			body, _ := io.ReadAll(resp.Body)
-			http.Error(w, fmt.Sprintf("target rejected deployment (status %d): %s", resp.StatusCode, body), 500)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("target rejected deployment (status %d): %s", resp.StatusCode, body))
 			return
 		}
 
@@ -1284,7 +1289,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 			} `json:"owner"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&deployResult); err != nil {
-			log.Printf("Warning: could not parse deploy response: %v", err)
+			logWarnf("could not parse deploy response: %v", err)
 		}
 		newVersion = deployResult.Version
 
@@ -1300,7 +1305,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 			delReq, _ := a.peerRequest("DELETE", deleteURL, nil)
 			delResp, err := httpClient.Do(delReq)
 			if err != nil {
-				log.Printf("Warning: failed to remove workload from original owner: %v", err)
+				logWarnf("failed to remove workload from original owner: %v", err)
 			} else {
 				delResp.Body.Close()
 			}
@@ -1324,10 +1329,11 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 	a.saveState()
 	a.broadcastState()
 
-	log.Printf("Moved workload %s to %s", found.Name, target.Name)
+	logInfof("Moved workload %s to %s", found.Name, target.Name)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"moved": "ok", "to": target.Name})
 }
+
 // apiWorkloadLogs godoc
 // @Summary Get workload logs
 // @Description Returns container logs for a workload
@@ -1355,14 +1361,14 @@ func (a *Agent) apiWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found", 404)
+		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
 
 	// If workload is remote, proxy to owner
 	if found.Owner != a.hwid {
 		if ownerPeer == nil || !ownerPeer.Healthy {
-			http.Error(w, "owner node unreachable", 502)
+			writeError(w, http.StatusBadGateway, "owner node unreachable")
 			return
 		}
 		// Proxy logs request to owner
@@ -1370,7 +1376,7 @@ func (a *Agent) apiWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 		req, _ := a.peerRequest("GET", url, nil)
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach owner: %v", err))
 			return
 		}
 		defer resp.Body.Close()
@@ -1385,6 +1391,7 @@ func (a *Agent) apiWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(out))
 }
+
 // apiStartWorkload godoc
 // @Summary Start a stopped workload
 // @Description Starts the containers for a workload that was previously stopped
@@ -1412,14 +1419,14 @@ func (a *Agent) apiStartWorkload(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found", 404)
+		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
 
 	// If workload is remote, proxy to owner
 	if found.Owner != a.hwid {
 		if ownerPeer == nil || !ownerPeer.Healthy {
-			http.Error(w, "owner node unreachable", 502)
+			writeError(w, http.StatusBadGateway, "owner node unreachable")
 			return
 		}
 		// Proxy start request to owner
@@ -1427,7 +1434,7 @@ func (a *Agent) apiStartWorkload(w http.ResponseWriter, r *http.Request) {
 		req, _ := a.peerRequest("POST", url, nil)
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach owner: %v", err))
 			return
 		}
 		defer resp.Body.Close()
@@ -1439,17 +1446,18 @@ func (a *Agent) apiStartWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if out, err := a.composeCmd(found.Name, "start"); err != nil {
-		http.Error(w, fmt.Sprintf("start failed: %s", out), 500)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("start failed: %s", out))
 		return
 	}
 
 	// Re-setup mesh IP routing (container IP may have changed)
 	a.setupWorkloadIP(found)
 
-	log.Printf("Started workload: %s", found.Name)
+	logInfof("Started workload: %s", found.Name)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "started", "name": found.Name})
 }
+
 // apiStopWorkload godoc
 // @Summary Stop a running workload
 // @Description Stops the containers for a workload without removing them
@@ -1477,14 +1485,14 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found", 404)
+		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
 
 	// If workload is remote, proxy to owner
 	if found.Owner != a.hwid {
 		if ownerPeer == nil || !ownerPeer.Healthy {
-			http.Error(w, "owner node unreachable", 502)
+			writeError(w, http.StatusBadGateway, "owner node unreachable")
 			return
 		}
 		// Proxy stop request to owner
@@ -1492,7 +1500,7 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 		req, _ := a.peerRequest("POST", url, nil)
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach owner: %v", err))
 			return
 		}
 		defer resp.Body.Close()
@@ -1507,11 +1515,11 @@ func (a *Agent) apiStopWorkload(w http.ResponseWriter, r *http.Request) {
 	a.cleanupWorkloadIP(found)
 
 	if out, err := a.composeCmd(found.Name, "stop"); err != nil {
-		http.Error(w, fmt.Sprintf("stop failed: %s", out), 500)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("stop failed: %s", out))
 		return
 	}
 
-	log.Printf("Stopped workload: %s", found.Name)
+	logInfof("Stopped workload: %s", found.Name)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "stopped", "name": found.Name})
 }
@@ -1543,21 +1551,21 @@ func (a *Agent) apiRestartWorkload(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "not found", 404)
+		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
 
 	// Remote workload: proxy to its owner.
 	if found.Owner != a.hwid {
 		if ownerPeer == nil || !ownerPeer.Healthy {
-			http.Error(w, "owner node unreachable", 502)
+			writeError(w, http.StatusBadGateway, "owner node unreachable")
 			return
 		}
 		url := a.getPeerAPIURL(ownerPeer, "/api/workloads/"+name+"/restart")
 		req, _ := a.peerRequest("POST", url, nil)
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to reach owner: %v", err), 502)
+			writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to reach owner: %v", err))
 			return
 		}
 		defer resp.Body.Close()
@@ -1577,7 +1585,7 @@ func (a *Agent) apiRestartWorkload(w http.ResponseWriter, r *http.Request) {
 	a.pullWithRetry(found.Name)
 
 	if out, err := a.composeCmd(found.Name, "up", "-d", "--force-recreate", "--remove-orphans"); err != nil {
-		http.Error(w, fmt.Sprintf("restart failed: %s", out), 500)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("restart failed: %s", out))
 		return
 	}
 
@@ -1585,7 +1593,7 @@ func (a *Agent) apiRestartWorkload(w http.ResponseWriter, r *http.Request) {
 		a.setupWorkloadIP(found)
 	}
 
-	log.Printf("Restarted workload: %s", found.Name)
+	logInfof("Restarted workload: %s", found.Name)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "restarted", "name": found.Name})
 }
@@ -1612,7 +1620,7 @@ func (a *Agent) apiPrePullWorkload(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "workload not in cluster state yet", 404)
+		writeError(w, http.StatusNotFound, "workload not in cluster state yet")
 		return
 	}
 
@@ -1630,13 +1638,23 @@ func (a *Agent) apiPrePullWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.prePullLocally(found); err != nil {
-		http.Error(w, fmt.Sprintf("pre-pull failed: %v", err), 500)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("pre-pull failed: %v", err))
 		return
 	}
 	writeJSONStatus(w, http.StatusAccepted, map[string]string{"status": "scheduled", "name": name})
 }
 
-// apiWorkloadProxy proxies HTTP requests to workloads.
+// apiWorkloadProxy godoc
+// @Summary Proxy an HTTP request to a workload
+// @Description Forwards to a workload by its mesh IP, so a workload's own HTTP endpoint is reachable through the cluster API without exposing it publicly. Local workloads are dialled directly; remote ones go over the mesh. Cluster credentials are stripped before forwarding so a workload never sees the caller's API key. HTTP only - WebSocket upgrades are not proxied.
+// @Tags workloads
+// @Param ip path string true "Workload mesh IP, e.g. 10.100.0.50"
+// @Param path path string false "Path on the workload"
+// @Success 200 "Response from the workload, passed through"
+// @Failure 404 {object} ErrorResponse "No workload with that mesh IP"
+// @Failure 502 {object} ErrorResponse "Workload unreachable"
+// @Router /proxy/{ip}/{path} [get]
+//
 // URL format: /api/proxy/{mesh_ip}/{path...}
 // If the workload is local, forwards to the container directly.
 // If remote, forwards through the tunnel or mesh IP.
@@ -1645,7 +1663,7 @@ func (a *Agent) apiWorkloadProxy(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/proxy/")
 	parts := strings.SplitN(path, "/", 2)
 	if len(parts) == 0 || parts[0] == "" {
-		http.Error(w, "mesh_ip required in path", 400)
+		writeError(w, http.StatusBadRequest, "mesh_ip required in path")
 		return
 	}
 
@@ -1657,7 +1675,7 @@ func (a *Agent) apiWorkloadProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Validate mesh IP format
 	if net.ParseIP(meshIP) == nil {
-		http.Error(w, "invalid mesh_ip", 400)
+		writeError(w, http.StatusBadRequest, "invalid mesh_ip")
 		return
 	}
 
@@ -1671,7 +1689,7 @@ func (a *Agent) apiWorkloadProxy(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 
 	if workload == nil {
-		http.Error(w, "workload not found", 404)
+		writeError(w, http.StatusNotFound, "workload not found")
 		return
 	}
 
@@ -1696,14 +1714,14 @@ func (a *Agent) apiWorkloadProxy(w http.ResponseWriter, r *http.Request) {
 			targetURL = fmt.Sprintf("http://%s:%d/api/proxy/%s%s", owner.IP, a.apiPort, meshIP, targetPath)
 		}
 	} else {
-		http.Error(w, "workload owner not found", 503)
+		writeError(w, http.StatusServiceUnavailable, "workload owner not found")
 		return
 	}
 
 	// Create proxy request
 	proxyReq, err := http.NewRequest(r.Method, targetURL, r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1733,7 +1751,7 @@ func (a *Agent) apiWorkloadProxy(w http.ResponseWriter, r *http.Request) {
 	// Execute request
 	resp, err := httpClient.Do(proxyReq)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("proxy error: %v", err), 502)
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("proxy error: %v", err))
 		return
 	}
 	defer resp.Body.Close()

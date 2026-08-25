@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -65,6 +64,7 @@ func (a *Agent) apiListNodes(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(nodes)
 }
+
 // apiRemoveNode godoc
 // @Summary Remove a node from the cluster
 // @Description Removes a peer node from the cluster. Workloads owned by that node will be orphaned and eligible for failover if revive is enabled.
@@ -81,7 +81,7 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 
 	// Can't remove self
 	if nodeID == a.hwid || nodeID == a.hostname {
-		http.Error(w, "cannot remove self from cluster", 400)
+		writeError(w, http.StatusBadRequest, "cannot remove self from cluster")
 		return
 	}
 
@@ -100,7 +100,7 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 
 	if found == nil {
 		a.stateMu.Unlock()
-		http.Error(w, "node not found", 404)
+		writeError(w, http.StatusNotFound, "node not found")
 		return
 	}
 
@@ -111,33 +111,59 @@ func (a *Agent) apiRemoveNode(w http.ResponseWriter, r *http.Request) {
 			orphanedWorkloads = append(orphanedWorkloads, wl.Name)
 		}
 	}
-
-	// Remove the peer
-	delete(a.state.Peers, foundID)
+	target := *found // copy; the map entry is about to go
 	a.stateMu.Unlock()
 
-	// Clean up IPIP tunnel to this peer
-	a.removePeerTunnel(found.ID)
+	// Ask the node to leave BEFORE tearing anything down.
+	//
+	// This ordering is the whole fix. Removal used to delete the peer
+	// locally, tear down the tunnel and rewrite routes, and only then
+	// broadcast - while the node itself was never told. It kept running, kept
+	// gossiping, and was re-added within a round, so the teardown/rebuild
+	// flapped. And in the window where it was absent from state its workloads
+	// looked orphaned, so failover claimed them while the node was still
+	// running them.
+	//
+	// Memberlist has no forcible eviction: a node can only be made to leave by
+	// asking it. So we ask, and we wait for the answer before doing anything
+	// destructive. An unreachable node cannot double-run anything we would
+	// then claim - it is not serving - so proceeding is safe there.
+	left, leaveErr := a.requestPeerLeave(&target)
 
-	// Clean up routes for workloads that were owned by this peer
 	a.stateMu.Lock()
-	a.updateWorkloadRoutes()
+	delete(a.state.Peers, foundID)
+	a.tombstonePeerLocked(target.ID, target.Name)
+	a.stateMu.Unlock()
+
+	a.removePeerTunnel(target.ID)
+
+	a.stateMu.Lock()
+	a.triggerRouteReconcile()
 	a.stateMu.Unlock()
 
 	a.updateHosts()
 	a.saveState()
 	a.broadcastState()
 
-	log.Printf("Removed node: %s (%s), orphaned workloads: %v", found.Name, found.ID, orphanedWorkloads)
+	message := "node removed and acknowledged the leave; its workloads are stopped and will failover if revive is enabled"
+	if !left {
+		message = "node removed, but it did not acknowledge the leave (" + leaveErr +
+			"). If it is still running it will keep serving its workloads while the cluster fails them over - stop the agent on that node before it reconnects."
+		logWarnf("Removed node %s (%s) without a leave acknowledgement: %s",
+			target.Name, shortID(target.ID, 12), leaveErr)
+	} else {
+		logInfof("Removed node: %s (%s), orphaned workloads: %v", target.Name, target.ID, orphanedWorkloads)
+	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"removed":            found.Name,
-		"id":                 found.ID,
+	writeJSON(w, map[string]interface{}{
+		"removed":            target.Name,
+		"id":                 target.ID,
 		"orphaned_workloads": orphanedWorkloads,
-		"message":            "node removed; orphaned workloads will failover if revive is enabled",
+		"leave_acknowledged": left,
+		"message":            message,
 	})
 }
+
 // apiUpdateNode godoc
 // @Summary Update a node (self-update)
 // @Description Triggers a self-update of the node by pulling a new Docker image and restarting. Only works on the target node itself - requests to other nodes will be proxied.
@@ -159,7 +185,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	// peer keys for everything else, so the explicit gate here is what
 	// prevents a compromised peer from owning the cluster.
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required for node update", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required for node update")
 		return
 	}
 
@@ -172,12 +198,12 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		Env   map[string]string `json:"env,omitempty"` // Optional env overrides applied last (override both preserved env and JETTY_SECRET)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", 400)
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	if req.Image == "" {
-		http.Error(w, "image is required", 400)
+		writeError(w, http.StatusBadRequest, "image is required")
 		return
 	}
 
@@ -197,7 +223,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		a.stateMu.RUnlock()
 
 		if targetPeer == nil {
-			http.Error(w, "node not found", 404)
+			writeError(w, http.StatusNotFound, "node not found")
 			return
 		}
 
@@ -209,7 +235,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		reqBody, _ := json.Marshal(req)
 		proxyReq, err := http.NewRequest("POST", proxyURL, strings.NewReader(string(reqBody)))
 		if err != nil {
-			http.Error(w, fmt.Sprintf("build proxy request: %v", err), 500)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("build proxy request: %v", err))
 			return
 		}
 		a.stateMu.RLock()
@@ -220,7 +246,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 
 		resp, err := peerClient.Do(proxyReq)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to reach node: %v", err), 503)
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("failed to reach node: %v", err))
 			return
 		}
 		defer resp.Body.Close()
@@ -233,33 +259,33 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Self-update: pull image and restart
-	log.Printf("Starting self-update to image: %s", req.Image)
+	logInfof("Starting self-update to image: %s", req.Image)
 
 	// Step 1: Pull the new image
 	pullCmd := exec.Command("docker", "pull", req.Image)
 	pullOutput, err := pullCmd.CombinedOutput()
 	if err != nil {
-		log.Printf("Failed to pull image %s: %v\nOutput: %s", req.Image, err, pullOutput)
-		http.Error(w, fmt.Sprintf("failed to pull image: %v", err), 500)
+		logErrorf("Failed to pull image %s: %v\nOutput: %s", req.Image, err, pullOutput)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to pull image: %v", err))
 		return
 	}
-	log.Printf("Pulled image: %s", req.Image)
+	logInfof("Pulled image: %s", req.Image)
 
 	// Step 2: Get our container ID
 	containerID, err := a.getSelfContainerID()
 	if err != nil {
-		log.Printf("Failed to get own container ID: %v", err)
-		http.Error(w, fmt.Sprintf("failed to get container ID: %v", err), 500)
+		logErrorf("Failed to get own container ID: %v", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get container ID: %v", err))
 		return
 	}
-	log.Printf("Self container ID: %s", containerID)
+	logInfof("Self container ID: %s", containerID)
 
 	// Step 3: Inspect self to get mounts and config
 	inspectCmd := exec.Command("docker", "inspect", containerID)
 	inspectOutput, err := inspectCmd.Output()
 	if err != nil {
-		log.Printf("Failed to inspect container: %v", err)
-		http.Error(w, fmt.Sprintf("failed to inspect container: %v", err), 500)
+		logErrorf("Failed to inspect container: %v", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to inspect container: %v", err))
 		return
 	}
 
@@ -277,13 +303,13 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"Name"`
 	}
 	if err := json.Unmarshal(inspectOutput, &containers); err != nil {
-		log.Printf("Failed to parse inspect output: %v", err)
-		http.Error(w, fmt.Sprintf("failed to parse container config: %v", err), 500)
+		logErrorf("Failed to parse inspect output: %v", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to parse container config: %v", err))
 		return
 	}
 
 	if len(containers) == 0 {
-		http.Error(w, "container not found", 500)
+		writeError(w, http.StatusInternalServerError, "container not found")
 		return
 	}
 
@@ -366,7 +392,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	// -e arg that aborts docker create halfway through.
 	for k, v := range req.Env {
 		if k == "" || strings.ContainsAny(k, "=\x00") || strings.ContainsAny(v, "\x00") {
-			log.Printf("Update: skipping malformed env entry %q", k)
+			logInfof("Update: skipping malformed env entry %q", k)
 			continue
 		}
 		args = append(args, "-e", k+"="+v)
@@ -400,7 +426,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	// Add the image
 	args = append(args, req.Image)
 
-	log.Printf("Creating new container with: docker %v", args)
+	logInfof("Creating new container with: docker %v", args)
 
 	// Step 5: Create new container (but don't start it yet - avoids port conflict)
 	// Change "run" to "create" so we can control when it starts
@@ -416,12 +442,12 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	createCmd := exec.Command("docker", newArgs...)
 	createOutput, err := createCmd.CombinedOutput()
 	if err != nil {
-		log.Printf("Failed to create new container: %v\nOutput: %s", err, createOutput)
-		http.Error(w, fmt.Sprintf("failed to create new container: %v", err), 500)
+		logErrorf("Failed to create new container: %v\nOutput: %s", err, createOutput)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to create new container: %v", err))
 		return
 	}
 	newContainerID := strings.TrimSpace(string(createOutput))
-	log.Printf("Created new container (not started): %s", newContainerID)
+	logInfof("Created new container (not started): %s", newContainerID)
 
 	// Respond before stopping self - the actual switch happens in the goroutine
 	w.Header().Set("Content-Type", "application/json")
@@ -441,17 +467,17 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(500 * time.Millisecond) // Give time for response to be sent
 
 		// Rename old container first (while it's still running)
-		log.Printf("Renaming old container %s to %s-old", containerName, containerName)
+		logInfof("Renaming old container %s to %s-old", containerName, containerName)
 		renameOldCmd := exec.Command("docker", "rename", containerName, containerName+"-old")
 		if out, err := renameOldCmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to rename old container: %v, output: %s", err, out)
+			logWarnf("failed to rename old container: %v, output: %s", err, out)
 		}
 
 		// Rename new container to original name (while it's stopped)
-		log.Printf("Renaming new container to %s", containerName)
+		logInfof("Renaming new container to %s", containerName)
 		renameNewCmd := exec.Command("docker", "rename", containerName+"-update", containerName)
 		if out, err := renameNewCmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to rename new container: %v, output: %s", err, out)
+			logWarnf("failed to rename new container: %v, output: %s", err, out)
 		}
 
 		// Spawn a helper container to do the actual stop/start sequence
@@ -462,37 +488,37 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 			"sleep 1 && docker stop -t 5 %s && docker start %s && docker rm %s",
 			containerID, newContainerID, containerID)
 
-		log.Printf("Spawning helper container to orchestrate restart")
+		logInfof("Spawning helper container to orchestrate restart")
 		helperCmd := exec.Command("docker", "run", "--rm", "-d",
 			"--entrypoint", "sh",
 			"-v", "/var/run/docker.sock:/var/run/docker.sock",
 			req.Image, "-c", restartScript)
 
 		if out, err := helperCmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to spawn helper container: %v, output: %s", err, out)
+			logWarnf("failed to spawn helper container: %v, output: %s", err, out)
 			// Fallback: try docker:cli image (smaller, commonly available)
-			log.Printf("Trying docker:cli as fallback helper...")
+			logInfof("Trying docker:cli as fallback helper...")
 			helperCmd = exec.Command("docker", "run", "--rm", "-d",
 				"-v", "/var/run/docker.sock:/var/run/docker.sock",
 				"docker:cli", "sh", "-c", restartScript)
 			if out, err := helperCmd.CombinedOutput(); err != nil {
-				log.Printf("Warning: docker:cli also failed: %v, output: %s", err, out)
-				log.Printf("Falling back to direct restart (may fail)")
+				logWarnf("docker:cli also failed: %v, output: %s", err, out)
+				logInfof("Falling back to direct restart (may fail)")
 
 				// Last resort: non-blocking commands
-				log.Printf("Stopping old container %s", containerID)
+				logInfof("Stopping old container %s", containerID)
 				stopCmd := exec.Command("docker", "stop", "-t", "5", containerID)
 				stopCmd.Start() // Non-blocking - don't wait
 
 				time.Sleep(100 * time.Millisecond)
-				log.Printf("Starting new container %s", newContainerID)
+				logInfof("Starting new container %s", newContainerID)
 				startCmd := exec.Command("docker", "start", newContainerID)
 				startCmd.Start() // Non-blocking
 			} else {
-				log.Printf("Helper container (docker:cli) spawned successfully, exiting...")
+				logInfof("Helper container (docker:cli) spawned successfully, exiting...")
 			}
 		} else {
-			log.Printf("Helper container spawned successfully, exiting...")
+			logInfof("Helper container spawned successfully, exiting...")
 		}
 
 		// Give commands time to be sent to Docker daemon before we exit
@@ -500,6 +526,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		os.Exit(0)
 	}()
 }
+
 // getSelfContainerID returns this container's ID
 func (a *Agent) getSelfContainerID() (string, error) {
 	// Method 1: Check hostname (often the container ID)

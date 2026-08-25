@@ -43,11 +43,11 @@ type OwnerInfo struct {
 
 // WorkloadRequest represents a request to create a workload
 type WorkloadRequest struct {
-	Name         string   `json:"name" example:"nginx"`
-	IP           string   `json:"ip,omitempty" example:"10.100.0.50"`
-	Compose      string   `json:"compose" example:"services:\n  web:\n    image: nginx"`
-	ComposeAmd64 string   `json:"compose_amd64,omitempty" example:"services:\n  web:\n    image: nginx:amd64"`
-	ComposeArm64 string   `json:"compose_arm64,omitempty" example:"services:\n  web:\n    image: nginx:arm64"`
+	Name         string        `json:"name" example:"nginx"`
+	IP           string        `json:"ip,omitempty" example:"10.100.0.50"`
+	Compose      string        `json:"compose" example:"services:\n  web:\n    image: nginx"`
+	ComposeAmd64 string        `json:"compose_amd64,omitempty" example:"services:\n  web:\n    image: nginx:amd64"`
+	ComposeArm64 string        `json:"compose_arm64,omitempty" example:"services:\n  web:\n    image: nginx:arm64"`
 	Revive       bool          `json:"revive" example:"true"`
 	Autostart    bool          `json:"autostart" example:"true"`
 	AllowedNodes []string      `json:"allowed_nodes,omitempty" example:"node1,node2"`

@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"regexp"
 	"sort"
@@ -46,10 +45,10 @@ import (
 
 // portableExport is the on-the-wire JSON for export/import.
 type portableExport struct {
-	Version            string             `json:"version"`              // "1"
-	ExportedAt         time.Time          `json:"exported_at"`
-	Workloads          []portableWorkload `json:"workloads"`
-	ReferencedEnvKeys  []string           `json:"referenced_env_keys,omitempty"` // env keys used in the compose strings (names only, never values)
+	Version           string             `json:"version"` // "1"
+	ExportedAt        time.Time          `json:"exported_at"`
+	Workloads         []portableWorkload `json:"workloads"`
+	ReferencedEnvKeys []string           `json:"referenced_env_keys,omitempty"` // env keys used in the compose strings (names only, never values)
 }
 
 // portableWorkload mirrors Workload but drops Owner and Version - the
@@ -150,18 +149,18 @@ func (a *Agent) apiExportWorkloads(w http.ResponseWriter, r *http.Request) {
 
 // importRequest is the body of POST /api/workloads/import.
 type importRequest struct {
-	Mode         string         `json:"mode,omitempty"`          // skip | replace | fail (default: skip)
-	ReassignIPs  *bool          `json:"reassign_ips,omitempty"`  // default: true
-	Payload      portableExport `json:"payload"`
+	Mode        string         `json:"mode,omitempty"`         // skip | replace | fail (default: skip)
+	ReassignIPs *bool          `json:"reassign_ips,omitempty"` // default: true
+	Payload     portableExport `json:"payload"`
 }
 
 // importEntry is one line of the import report.
 type importEntry struct {
-	Name        string `json:"name"`
-	Status      string `json:"status"` // imported | replaced | reassigned | skipped | error
-	Detail      string `json:"detail,omitempty"`
-	OriginalIP  string `json:"original_ip,omitempty"`
-	AssignedIP  string `json:"assigned_ip,omitempty"`
+	Name       string `json:"name"`
+	Status     string `json:"status"` // imported | replaced | reassigned | skipped | error
+	Detail     string `json:"detail,omitempty"`
+	OriginalIP string `json:"original_ip,omitempty"`
+	AssignedIP string `json:"assigned_ip,omitempty"`
 }
 
 type importReport struct {
@@ -187,7 +186,7 @@ type importReport struct {
 func (a *Agent) apiImportWorkloads(w http.ResponseWriter, r *http.Request) {
 	var req importRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), 400)
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
@@ -198,7 +197,7 @@ func (a *Agent) apiImportWorkloads(w http.ResponseWriter, r *http.Request) {
 	switch mode {
 	case "skip", "replace", "fail":
 	default:
-		http.Error(w, "mode must be one of: skip, replace, fail", 400)
+		writeError(w, http.StatusBadRequest, "mode must be one of: skip, replace, fail")
 		return
 	}
 
@@ -208,7 +207,7 @@ func (a *Agent) apiImportWorkloads(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Payload.Version != "1" && req.Payload.Version != "" {
-		http.Error(w, fmt.Sprintf("unsupported export version %q (this agent supports v1)", req.Payload.Version), 400)
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported export version %q (this agent supports v1)", req.Payload.Version))
 		return
 	}
 
@@ -221,7 +220,7 @@ func (a *Agent) apiImportWorkloads(w http.ResponseWriter, r *http.Request) {
 	// is false), and invalid fields before doing any state mutations.
 	if mode == "fail" {
 		if err := a.validateImportPayload(req.Payload.Workloads, reassignIPs); err != nil {
-			http.Error(w, "import validation failed: "+err.Error(), 409)
+			writeError(w, http.StatusConflict, "import validation failed: "+err.Error())
 			return
 		}
 	}
@@ -248,7 +247,7 @@ func (a *Agent) apiImportWorkloads(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	enc.Encode(report)
-	log.Printf("Import: mode=%s total=%d created=%d skipped=%d errors=%d",
+	logInfof("Import: mode=%s total=%d created=%d skipped=%d errors=%d",
 		mode, report.Total, report.Created, report.Skipped, report.Errors)
 }
 

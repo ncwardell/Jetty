@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 'stable' rather than go-version-file: go.mod. The go directive is a
+      # minimum (1.25.0), and building against it would ship known-patched
+      # stdlib CVEs -- govulncheck below flags 27 of them on 1.25.2 alone.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./agent ./main.go)
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt'd:"
+            echo "$unformatted"
+            gofmt -d ./agent ./main.go
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test (race + coverage)
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Coverage summary
+        run: |
+          go tool cover -func=coverage.out | tail -1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Generated files are current
+        # Two generators: agent/dashboard.html is a copy of web-ui/index.html,
+        # and docs/ is the OpenAPI spec built from the @Router annotations.
+        # Neither runs during a normal build, so a dirty tree can ship a stale
+        # dashboard or a spec that lies about the API. Regenerate and fail on
+        # any diff. Both generators are deterministic, so a clean tree stays
+        # clean.
+        run: |
+          go generate ./...
+          if ! git diff --exit-code --stat; then
+            echo "::error::Generated files are stale. Run: go generate ./..."
+            exit 1
+          fi
+
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Run govulncheck
+        run: govulncheck ./...

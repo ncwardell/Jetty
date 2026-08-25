@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -43,7 +42,7 @@ const backupScheduleMinInterval = 5 // minutes
 // @Router /backup/schedule [get]
 func (a *Agent) apiGetBackupSchedule(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required")
 		return
 	}
 	a.stateMu.RLock()
@@ -74,20 +73,20 @@ func (a *Agent) apiGetBackupSchedule(w http.ResponseWriter, r *http.Request) {
 // @Router /backup/schedule [post]
 func (a *Agent) apiSetBackupSchedule(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required")
 		return
 	}
 	var req BackupSchedule
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 	if req.IntervalMinutes < backupScheduleMinInterval {
-		http.Error(w, fmt.Sprintf("interval_minutes must be >= %d", backupScheduleMinInterval), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("interval_minutes must be >= %d", backupScheduleMinInterval))
 		return
 	}
 	if req.Retention < 0 {
-		http.Error(w, "retention must be >= 0", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "retention must be >= 0")
 		return
 	}
 	req.UpdatedAt = time.Now().UTC()
@@ -111,7 +110,7 @@ func (a *Agent) apiSetBackupSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(&out)
-	log.Printf("Backup schedule updated: every %dm, retention=%d, encrypted=%v",
+	logInfof("Backup schedule updated: every %dm, retention=%d, encrypted=%v",
 		req.IntervalMinutes, req.Retention, req.Passphrase != "")
 }
 
@@ -123,7 +122,7 @@ func (a *Agent) apiSetBackupSchedule(w http.ResponseWriter, r *http.Request) {
 // @Router /backup/schedule [delete]
 func (a *Agent) apiDeleteBackupSchedule(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required")
 		return
 	}
 	a.stateMu.Lock()
@@ -132,7 +131,7 @@ func (a *Agent) apiDeleteBackupSchedule(w http.ResponseWriter, r *http.Request) 
 	a.saveState()
 	a.broadcastState()
 	w.WriteHeader(http.StatusNoContent)
-	log.Printf("Backup schedule disabled")
+	logInfof("Backup schedule disabled")
 }
 
 // shouldRunScheduledBackup decides whether THIS node should write
@@ -165,7 +164,7 @@ func (a *Agent) runScheduledBackup() {
 
 	backupsDir := filepath.Join(a.dataDir, "backups")
 	if err := os.MkdirAll(backupsDir, 0700); err != nil {
-		a.recordBackupRunResult("error: mkdir: " + err.Error(), "")
+		a.recordBackupRunResult("error: mkdir: "+err.Error(), "")
 		return
 	}
 
@@ -194,12 +193,12 @@ func (a *Agent) runScheduledBackup() {
 	// Apply retention.
 	if sched.Retention > 0 {
 		if err := a.pruneBackups(backupsDir, sched.Retention); err != nil {
-			log.Printf("Backup retention: %v", err)
+			logInfof("Backup retention: %v", err)
 		}
 	}
 
 	a.recordBackupRunResult("ok", path)
-	log.Printf("Scheduled backup written: %s (%d bytes)", path, rec.Body.Len())
+	logInfof("Scheduled backup written: %s (%d bytes)", path, rec.Body.Len())
 }
 
 func (a *Agent) recordBackupRunResult(status, path string) {
@@ -245,7 +244,7 @@ func (a *Agent) pruneBackups(dir string, keep int) error {
 	sort.Slice(files, func(i, j int) bool { return files[i].mod.After(files[j].mod) })
 	for _, f := range files[keep:] {
 		if err := os.Remove(filepath.Join(dir, f.name)); err != nil {
-			log.Printf("retention: remove %s: %v", f.name, err)
+			logInfof("retention: remove %s: %v", f.name, err)
 		}
 	}
 	return nil

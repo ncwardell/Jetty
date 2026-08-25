@@ -2296,6 +2296,17 @@
                     </select>
                 </div>
                 <div class="form-group">
+                    <label class="form-label">Per-node Cloudflare Mesh token</label>
+                    <input type="text" class="form-input" id="createTokenWarpToken" placeholder="paste the token for THIS machine's mesh node">
+                    <p style="color: var(--text-secondary); font-size: 12px; margin-top: 4px;">
+                        Create one <strong>per machine</strong> in Cloudflare: Zero&nbsp;Trust &rarr; Networking &rarr; Mesh &rarr; Add a node. Sets <code>JETTY_WARP_CONNECTOR_TOKEN</code> in the generated command.
+                    </p>
+                    <p id="createTokenWarpWarning" style="color: var(--accent-amber, #d97706); font-size: 12px; margin-top: 6px;">
+                        <strong>Leave blank and the new node inherits the cluster-shared token.</strong>
+                        Cloudflare Mesh then treats it as a passive replica of an identity another machine already owns &mdash; it will join and look healthy in this dashboard while dropping all mesh traffic.
+                    </p>
+                </div>
+                <div class="form-group">
                     <label class="form-label">Image tag for the generated docker run</label>
                     <input type="text" class="form-input" id="createTokenImageTag" value="ghcr.io/ncwardell/jetty:latest">
                 </div>
@@ -2326,6 +2337,12 @@
             <div class="modal-body">
                 <p style="color: var(--text-secondary); margin-bottom: 12px;">
                     This token will not be shown again. Run the command below on the new node &mdash; the token is consumed on first successful join.
+                </p>
+                <p id="tokenResultWarpWarning" class="hidden" style="border-left: 3px solid var(--accent-amber, #d97706); padding: 8px 12px; margin-bottom: 12px; font-size: 13px; line-height: 1.5;">
+                    <strong>No per-node Cloudflare Mesh token was set.</strong>
+                    This node will inherit the cluster-shared token, and Cloudflare Mesh will register it as a passive replica of an identity another machine already owns. It will join, appear healthy here, and drop all mesh traffic.
+                    Create one at Zero&nbsp;Trust &rarr; Networking &rarr; Mesh &rarr; Add a node, then add
+                    <code>-e JETTY_WARP_CONNECTOR_TOKEN='&lt;token&gt;'</code> to the command below.
                 </p>
                 <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
                     <label class="form-label" style="margin: 0;">Token</label>
@@ -3254,7 +3271,7 @@
             const url = `${state.apiUrl}/api/workloads/export${params.toString() ? '?' + params.toString() : ''}`;
             try {
                 const resp = await fetch(url, { headers: { 'X-API-Key': state.secretKey } });
-                if (!resp.ok) throw new Error(await resp.text() || `HTTP ${resp.status}`);
+                if (!resp.ok) throw new Error(await apiErrorMessage(resp));
                 const blob = await resp.blob();
                 const dlUrl = URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -3678,6 +3695,28 @@
             }
         }
 
+        // Every API error is a JSON envelope: {"error": "..."}. Read the
+        // message out of it rather than showing the operator raw JSON in a
+        // toast. Falls back to the raw body for anything that isn't the
+        // envelope (a proxy error page, an upstream 502) and finally to the
+        // bare status code, so no failure path ends up with an empty message.
+        async function apiErrorMessage(response) {
+            let raw = '';
+            try {
+                raw = await response.text();
+            } catch (_) { /* body already consumed or unreadable */ }
+            if (raw) {
+                try {
+                    const parsed = JSON.parse(raw);
+                    if (parsed && typeof parsed.error === 'string' && parsed.error) {
+                        return parsed.error;
+                    }
+                } catch (_) { /* not JSON - fall through to the raw text */ }
+                return raw;
+            }
+            return `HTTP ${response.status}`;
+        }
+
         // API Calls
         async function apiCall(endpoint, method = 'GET', body = null) {
             const url = `${state.apiUrl}/api${endpoint}`;
@@ -3696,8 +3735,7 @@
             const response = await fetch(url, options);
 
             if (!response.ok) {
-                const errorText = await response.text();
-                throw new Error(errorText || `HTTP ${response.status}`);
+                throw new Error(await apiErrorMessage(response));
             }
 
             const text = await response.text();
@@ -5276,7 +5314,7 @@
                     headers: { 'X-API-Key': state.secretKey }
                 });
                 if (!response.ok) {
-                    throw new Error(await response.text() || `HTTP ${response.status}`);
+                    throw new Error(await apiErrorMessage(response));
                 }
                 const logs = await response.text() || 'No logs available';
                 currentLogsContent = logs;
@@ -5694,7 +5732,15 @@
         // that lets the agent nsenter into PID 1's namespaces and give a
         // shell that actually shows the host's /home, /etc, and processes
         // (without it the "host" shell is a shell in the agent container).
-        function buildJoinDockerRun({ joinURL, token, hostShell, imageTag }) {
+        //
+        // warpToken is the per-node Cloudflare Mesh token. Omitting it is a
+        // real hazard rather than a missing nicety: the joiner falls back to
+        // the cluster-shared token, and Mesh registers shared-token nodes as
+        // active-passive replicas of ONE identity - the passive ones drop all
+        // traffic while still joining Jetty and reporting healthy. Jetty
+        // cannot mint these (they come from the Cloudflare dashboard), so the
+        // best we can do is carry it through and say so loudly.
+        function buildJoinDockerRun({ joinURL, token, hostShell, imageTag, warpToken }) {
             const lines = [
                 'docker run -d',
                 '  --name jetty',
@@ -5712,6 +5758,9 @@
                 `  -e JETTY_JOIN='${joinURL}'`,
                 `  -e JETTY_JOIN_TOKEN='${token}'`,
             );
+            if (warpToken) {
+                lines.push(`  -e JETTY_WARP_CONNECTOR_TOKEN='${warpToken}'`);
+            }
             if (hostShell) {
                 lines.push('  -e JETTY_HOST_SHELL=true');
             }
@@ -5726,6 +5775,7 @@
             const ttl = parseInt(document.getElementById('createTokenTTL').value, 10) || 3600;
             const hostShell = document.getElementById('createTokenHostShell').checked;
             const imageTag = document.getElementById('createTokenImageTag').value.trim() || 'ghcr.io/ncwardell/jetty:latest';
+            const warpToken = document.getElementById('createTokenWarpToken').value.trim();
             try {
                 const result = await apiCall('/tokens', 'POST', { ttl_seconds: ttl, note });
                 closeCreateTokenModal();
@@ -5734,10 +5784,15 @@
                 document.getElementById('tokenResultExpires').textContent = formatRelative(result.expires_at);
                 const joinURL = state.connection && state.connection.url ? state.connection.url : 'https://your-cluster';
                 lastGeneratedDockerRun = buildJoinDockerRun({
-                    joinURL, token: result.token, hostShell, imageTag,
+                    joinURL, token: result.token, hostShell, imageTag, warpToken,
                 });
                 document.getElementById('tokenResultDockerRun').textContent = lastGeneratedDockerRun;
+                // Carry the warning onto the result screen too - this is the
+                // page that actually gets read, and a blank mesh token is
+                // silent everywhere else.
+                document.getElementById('tokenResultWarpWarning').classList.toggle('hidden', !!warpToken);
                 document.getElementById('tokenResultModal').classList.remove('hidden');
+                document.getElementById('createTokenWarpToken').value = '';
                 refreshTokens();
             } catch (error) {
                 showToast(`Failed to generate token: ${error.message}`, 'error');

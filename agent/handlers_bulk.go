@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -73,14 +72,14 @@ type bulkSelected struct {
 func (a *Agent) apiBulkWorkload(w http.ResponseWriter, r *http.Request) {
 	var req bulkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), 400)
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
 	switch req.Action {
 	case "start", "stop", "restart", "delete":
 	default:
-		http.Error(w, "action must be one of: start, stop, restart, delete", 400)
+		writeError(w, http.StatusBadRequest, "action must be one of: start, stop, restart, delete")
 		return
 	}
 
@@ -95,7 +94,7 @@ func (a *Agent) apiBulkWorkload(w http.ResponseWriter, r *http.Request) {
 		selectors++
 	}
 	if selectors != 1 {
-		http.Error(w, "exactly one selector required: 'tag', 'names', or 'all'", 400)
+		writeError(w, http.StatusBadRequest, "exactly one selector required: 'tag', 'names', or 'all'")
 		return
 	}
 
@@ -180,7 +179,7 @@ func (a *Agent) apiBulkWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
-	log.Printf("Bulk %s: %d workloads", req.Action, len(selected))
+	logInfof("Bulk %s: %d workloads", req.Action, len(selected))
 }
 
 // applyBulkAction runs the action against a single workload, either

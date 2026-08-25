@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -77,7 +76,7 @@ func (a *Agent) authorizeTerminalRequest(w http.ResponseWriter, r *http.Request)
 	admin := a.state.AdminKey
 	a.stateMu.RUnlock()
 	if admin == "" {
-		http.Error(w, "terminal disabled: admin key not configured", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "terminal disabled: admin key not configured")
 		return false
 	}
 	apiKey := r.Header.Get("X-API-Key")
@@ -85,7 +84,7 @@ func (a *Agent) authorizeTerminalRequest(w http.ResponseWriter, r *http.Request)
 		apiKey = r.URL.Query().Get("api_key")
 	}
 	if subtle.ConstantTimeCompare([]byte(apiKey), []byte(admin)) != 1 {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return false
 	}
 	return true
@@ -183,7 +182,7 @@ func (a *Agent) attachPTYToWS(conn *websocket.Conn, cmd *exec.Cmd) {
 			cols := binary.BigEndian.Uint16(msg[1:3])
 			rows := binary.BigEndian.Uint16(msg[3:5])
 			if err := resizePTY(master, cols, rows); err != nil {
-				log.Printf("Terminal resize failed: %v", err)
+				logErrorf("Terminal resize failed: %v", err)
 			}
 		}
 	}
@@ -246,7 +245,7 @@ func (a *Agent) apiWorkloadExec(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 
 	if found == nil {
-		http.Error(w, "workload not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "workload not found")
 		return
 	}
 
@@ -260,28 +259,27 @@ func (a *Agent) apiWorkloadExec(w http.ResponseWriter, r *http.Request) {
 			ownerName = ownerPeer.Name
 			ownerIP = ownerPeer.IP
 		}
-		http.Error(w,
-			fmt.Sprintf("workload runs on node %q (%s) - open the dashboard on that node to exec", ownerName, ownerIP),
-			http.StatusBadGateway)
+		writeError(w, http.StatusBadGateway,
+			fmt.Sprintf("workload runs on node %q (%s) - open the dashboard on that node to exec", ownerName, ownerIP))
 		return
 	}
 
 	containerID, err := a.containerForExec(name, r.URL.Query().Get("service"))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
 
 	conn, err := termWSUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Terminal exec: WS upgrade failed: %v", err)
+		logErrorf("Terminal exec: WS upgrade failed: %v", err)
 		return
 	}
 	defer conn.Close()
 
 	shell := pickShell(r, "/bin/sh")
 	cmd := exec.Command("docker", "exec", "-i", "-t", containerID, shell)
-	log.Printf("Terminal: exec into workload %s container %s shell=%s from %s",
+	logInfof("Terminal: exec into workload %s container %s shell=%s from %s",
 		name, shortID(containerID, 12), shell, r.RemoteAddr)
 	a.attachPTYToWS(conn, cmd)
 }
@@ -321,13 +319,13 @@ func (a *Agent) apiHostShell(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !a.hostShellEnabled {
-		http.Error(w, "host shell disabled - set JETTY_HOST_SHELL=true on the agent to enable", http.StatusForbidden)
+		writeError(w, http.StatusForbidden, "host shell disabled - set JETTY_HOST_SHELL=true on the agent to enable")
 		return
 	}
 
 	conn, err := termWSUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Host shell: WS upgrade failed: %v", err)
+		logErrorf("Host shell: WS upgrade failed: %v", err)
 		return
 	}
 	defer conn.Close()
@@ -369,7 +367,7 @@ func (a *Agent) apiHostShell(w http.ResponseWriter, r *http.Request) {
 		// xterm.js will render this before the shell's first prompt.
 		_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{termMsgData}, []byte(banner)...))
 	}
-	log.Printf("Host shell: opened by %s (host_ns=%v)", r.RemoteAddr, hostNamespacesAvailable())
+	logInfof("Host shell: opened by %s (host_ns=%v)", r.RemoteAddr, hostNamespacesAvailable())
 	a.attachPTYToWS(conn, cmd)
 }
 
@@ -432,7 +430,7 @@ type HostExecResponse struct {
 func (a *Agent) apiHostExec(w http.ResponseWriter, r *http.Request) {
 	// Same auth shape as the WS host shell: AdminKey only (not peer keys).
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required for host exec", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required for host exec")
 		return
 	}
 
@@ -444,17 +442,17 @@ func (a *Agent) apiHostExec(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !a.hostShellEnabled {
-		http.Error(w, "host exec disabled - set JETTY_HOST_SHELL=true on the agent to enable", http.StatusForbidden)
+		writeError(w, http.StatusForbidden, "host exec disabled - set JETTY_HOST_SHELL=true on the agent to enable")
 		return
 	}
 
 	var req HostExecRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
 	if strings.TrimSpace(req.Command) == "" {
-		http.Error(w, "command is required", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "command is required")
 		return
 	}
 	timeout := req.Timeout
@@ -505,12 +503,12 @@ func (a *Agent) apiHostExec(w http.ResponseWriter, r *http.Request) {
 		} else {
 			// Process didn't start at all (e.g. nsenter missing). Surface
 			// as a 500 rather than a "completed with rc=1" lie.
-			http.Error(w, fmt.Sprintf("exec failed to start: %v", err), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("exec failed to start: %v", err))
 			return
 		}
 	}
 
-	log.Printf("Host exec: by %s (%dms exit=%d, %d stdout / %d stderr bytes)",
+	logInfof("Host exec: by %s (%dms exit=%d, %d stdout / %d stderr bytes)",
 		r.RemoteAddr, resp.DurationMs, resp.ExitCode, len(resp.Stdout), len(resp.Stderr))
 	writeJSON(w, resp)
 }
@@ -529,23 +527,23 @@ func (a *Agent) proxyHostExec(w http.ResponseWriter, r *http.Request, nodeID str
 	a.stateMu.RUnlock()
 
 	if target == nil {
-		http.Error(w, "node not found: "+nodeID, http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "node not found: "+nodeID)
 		return
 	}
 	if admin == "" {
-		http.Error(w, "admin key not configured", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "admin key not configured")
 		return
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
 	url := a.getPeerAPIURL(target, "/api/host/exec")
 	proxyReq, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
-		http.Error(w, "build proxy request: "+err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "build proxy request: "+err.Error())
 		return
 	}
 	proxyReq.Header.Set("X-API-Key", admin)
@@ -553,7 +551,7 @@ func (a *Agent) proxyHostExec(w http.ResponseWriter, r *http.Request, nodeID str
 
 	resp, err := httpClient.Do(proxyReq)
 	if err != nil {
-		http.Error(w, "reach node: "+err.Error(), http.StatusBadGateway)
+		writeError(w, http.StatusBadGateway, "reach node: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -575,14 +573,14 @@ func (a *Agent) proxyHostShell(w http.ResponseWriter, r *http.Request, nodeID st
 	a.stateMu.RUnlock()
 
 	if peer == nil || peer.IP == "" {
-		http.Error(w, fmt.Sprintf("peer %s not found or has no WARP IP", nodeID), http.StatusBadGateway)
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("peer %s not found or has no WARP IP", nodeID))
 		return
 	}
 	if admin == "" {
 		// authorizeTerminalRequest already enforces this for the local
 		// path, but we re-check here because the proxy uses AdminKey to
 		// authenticate to the peer.
-		http.Error(w, "admin key not configured", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "admin key not configured")
 		return
 	}
 
@@ -605,12 +603,11 @@ func (a *Agent) proxyHostShell(w http.ResponseWriter, r *http.Request, nodeID st
 		if resp != nil {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			http.Error(w,
+			writeError(w, http.StatusBadGateway,
 				fmt.Sprintf("peer %s rejected shell (HTTP %d): %s",
-					peer.Name, resp.StatusCode, strings.TrimSpace(string(body))),
-				http.StatusBadGateway)
+					peer.Name, resp.StatusCode, strings.TrimSpace(string(body))))
 		} else {
-			http.Error(w, fmt.Sprintf("dial peer host shell: %v", err), http.StatusBadGateway)
+			writeError(w, http.StatusBadGateway, fmt.Sprintf("dial peer host shell: %v", err))
 		}
 		return
 	}
@@ -618,12 +615,12 @@ func (a *Agent) proxyHostShell(w http.ResponseWriter, r *http.Request, nodeID st
 
 	clientConn, err := termWSUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Host shell proxy: WS upgrade failed: %v", err)
+		logErrorf("Host shell proxy: WS upgrade failed: %v", err)
 		return
 	}
 	defer clientConn.Close()
 
-	log.Printf("Host shell proxy: %s -> peer %s (%s)", r.RemoteAddr, peer.Name, shortID(nodeID, 12))
+	logInfof("Host shell proxy: %s -> peer %s (%s)", r.RemoteAddr, peer.Name, shortID(nodeID, 12))
 	bridgeWebSockets(clientConn, peerConn)
 }
 

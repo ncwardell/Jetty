@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"runtime"
@@ -212,6 +211,14 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
+
+// apiSync godoc
+// @Summary Full replicated state dump (internal)
+// @Description Node-to-node pull used as the backstop when memberlist gossip is unavailable. Returns every workload, deletion tombstone, env value and env tombstone so a peer can merge by highest-version-wins. Peer API key required.
+// @Tags internal
+// @Produce json
+// @Success 200 {object} SyncResponse
+// @Router /sync [get]
 func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 	// Return all workloads, deleted workloads (tombstones), and env data for sync
 	// This allows other nodes to get a complete view of cluster state including deletions
@@ -232,6 +239,7 @@ func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 	for _, dek := range a.state.DeletedEnvKeys {
 		deletedEnvKeys = append(deletedEnvKeys, dek)
 	}
+	removedPeers := a.removedPeersSlice()
 	a.stateMu.RUnlock()
 
 	// Return sync response with workloads, tombstones, and env data
@@ -247,16 +255,29 @@ func (a *Agent) apiSync(w http.ResponseWriter, r *http.Request) {
 	if len(deletedEnvKeys) > 0 {
 		resp["deleted_env_keys"] = deletedEnvKeys
 	}
+	if len(removedPeers) > 0 {
+		resp["removed_peers"] = removedPeers
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
+
+// apiPeerAnnounce godoc
+// @Summary Announce a peer's current address and state (internal)
+// @Description Node-to-node. A peer reports its identity, WARP IP, version and architecture so the receiver can add or refresh it in the peer table. Peer API key required.
+// @Tags internal
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} ErrorResponse "Invalid request"
+// @Router /peer-announce [post]
 func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Peer Peer `json:"peer"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), 400)
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -274,7 +295,7 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	// /etc/hosts; an unvalidated newline/tab would let a (compromised)
 	// peer inject arbitrary host -> IP mappings on every node.
 	if !validIngestedPeer(&req.Peer) {
-		http.Error(w, "invalid peer fields", 400)
+		writeError(w, http.StatusBadRequest, "invalid peer fields")
 		return
 	}
 
@@ -291,6 +312,15 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 
 	// Refuse to repoint an existing peer's IP via this endpoint.
 	a.stateMu.Lock()
+	// A removed node announces itself like any other - it is still running.
+	// Without this it is back in the peer table on the next announce.
+	if a.peerRemovedLocked(req.Peer.ID) {
+		a.stateMu.Unlock()
+		logWarnf("Rejecting announce from removed node %s (%s); "+
+			"issue a fresh join token to re-admit it", req.Peer.Name, shortID(req.Peer.ID, 12))
+		writeError(w, http.StatusForbidden, "node has been removed from this cluster")
+		return
+	}
 	oldPeer := a.state.Peers[req.Peer.ID]
 	oldIP := ""
 	oldAPIKey := ""
@@ -302,9 +332,9 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 		remoteHost, _, _ := net.SplitHostPort(r.RemoteAddr)
 		if remoteHost != req.Peer.IP {
 			a.stateMu.Unlock()
-			log.Printf("Refusing peer-announce IP change for %s: %s -> %s (RemoteAddr=%s does not match new IP)",
+			logInfof("Refusing peer-announce IP change for %s: %s -> %s (RemoteAddr=%s does not match new IP)",
 				req.Peer.ID, oldIP, req.Peer.IP, remoteHost)
-			http.Error(w, "peer IP change must come from the new IP", 403)
+			writeError(w, http.StatusForbidden, "peer IP change must come from the new IP")
 			return
 		}
 	}
@@ -331,32 +361,42 @@ func (a *Agent) apiPeerAnnounce(w http.ResponseWriter, r *http.Request) {
 	// IPIP requires both sides to have matching tunnels
 	if req.Peer.IP != "" {
 		if err := a.ensurePeerTunnel(req.Peer.ID, req.Peer.IP); err != nil {
-			log.Printf("Warning: failed to create tunnel to %s: %v", req.Peer.Name, err)
+			logWarnf("failed to create tunnel to %s: %v", req.Peer.Name, err)
 		}
 	}
 
 	// If peer IP changed, also update workload routes
 	if ipChanged {
-		log.Printf("Peer %s IP changed: %s -> %s", req.Peer.Name, oldIP, req.Peer.IP)
+		logInfof("Peer %s IP changed: %s -> %s", req.Peer.Name, oldIP, req.Peer.IP)
 		a.stateMu.Lock()
-		a.updateWorkloadRoutes()
+		a.triggerRouteReconcile()
 		a.stateMu.Unlock()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 
-	log.Printf("Peer announced: %s (%s)", req.Peer.Name, req.Peer.IP)
+	logInfof("Peer announced: %s (%s)", req.Peer.Name, req.Peer.IP)
 }
+
 // apiHeartbeat receives heartbeats from peers in tunnel-only mode.
 // This allows peers to track each other's health through the Cloudflare tunnel.
+// apiHeartbeat godoc
+// @Summary Peer liveness ping (internal)
+// @Description Node-to-node liveness used in tunnel mode, where peers cannot reach each other directly over WARP. Refreshes the sender's LastSeen. Peer API key required.
+// @Tags internal
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} ErrorResponse "Invalid request"
+// @Router /heartbeat [post]
 func (a *Agent) apiHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), 400)
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -380,6 +420,7 @@ func (a *Agent) apiHeartbeat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "received_by": a.hostname})
 }
+
 // broadcastTunnelToken sends the CF token to all peers so they can start their tunnels.
 // Sends X-API-Key via peerRequest so the receiver's apiKeyMiddleware admits it.
 func (a *Agent) broadcastTunnelToken(token string) {
@@ -390,12 +431,12 @@ func (a *Agent) broadcastTunnelToken(token string) {
 		url := a.getTunnelAPIURL("/api/tunnel/sync")
 		req, err := a.peerRequest("POST", url, strings.NewReader(string(data)))
 		if err != nil {
-			log.Printf("Failed to build tunnel-token broadcast: %v", err)
+			logErrorf("Failed to build tunnel-token broadcast: %v", err)
 			return
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			log.Printf("Failed to broadcast tunnel token: %v", err)
+			logErrorf("Failed to broadcast tunnel token: %v", err)
 		} else {
 			resp.Body.Close()
 		}
@@ -416,23 +457,34 @@ func (a *Agent) broadcastTunnelToken(token string) {
 		url := fmt.Sprintf("http://%s:%d/api/tunnel/sync", peer.IP, a.apiPort)
 		req, err := a.peerRequest("POST", url, strings.NewReader(string(data)))
 		if err != nil {
-			log.Printf("Failed to build tunnel-token broadcast to %s: %v", peer.Name, err)
+			logErrorf("Failed to build tunnel-token broadcast to %s: %v", peer.Name, err)
 			continue
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			log.Printf("Failed to broadcast tunnel token to %s: %v", peer.Name, err)
+			logErrorf("Failed to broadcast tunnel token to %s: %v", peer.Name, err)
 			continue
 		}
 		resp.Body.Close()
 	}
 }
+
+// apiTunnelSync godoc
+// @Summary Receive a tunnel token broadcast (internal)
+// @Description Node-to-node. Accepts the cluster CFToken from a peer and starts or stops cloudflared to match. A node that has opted out via DELETE /tunnel?scope=node accepts the token but stays stopped. Peer API key required.
+// @Tags internal
+// @Accept json
+// @Produce json
+// @Param token body TunnelRequest true "Cluster tunnel token; empty string tears the tunnel down"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} ErrorResponse "Invalid request"
+// @Router /tunnel/sync [post]
 func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Token string `json:"token"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), 400)
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -446,12 +498,20 @@ func (a *Agent) apiTunnelSync(w http.ResponseWriter, r *http.Request) {
 		a.saveState()
 		if req.Token == "" {
 			a.stopCloudflared()
-			log.Printf("Cloudflare tunnel removed via sync")
+			logInfof("Cloudflare tunnel removed via sync")
 		} else {
-			if err := a.restartCloudflared(); err != nil {
-				log.Printf("Failed to start tunnel after sync: %v", err)
+			a.stateMu.RLock()
+			disabled := a.state.CFTunnelDisabled
+			a.stateMu.RUnlock()
+			if disabled {
+				// The token is cluster state and we accept it, but a node
+				// that opted out stays out. startCloudflared enforces this
+				// too; short-circuiting here keeps the log honest.
+				logInfof("Cloudflare tunnel token synced but this node is disabled; not starting")
+			} else if err := a.restartCloudflared(); err != nil {
+				logErrorf("Failed to start tunnel after sync: %v", err)
 			} else {
-				log.Printf("Cloudflare tunnel started via sync")
+				logInfof("Cloudflare tunnel started via sync")
 			}
 		}
 	}

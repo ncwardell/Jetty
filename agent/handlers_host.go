@@ -26,11 +26,11 @@ import (
 
 // HostContainer is the per-container shape returned by /api/host/containers.
 type HostContainer struct {
-	ID             string   `json:"id"`             // short ID
-	Name           string   `json:"name"`           // primary container name (without leading /)
-	Image          string   `json:"image"`          // image:tag
-	State          string   `json:"state"`          // "running", "exited", "paused", ...
-	Status         string   `json:"status"`         // human-readable e.g. "Up 5 hours"
+	ID             string   `json:"id"`     // short ID
+	Name           string   `json:"name"`   // primary container name (without leading /)
+	Image          string   `json:"image"`  // image:tag
+	State          string   `json:"state"`  // "running", "exited", "paused", ...
+	Status         string   `json:"status"` // human-readable e.g. "Up 5 hours"
 	ComposeProject string   `json:"compose_project,omitempty"`
 	ComposeService string   `json:"compose_service,omitempty"`
 	Ports          []string `json:"ports,omitempty"` // e.g. "0.0.0.0:80->80/tcp"
@@ -100,8 +100,9 @@ func parseHostContainerLine(line string) (HostContainer, bool) {
 // docker's own template language pulls each label out for us.
 //
 // Fields, in order:
-//   ID  Names  Image  State  Status  Ports  CreatedAt
-//   compose.project  compose.service
+//
+//	ID  Names  Image  State  Status  Ports  CreatedAt
+//	compose.project  compose.service
 const hostContainersFormat = `{{.ID}}` + "\t" +
 	`{{.Names}}` + "\t" +
 	`{{.Image}}` + "\t" +

@@ -3,7 +3,6 @@ package agent
 import (
 	"crypto/subtle"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -85,6 +84,35 @@ func (a *Agent) corsMiddleware(next http.Handler) http.Handler {
 // set JETTY_SECRET so AdminKey gets bootstrapped.
 func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Public endpoints are checked FIRST, before any lock is taken.
+		//
+		// This ordering is load-bearing. Taking stateMu.RLock() up front meant
+		// every request - including ones that need no credential at all -
+		// scanned the whole peer table under the lock and discarded the
+		// result. So when a writer was stuck (route programming used to
+		// fork/exec under this lock), even /api/health blocked, and a wedged
+		// node could not report being wedged. Cheaper per request and, more
+		// importantly, keeps the endpoints you reach for during an incident
+		// independent of the lock that is stuck.
+		publicPaths := []string{
+			"/api/health",
+			"/api/livez",
+			"/api/join",
+			"/swagger/",
+		}
+
+		path := r.URL.Path
+		if path == "/" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		for _, p := range publicPaths {
+			if strings.HasPrefix(path, p) {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
 		// Skip authentication if neither AdminKey nor any peer key is
 		// configured. Mirrors the original behavior on first-ever-node
 		// startup before bootstrap completes.
@@ -105,38 +133,19 @@ func (a *Agent) apiKeyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Public endpoints that don't require API key.
-		publicPaths := []string{
-			"/api/health",
-			"/api/join",
-			"/swagger/",
-		}
-
-		path := r.URL.Path
-		if path == "/" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		for _, p := range publicPaths {
-			if strings.HasPrefix(path, p) {
-				next.ServeHTTP(w, r)
-				return
-			}
-		}
-
 		apiKey := r.Header.Get("X-API-Key")
 		if apiKey == "" {
 			apiKey = r.URL.Query().Get("api_key")
 		}
 		if apiKey == "" {
-			http.Error(w, "unauthorized: missing API key", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "unauthorized: missing API key")
 			return
 		}
 		if a.authorizeAPIKey(apiKey) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		http.Error(w, "unauthorized: invalid API key", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: invalid API key")
 	})
 }
 
@@ -200,18 +209,18 @@ func (a *Agent) waitForAPI() {
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 200 || resp.StatusCode == 401 { // 401 is OK, means API is up but needs auth
-				log.Printf("API server ready")
+				logInfof("API server ready")
 				return
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	log.Printf("Warning: API server not responding after 5s, continuing anyway")
+	logWarnf("API server not responding after 5s, continuing anyway")
 }
 
 // runAPI builds the route table, wraps it in middleware, and starts
 // ListenAndServe. Called as a goroutine from Start(); blocks forever
-// (or exits the process via log.Fatalf if ListenAndServe fails).
+// (or exits the process via logFatalf if ListenAndServe fails).
 func (a *Agent) runAPI() {
 	// Set Swagger host to empty so it uses the current request's host
 	// This makes it work automatically for both localhost and cloudflared tunnels
@@ -254,6 +263,10 @@ func (a *Agent) runAPI() {
 	// --- Node CRUD (handlers_nodes.go) -------------------------------
 	r.HandleFunc("/api/nodes", a.apiListNodes).Methods("GET")
 	r.HandleFunc("/api/nodes/{id}", a.apiRemoveNode).Methods("DELETE")
+	r.HandleFunc("/api/leave", a.apiLeave).Methods("POST")
+	r.HandleFunc("/api/livez", a.apiLivez).Methods("GET")
+	r.HandleFunc("/api/log-level", a.apiGetLogLevel).Methods("GET")
+	r.HandleFunc("/api/log-level", a.apiSetLogLevel).Methods("POST")
 	r.HandleFunc("/api/nodes/{id}/update", a.apiUpdateNode).Methods("POST")
 
 	// --- Cloudflare Tunnel (handlers_tunnel.go) ----------------------
@@ -329,8 +342,8 @@ func (a *Agent) runAPI() {
 	a.stateMu.RLock()
 	hasAdmin := a.state.AdminKey != ""
 	a.stateMu.RUnlock()
-	log.Printf("API on %s (auth=%v)", addr, hasAdmin)
+	logInfof("API on %s (auth=%v)", addr, hasAdmin)
 	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatalf("API server failed: %v", err)
+		logFatalf("API server failed: %v", err)
 	}
 }

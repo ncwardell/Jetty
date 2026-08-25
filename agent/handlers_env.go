@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"regexp"
 	"sort"
@@ -47,6 +46,7 @@ func (a *Agent) apiListEnv(w http.ResponseWriter, r *http.Request) {
 		"count": len(keys),
 	})
 }
+
 // apiSetEnv godoc
 // @Summary Set environment variables
 // @Description Stores encrypted environment variables (existing keys are overwritten)
@@ -62,12 +62,12 @@ func (a *Agent) apiSetEnv(w http.ResponseWriter, r *http.Request) {
 		Env map[string]string `json:"env"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), 400)
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	if len(req.Env) == 0 {
-		http.Error(w, "env map required", 400)
+		writeError(w, http.StatusBadRequest, "env map required")
 		return
 	}
 
@@ -75,7 +75,7 @@ func (a *Agent) apiSetEnv(w http.ResponseWriter, r *http.Request) {
 	envKeyPattern := regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 	for key := range req.Env {
 		if !envKeyPattern.MatchString(key) {
-			http.Error(w, fmt.Sprintf("invalid env key: %s (must start with letter or underscore, contain only alphanumerics and underscores)", key), 400)
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid env key: %s (must start with letter or underscore, contain only alphanumerics and underscores)", key))
 			return
 		}
 	}
@@ -87,7 +87,7 @@ func (a *Agent) apiSetEnv(w http.ResponseWriter, r *http.Request) {
 	for key, value := range req.Env {
 		encrypted, err := a.encryptValue(value)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("encrypt %s: %v", key, err), 500)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("encrypt %s: %v", key, err))
 			return
 		}
 		encryptedMap[key] = encrypted
@@ -145,8 +145,9 @@ func (a *Agent) apiSetEnv(w http.ResponseWriter, r *http.Request) {
 		"updated": updated,
 	})
 
-	log.Printf("Env set: added=%v, updated=%v", added, updated)
+	logInfof("Env set: added=%v, updated=%v", added, updated)
 }
+
 // apiGetEnv godoc
 // @Summary Get environment variable
 // @Description Returns the decrypted value of a specific environment variable
@@ -165,13 +166,13 @@ func (a *Agent) apiGetEnv(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.RUnlock()
 
 	if !exists {
-		http.Error(w, "env key not found", 404)
+		writeError(w, http.StatusNotFound, "env key not found")
 		return
 	}
 
 	value, err := a.decryptValue(encrypted)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("decrypt: %v", err), 500)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("decrypt: %v", err))
 		return
 	}
 
@@ -181,6 +182,7 @@ func (a *Agent) apiGetEnv(w http.ResponseWriter, r *http.Request) {
 		"value": value,
 	})
 }
+
 // apiDeleteEnv godoc
 // @Summary Delete environment variable
 // @Description Removes an environment variable from storage
@@ -207,7 +209,7 @@ func (a *Agent) apiDeleteEnv(w http.ResponseWriter, r *http.Request) {
 	a.stateMu.Unlock()
 
 	if !exists {
-		http.Error(w, "env key not found", 404)
+		writeError(w, http.StatusNotFound, "env key not found")
 		return
 	}
 
@@ -222,5 +224,5 @@ func (a *Agent) apiDeleteEnv(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(204)
-	log.Printf("Env deleted: %s, created tombstone for sync propagation", key)
+	logInfof("Env deleted: %s, created tombstone for sync propagation", key)
 }

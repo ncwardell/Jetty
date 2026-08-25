@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -38,12 +37,12 @@ import (
 // @Router /peers/{id}/rotate-key [post]
 func (a *Agent) apiRotatePeerKey(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthorize(r) {
-		http.Error(w, "unauthorized: admin key required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized: admin key required")
 		return
 	}
 	id := mux.Vars(r)["id"]
 	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "missing id")
 		return
 	}
 
@@ -51,7 +50,7 @@ func (a *Agent) apiRotatePeerKey(w http.ResponseWriter, r *http.Request) {
 	if id == "self" || id == a.hwid || id == a.hostname {
 		newKey, err := a.rotateSelfAPIKeyLocal()
 		if err != nil {
-			http.Error(w, "rotate failed: "+err.Error(), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "rotate failed: "+err.Error())
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -62,7 +61,7 @@ func (a *Agent) apiRotatePeerKey(w http.ResponseWriter, r *http.Request) {
 			// Don't return the new key itself - the operator never
 			// needs to see it; only the agent and its peers do.
 		})
-		log.Printf("Self APIKey rotated by admin from %s; new key has %d chars", r.RemoteAddr, len(newKey))
+		logInfof("Self APIKey rotated by admin from %s; new key has %d chars", r.RemoteAddr, len(newKey))
 		return
 	}
 
@@ -77,17 +76,17 @@ func (a *Agent) apiRotatePeerKey(w http.ResponseWriter, r *http.Request) {
 	}
 	a.stateMu.RUnlock()
 	if target == nil {
-		http.Error(w, "peer not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "peer not found")
 		return
 	}
 	if !target.Healthy {
-		http.Error(w, "peer is unhealthy; cannot rotate its key remotely (peer must be reachable to mint a new SelfAPIKey)", http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "peer is unhealthy; cannot rotate its key remotely (peer must be reachable to mint a new SelfAPIKey)")
 		return
 	}
 
 	url := a.getPeerAPIURL(target, "/api/peers/self/rotate-key")
 	if url == "" {
-		http.Error(w, "no route to peer", http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "no route to peer")
 		return
 	}
 	// The proxied request needs admin auth at the target. We carry
@@ -96,7 +95,7 @@ func (a *Agent) apiRotatePeerKey(w http.ResponseWriter, r *http.Request) {
 	// AdminKey is cluster-wide) matches what the operator sent us.
 	pr, err := http.NewRequest("POST", url, nil)
 	if err != nil {
-		http.Error(w, "build proxy request: "+err.Error(), 500)
+		writeError(w, http.StatusInternalServerError, "build proxy request: "+err.Error())
 		return
 	}
 	if k := r.Header.Get("X-API-Key"); k != "" {
@@ -104,7 +103,7 @@ func (a *Agent) apiRotatePeerKey(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := httpClient.Do(pr)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("proxy to peer: %v", err), http.StatusBadGateway)
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("proxy to peer: %v", err))
 		return
 	}
 	defer resp.Body.Close()
@@ -143,4 +142,3 @@ func (a *Agent) rotateSelfAPIKeyLocal() (string, error) {
 	}
 	return newKey, nil
 }
-

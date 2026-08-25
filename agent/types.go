@@ -27,9 +27,15 @@ const (
 	FailoverCheckInterval = 5 * time.Second  // How often to scan for orphaned workloads
 	FailoverGracePeriod   = 30 * time.Second // Peer must stay unreachable this long before failover claims its workloads
 	FailoverStartupGrace  = 90 * time.Second // No failover claims for the first N seconds after agent startup - lets memberlist + checkPeers converge so we don't claim based on stale peer-health from before our last shutdown
+	FailoverClaimSettle   = 2 * time.Second  // After announcing a claim, wait this long and re-check before deploying, so a node that lost a concurrent claim never starts the container
 	IPMonitorInterval     = 10 * time.Second // How often to check for WARP IP changes
 	CPUSampleInterval     = 30 * time.Second // How often to sample CPU usage
 	TombstoneMaxAge       = 1 * time.Hour    // How long to keep deletion tombstones
+	// RemovedPeerMaxAge is far longer than TombstoneMaxAge on purpose. A
+	// workload tombstone only has to outlive a gossip round, but a removed
+	// node can legitimately be powered off for weeks and must not come back
+	// as a cluster member when it boots.
+	RemovedPeerMaxAge = 30 * 24 * time.Hour
 
 	// Timeouts
 	DefaultHTTPTimeout   = 30 * time.Second
@@ -46,6 +52,11 @@ const (
 	CloudflaredMaxBackoff     = 2 * time.Minute
 	CloudflaredMaxFailures    = 10
 	CloudflaredSuccessReset   = 30 * time.Second
+
+	// memberlistLeaveTimeout bounds how long a departing node waits for its
+	// leave to propagate. Short: the removal already happened, this is just
+	// courtesy notice so peers mark us gone promptly rather than by timeout.
+	memberlistLeaveTimeout = 5 * time.Second
 )
 
 // =============================================================================
@@ -148,15 +159,53 @@ type DeletedEnvKey struct {
 	Version int64  `json:"version"` // Timestamp when deleted
 }
 
+// RemovedPeer is a tombstone for a node removed from the cluster.
+//
+// Without one, removal cannot stick. A removed node keeps running, stays on
+// WARP and stays an active memberlist member, so NotifyJoin and
+// /api/peer-announce re-add it within a gossip round - while the removal has
+// already torn down the IPIP tunnel, the route table and /etc/hosts. The
+// resulting flap is what took the cluster down.
+//
+// Deliberately NOT consulted by /api/join: presenting a fresh, valid join
+// token is an explicit operator action that re-admits the node and clears the
+// tombstone. The tombstone blocks *resurrection by gossip*, not readmission
+// by decision.
+type RemovedPeer struct {
+	ID      string `json:"id"`
+	Name    string `json:"name,omitempty"`
+	Version int64  `json:"version"` // UnixNano when removed; highest wins
+}
+
 // State represents the cluster-wide state
 type State struct {
 	Peers            map[string]*Peer            `json:"peers"`                       // ID -> Peer
 	Workloads        map[string]*Workload        `json:"workloads"`                   // IP -> Workload
 	DeletedWorkloads map[string]*DeletedWorkload `json:"deleted_workloads,omitempty"` // IP -> tombstone (for sync propagation)
 	CFToken          string                      `json:"cf_token,omitempty"`          // Cloudflare tunnel token (shared cluster-wide)
-	WarpToken        string                      `json:"warp_token,omitempty"`        // Cloudflare WARP connector token (shared cluster-wide)
-	EnvData          map[string]string           `json:"env_data,omitempty"`          // Encrypted environment variables (key -> encrypted value)
-	DeletedEnvKeys   map[string]*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`  // Key -> tombstone (for sync propagation)
+
+	// CFTunnelDisabled opts THIS node out of running a cloudflared
+	// connector while leaving the cluster-wide CFToken intact. It is
+	// node-local and deliberately never broadcast or merged - the whole
+	// point is to detach one node without touching the others.
+	//
+	// Motivating incident: every node running a connector on the same
+	// Cloudflare tunnel means Cloudflare load-balances public requests
+	// across all of them. When one node could not reach a workload, that
+	// share of requests stalled. The only available remedy was DELETE
+	// /api/tunnel, which broadcast an empty token and tore down every
+	// connector in the cluster - taking all public sites down with
+	// Cloudflare 530/1033 until the token was re-POSTed.
+	CFTunnelDisabled bool `json:"cf_tunnel_disabled,omitempty"`
+
+	WarpToken      string                    `json:"warp_token,omitempty"`       // Cloudflare WARP connector token (shared cluster-wide)
+	EnvData        map[string]string         `json:"env_data,omitempty"`         // Encrypted environment variables (key -> encrypted value)
+	DeletedEnvKeys map[string]*DeletedEnvKey `json:"deleted_env_keys,omitempty"` // Key -> tombstone (for sync propagation)
+
+	// RemovedPeers are node tombstones, keyed by node ID. Gossiped and
+	// version-merged like workload tombstones so a removed node cannot be
+	// resurrected by a peer that has not heard about the removal yet.
+	RemovedPeers map[string]*RemovedPeer `json:"removed_peers,omitempty"`
 
 	// AdminKey is the cluster-wide operator/dashboard credential.
 	// Bootstrapped from JETTY_SECRET on the first node, persisted, and
@@ -197,13 +246,13 @@ type State struct {
 // least-HWID healthy node actually writes the file - same election
 // rule failover uses, so we don't get N copies on every node.
 type BackupSchedule struct {
-	IntervalMinutes int       `json:"interval_minutes"`        // 0 = disabled
-	Retention       int       `json:"retention,omitempty"`     // keep this many on-disk backups (0 = unlimited)
-	Passphrase      string    `json:"passphrase,omitempty"`    // optional - if set, every scheduled backup is JETTY-ENC-V1 wrapped
-	LastRunAt       time.Time `json:"last_run_at,omitempty"`   // updated on every successful run
-	LastStatus      string    `json:"last_status,omitempty"`   // "ok" or "error: ..."
+	IntervalMinutes int       `json:"interval_minutes"`      // 0 = disabled
+	Retention       int       `json:"retention,omitempty"`   // keep this many on-disk backups (0 = unlimited)
+	Passphrase      string    `json:"passphrase,omitempty"`  // optional - if set, every scheduled backup is JETTY-ENC-V1 wrapped
+	LastRunAt       time.Time `json:"last_run_at,omitempty"` // updated on every successful run
+	LastStatus      string    `json:"last_status,omitempty"` // "ok" or "error: ..."
 	LastBackupPath  string    `json:"last_backup_path,omitempty"`
-	UpdatedAt       time.Time `json:"updated_at,omitempty"`    // when the schedule itself was last changed
+	UpdatedAt       time.Time `json:"updated_at,omitempty"` // when the schedule itself was last changed
 }
 
 // JoinToken is a single-use bearer credential that authorizes a new
@@ -213,13 +262,13 @@ type BackupSchedule struct {
 // attacker every unburned token. Burning sets Used=true and is
 // idempotent - replays after the first successful join are rejected.
 type JoinToken struct {
-	ID        string    `json:"id"`                    // Random hex; the token value itself
-	CreatedAt time.Time `json:"created_at"`            // When minted
-	ExpiresAt time.Time `json:"expires_at"`            // After this, refused even if unused
-	Note      string    `json:"note,omitempty"`        // Free-form ("for arnold's laptop")
-	Used      bool      `json:"used"`                  // True after a successful join consumed it
-	UsedBy    string    `json:"used_by,omitempty"`     // Joining peer's ID (audit)
-	UsedAt    time.Time `json:"used_at,omitempty"`     // When consumed
+	ID        string    `json:"id"`                // Random hex; the token value itself
+	CreatedAt time.Time `json:"created_at"`        // When minted
+	ExpiresAt time.Time `json:"expires_at"`        // After this, refused even if unused
+	Note      string    `json:"note,omitempty"`    // Free-form ("for arnold's laptop")
+	Used      bool      `json:"used"`              // True after a successful join consumed it
+	UsedBy    string    `json:"used_by,omitempty"` // Joining peer's ID (audit)
+	UsedAt    time.Time `json:"used_at,omitempty"` // When consumed
 }
 
 // NewState creates an empty state with initialized maps
@@ -230,6 +279,7 @@ func NewState() *State {
 		DeletedWorkloads: make(map[string]*DeletedWorkload),
 		EnvData:          make(map[string]string),
 		DeletedEnvKeys:   make(map[string]*DeletedEnvKey),
+		RemovedPeers:     make(map[string]*RemovedPeer),
 		JoinTokens:       make(map[string]*JoinToken),
 	}
 }
@@ -254,17 +304,36 @@ func (tc *tunnelConn) WriteMessage(messageType int, data []byte) error {
 
 // tcpProxyConn represents an active TCP proxy connection through the tunnel.
 type tcpProxyConn struct {
-	conn      net.Conn    // TCP connection to the workload (nil while pending)
-	wsConn    *tunnelConn // WebSocket connection back to the tunnel peer (with write mutex)
-	srcIP     net.IP          // Original source IP
-	srcPort   uint16          // Original source port
-	dstIP     net.IP          // Destination IP (workload)
-	dstPort   uint16          // Destination port
-	localSeq  uint32          // Our sequence number for responses
-	remoteSeq uint32          // Remote sequence number (from client)
-	mu        sync.Mutex      // Protects sequence numbers and conn
-	ready     chan struct{}   // Closed when connection is established (nil = already ready)
-	failed    bool            // True if connection establishment failed
+	conn      net.Conn      // TCP connection to the workload (nil while pending)
+	wsConn    *tunnelConn   // WebSocket connection back to the tunnel peer (with write mutex)
+	srcIP     net.IP        // Original source IP
+	srcPort   uint16        // Original source port
+	dstIP     net.IP        // Destination IP (workload)
+	dstPort   uint16        // Destination port
+	localSeq  uint32        // Our sequence number for responses
+	remoteSeq uint32        // Remote sequence number (from client)
+	mu        sync.Mutex    // Protects sequence numbers and conn
+	ready     chan struct{} // Closed when connection is established (nil = already ready)
+	failed    bool          // True if connection establishment failed
+
+	// Flow control. The proxy used to advertise a fixed 0xFFFF window,
+	// ignore the peer's advertised window entirely, and stream everything
+	// the origin produced as fast as it could read it. Since the WS
+	// transport carries no retransmission, any segment the receiver
+	// dropped for lack of buffer was gone for good - the flow then
+	// deadlocked waiting on a hole that never filled. That is the stall
+	// behind both the CIFS bulk-transfer hangs and the 10-15s
+	// cross-node HTTP stalls.
+	//
+	// We don't need full TCP: the WS transport is reliable and ordered,
+	// so we only have to stop overrunning the receiver. sendUnacked
+	// tracks bytes in flight (localSeq - lastAck) and peerWindow is the
+	// window most recently advertised by the peer; the read loop waits
+	// on windowCh whenever in-flight would exceed it.
+	lastAck    uint32        // highest ACK seen from the peer
+	peerWindow uint32        // peer's advertised receive window (scaled)
+	windowCh   chan struct{} // signalled when the window opens
+	closed     bool          // set once the flow is torn down
 }
 
 // =============================================================================
@@ -327,6 +396,10 @@ type Agent struct {
 	// Route management
 	workloadRoutes   map[string]string // workload IP -> owner WARP IP (for remote workloads)
 	workloadRoutesMu sync.Mutex
+	// routeReconcileCh is a capacity-1 level trigger for route reconciliation.
+	// Capacity 1 so triggerRouteReconcile never blocks - it is called with
+	// stateMu held.
+	routeReconcileCh chan struct{}
 
 	// Container autoheal: last time we restarted each running-but-unhealthy
 	// container, so a container that keeps coming up unhealthy isn't
@@ -335,7 +408,10 @@ type Agent struct {
 	healTimesMu sync.Mutex
 
 	// Tunnel support for cross-node routing
-	tunnelMode        string          // "ipip", "gre", or "" (none available)
+	tunnelMode string // "ipip", "gre", or "" (none available)
+	// tunnelStack selects the userspace tunnel receive implementation:
+	// "netstack" (gVisor, real TCP) or "legacy" (the hand-rolled proxy).
+	tunnelStack       string
 	ipipWarnedPeers   map[string]bool // Peers we've already warned about tunnel failure
 	ipipWarnedPeersMu sync.Mutex
 
@@ -438,4 +514,5 @@ type SyncResponse struct {
 	DeletedWorkloads []*DeletedWorkload `json:"deleted_workloads,omitempty"`
 	EnvData          map[string]string  `json:"env_data,omitempty"`
 	DeletedEnvKeys   []*DeletedEnvKey   `json:"deleted_env_keys,omitempty"`
+	RemovedPeers     []*RemovedPeer     `json:"removed_peers,omitempty"`
 }

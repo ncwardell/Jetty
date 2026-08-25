@@ -2,7 +2,6 @@ package agent
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"sort"
@@ -83,7 +82,7 @@ func (a *Agent) checkFailover() {
 	a.failoverInProgressMu.Lock()
 	for ip, startTime := range a.failoverInProgress {
 		if time.Since(startTime) > 5*time.Minute {
-			log.Printf("Failover for workload IP %s timed out, allowing retry", ip)
+			logInfof("Failover for workload IP %s timed out, allowing retry", ip)
 			delete(a.failoverInProgress, ip)
 		}
 	}
@@ -186,7 +185,7 @@ func (a *Agent) checkFailover() {
 
 		// Owner is dead - should we claim?
 		if a.shouldClaim(wl) {
-			log.Printf("Claiming orphaned workload: %s", wl.Name)
+			logInfof("Claiming orphaned workload: %s", wl.Name)
 
 			// Mark failover in progress before releasing state lock
 			a.failoverInProgressMu.Lock()
@@ -197,9 +196,11 @@ func (a *Agent) checkFailover() {
 			oldVersion := wl.Version
 			wl.Owner = a.hwid
 			wl.Version = time.Now().UnixNano() // Use nanoseconds for better precision
+			claimVersion := wl.Version
 
 			// Deploy it - capture workload state for rollback on failure
-			go func(w *Workload, prevOwner string, prevVersion int64) {
+			goSafe("failoverClaim", func() {
+				w, prevOwner, prevVersion := wl, oldOwner, oldVersion
 				// Ensure we clean up the in-progress marker when done
 				defer func() {
 					a.failoverInProgressMu.Lock()
@@ -207,8 +208,32 @@ func (a *Agent) checkFailover() {
 					a.failoverInProgressMu.Unlock()
 				}()
 
+				// Announce the claim BEFORE deploying, then let it settle.
+				//
+				// shouldClaim elects a single node deterministically, but only
+				// when every node sorts the same candidate list - and it ranks
+				// by per-node workload counts read from local state. Two nodes
+				// whose workload maps have not converged compute different
+				// counts, both rank themselves first, and both claim. That is
+				// most likely precisely when failover fires, since a node just
+				// disappeared and peers notice at different times.
+				//
+				// The claim used to be broadcast only after a successful
+				// deploy, so for the whole duration of an image pull no peer
+				// knew about it. Announcing first turns the window from
+				// "length of a deploy" into "length of the settle", and the
+				// re-check below means the losing claimant never starts a
+				// container at all. Ownership is still last-write-wins; this
+				// makes the loser find out before it does any damage.
+				a.announceClaim(w)
+				time.Sleep(FailoverClaimSettle)
+				if !a.claimStillHeld(w.IP, claimVersion) {
+					logInfof("Abandoning claim on %s: a peer's claim superseded ours during settle", w.Name)
+					return
+				}
+
 				if err := a.deployWorkload(w); err != nil {
-					log.Printf("Failover deploy failed for %s: %v - reverting ownership", w.Name, err)
+					logInfof("Failover deploy failed for %s: %v - reverting ownership", w.Name, err)
 					// Rollback ownership on failure so another node can try
 					a.stateMu.Lock()
 					if existing := a.state.Workloads[w.IP]; existing != nil && existing.Owner == a.hwid {
@@ -226,9 +251,44 @@ func (a *Agent) checkFailover() {
 				} else {
 					a.broadcastState()
 				}
-			}(wl, oldOwner, oldVersion)
+			})
 		}
 	}
+}
+
+// announceClaim publishes an ownership claim to the cluster immediately,
+// before any deploy work starts, so a competing claimant can see it and back
+// off. Best-effort: if it does not land, the settle re-check simply has less
+// to go on and we fall back to the old last-write-wins behaviour.
+func (a *Agent) announceClaim(wl *Workload) {
+	if a.memberlist != nil {
+		a.broadcastWorkloadUpdate(wl)
+		return
+	}
+	a.broadcastState()
+}
+
+// claimStillHeld reports whether our claim on ip at claimVersion survived.
+//
+// A peer that claimed at a higher version wins under the same last-write-wins
+// rule the merge uses, so seeing a different owner or a newer version means we
+// lost. Deliberately a pure state read: the failover path is otherwise all
+// docker and network side effects, and this is the decision worth testing.
+func (a *Agent) claimStillHeld(ip string, claimVersion int64) bool {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+
+	current := a.state.Workloads[ip]
+	if current == nil {
+		return false // deleted out from under us
+	}
+	if current.Owner != a.hwid {
+		return false // a peer took it
+	}
+	// A newer version under our own name means someone re-published the
+	// workload after our claim; that record, not ours, is what the cluster
+	// converged on.
+	return current.Version <= claimVersion
 }
 
 // anyNodeCanRun returns true if at least one node in the cluster (us or a
@@ -288,7 +348,7 @@ func (a *Agent) warnMarooned(wl *Workload) {
 	if len(archHas) > 0 {
 		reasons = append(reasons, fmt.Sprintf("compose=%v", archHas))
 	}
-	log.Printf("Workload %s (%s) is MAROONED: owner is dead and no other node is compatible (%s)",
+	logInfof("Workload %s (%s) is MAROONED: owner is dead and no other node is compatible (%s)",
 		wl.Name, wl.IP, strings.Join(reasons, ", "))
 }
 
@@ -304,7 +364,7 @@ func (a *Agent) warnPartitioned(wl *Workload) {
 		return
 	}
 	a.maroonedLogged[wl.IP] = time.Now()
-	log.Printf("Failover: refusing to claim %s (owned by %s) - this node has no public-internet connectivity, so we may be the partitioned side. Will retry when connectivity returns.",
+	logInfof("Failover: refusing to claim %s (owned by %s) - this node has no public-internet connectivity, so we may be the partitioned side. Will retry when connectivity returns.",
 		wl.Name, shortID(wl.Owner, 12))
 }
 

@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"runtime"
 	"sync"
@@ -62,10 +61,11 @@ type jettyEventDelegate struct {
 
 // NodeMeta returns metadata about this node (called by memberlist)
 func (d *jettyDelegate) NodeMeta(limit int) []byte {
+	defer recoverPanic("memberlist.NodeMeta")
 	d.metaMu.RLock()
 	defer d.metaMu.RUnlock()
 	if len(d.meta) > limit {
-		log.Printf("Warning: node meta exceeds limit (%d > %d)", len(d.meta), limit)
+		logWarnf("node meta exceeds limit (%d > %d)", len(d.meta), limit)
 		return d.meta[:limit]
 	}
 	return d.meta
@@ -73,13 +73,14 @@ func (d *jettyDelegate) NodeMeta(limit int) []byte {
 
 // NotifyMsg is called when a broadcast message is received
 func (d *jettyDelegate) NotifyMsg(msg []byte) {
+	defer recoverPanic("memberlist.NotifyMsg")
 	if len(msg) == 0 {
 		return
 	}
 
 	var broadcast BroadcastMessage
 	if err := json.Unmarshal(msg, &broadcast); err != nil {
-		log.Printf("Memberlist: failed to unmarshal broadcast: %v", err)
+		logErrorf("Memberlist: failed to unmarshal broadcast: %v", err)
 		return
 	}
 
@@ -88,12 +89,14 @@ func (d *jettyDelegate) NotifyMsg(msg []byte) {
 
 // GetBroadcasts returns any queued broadcasts (called by memberlist during protocol)
 func (d *jettyDelegate) GetBroadcasts(overhead, limit int) [][]byte {
+	defer recoverPanic("memberlist.GetBroadcasts")
 	return d.broadcasts.GetBroadcasts(overhead, limit)
 }
 
 // LocalState is called for full state sync when a new node joins
 // We return serialized state that MergeRemoteState will process
 func (d *jettyDelegate) LocalState(join bool) []byte {
+	defer recoverPanic("memberlist.LocalState")
 	d.agent.stateMu.RLock()
 	defer d.agent.stateMu.RUnlock()
 
@@ -114,10 +117,11 @@ func (d *jettyDelegate) LocalState(join bool) []byte {
 	for _, dek := range d.agent.state.DeletedEnvKeys {
 		syncResp.DeletedEnvKeys = append(syncResp.DeletedEnvKeys, dek)
 	}
+	syncResp.RemovedPeers = d.agent.removedPeersSlice()
 
 	data, err := json.Marshal(syncResp)
 	if err != nil {
-		log.Printf("Memberlist: failed to marshal local state: %v", err)
+		logErrorf("Memberlist: failed to marshal local state: %v", err)
 		return nil
 	}
 	return data
@@ -125,13 +129,14 @@ func (d *jettyDelegate) LocalState(join bool) []byte {
 
 // MergeRemoteState is called to merge state from another node
 func (d *jettyDelegate) MergeRemoteState(buf []byte, join bool) {
+	defer recoverPanic("memberlist.MergeRemoteState")
 	if len(buf) == 0 {
 		return
 	}
 
 	var syncResp SyncResponse
 	if err := json.Unmarshal(buf, &syncResp); err != nil {
-		log.Printf("Memberlist: failed to unmarshal remote state: %v", err)
+		logErrorf("Memberlist: failed to unmarshal remote state: %v", err)
 		return
 	}
 
@@ -141,7 +146,7 @@ func (d *jettyDelegate) MergeRemoteState(buf []byte, join bool) {
 
 	// Stop workloads we lost ownership of
 	for _, wl := range result.LostOwnership {
-		log.Printf("Memberlist sync: stopping local workload %s - ownership transferred", wl.Name)
+		logInfof("Memberlist sync: stopping local workload %s - ownership transferred", wl.Name)
 		d.agent.removeWorkload(wl)
 	}
 
@@ -158,13 +163,14 @@ func (d *jettyDelegate) MergeRemoteState(buf []byte, join bool) {
 
 // NotifyJoin is called when a node joins the cluster
 func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
+	defer recoverPanic("memberlist.NotifyJoin")
 	if node.Name == e.agent.hwid {
 		return // Ignore self
 	}
 
 	meta := parseNodeMeta(node.Meta)
 	if meta == nil {
-		log.Printf("Memberlist: node %s joined but has invalid metadata", node.Name)
+		logInfof("Memberlist: node %s joined but has invalid metadata", node.Name)
 		return
 	}
 	if !validIngestedNodeMeta(meta) {
@@ -175,14 +181,22 @@ func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
 	// this, peer X could broadcast NodeMeta with ID="peer-Y" and we'd
 	// merge their data onto peer Y's record.
 	if meta.ID != node.Name {
-		log.Printf("Memberlist: peer %s broadcast meta.ID=%s; refusing to merge",
+		logInfof("Memberlist: peer %s broadcast meta.ID=%s; refusing to merge",
 			node.Name, meta.ID)
 		return
 	}
 
-	log.Printf("Memberlist: node %s (%s) joined at %s", meta.Name, shortID(meta.ID, 12), meta.IP)
+	logInfof("Memberlist: node %s (%s) joined at %s", meta.Name, shortID(meta.ID, 12), meta.IP)
 
 	e.agent.stateMu.Lock()
+	// A removed node keeps gossiping - it is still up and still on WARP -
+	// so without this check the removal is undone within a round.
+	if e.agent.peerRemovedLocked(meta.ID) {
+		e.agent.stateMu.Unlock()
+		logWarnf("Memberlist: ignoring join from removed node %s (%s); "+
+			"issue a fresh join token to re-admit it", meta.Name, shortID(meta.ID, 12))
+		return
+	}
 	peer := e.agent.state.Peers[meta.ID]
 	if peer == nil {
 		peer = &Peer{
@@ -225,6 +239,7 @@ func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
 // for the periodic failover scan - kick checkFailover immediately so
 // orphaned workloads start moving sub-second after node loss.
 func (e *jettyEventDelegate) NotifyLeave(node *memberlist.Node) {
+	defer recoverPanic("memberlist.NotifyLeave")
 	if node.Name == e.agent.hwid {
 		return // Ignore self
 	}
@@ -237,7 +252,7 @@ func (e *jettyEventDelegate) NotifyLeave(node *memberlist.Node) {
 		nodeName = meta.Name
 	}
 
-	log.Printf("Memberlist: node %s (%s) left", nodeName, shortID(nodeID, 12))
+	logInfof("Memberlist: node %s (%s) left", nodeName, shortID(nodeID, 12))
 
 	e.agent.stateMu.Lock()
 	if peer := e.agent.state.Peers[nodeID]; peer != nil {
@@ -255,6 +270,7 @@ func (e *jettyEventDelegate) NotifyLeave(node *memberlist.Node) {
 
 // NotifyUpdate is called when a node's metadata is updated
 func (e *jettyEventDelegate) NotifyUpdate(node *memberlist.Node) {
+	defer recoverPanic("memberlist.NotifyUpdate")
 	if node.Name == e.agent.hwid {
 		return // Ignore self
 	}
@@ -267,7 +283,7 @@ func (e *jettyEventDelegate) NotifyUpdate(node *memberlist.Node) {
 		return
 	}
 	if meta.ID != node.Name {
-		log.Printf("Memberlist update: peer %s broadcast meta.ID=%s; refusing",
+		logInfof("Memberlist update: peer %s broadcast meta.ID=%s; refusing",
 			node.Name, meta.ID)
 		return
 	}
@@ -287,13 +303,13 @@ func (e *jettyEventDelegate) NotifyUpdate(node *memberlist.Node) {
 		if meta.APIKey != "" && peer.APIKey != meta.APIKey {
 			peer.APIKey = meta.APIKey
 			if oldKey != "" {
-				log.Printf("Memberlist: adopted rotated APIKey for peer %s", shortID(meta.ID, 12))
+				logInfof("Memberlist: adopted rotated APIKey for peer %s", shortID(meta.ID, 12))
 			}
 		}
 
 		// If IP changed, update tunnel
 		if oldIP != meta.IP {
-			log.Printf("Memberlist: node %s IP changed from %s to %s", meta.Name, oldIP, meta.IP)
+			logInfof("Memberlist: node %s IP changed from %s to %s", meta.Name, oldIP, meta.IP)
 			e.agent.updateTunPeerAddr(meta.ID, meta.IP)
 			e.agent.ensurePeerTunnel(meta.ID, meta.IP)
 		}
@@ -328,15 +344,15 @@ func validIngestedNodeMeta(meta *NodeMeta) bool {
 		return false
 	}
 	if !validNamePattern.MatchString(meta.ID) {
-		log.Printf("Memberlist: rejecting node with invalid ID %q", meta.ID)
+		logInfof("Memberlist: rejecting node with invalid ID %q", meta.ID)
 		return false
 	}
 	if !validPeerNamePattern.MatchString(meta.Name) {
-		log.Printf("Memberlist: rejecting node %q with invalid name %q", meta.ID, meta.Name)
+		logInfof("Memberlist: rejecting node %q with invalid name %q", meta.ID, meta.Name)
 		return false
 	}
 	if meta.IP != "" && net.ParseIP(meta.IP) == nil {
-		log.Printf("Memberlist: rejecting node %q with invalid IP %q", meta.ID, meta.IP)
+		logInfof("Memberlist: rejecting node %q with invalid IP %q", meta.ID, meta.IP)
 		return false
 	}
 	// Version/arch flow into peer records the dashboard renders -
@@ -364,7 +380,7 @@ func (d *jettyDelegate) updateNodeMeta(ip string) {
 
 	data, err := json.Marshal(meta)
 	if err != nil {
-		log.Printf("Memberlist: failed to marshal node meta: %v", err)
+		logErrorf("Memberlist: failed to marshal node meta: %v", err)
 		return
 	}
 
@@ -383,7 +399,7 @@ func (a *Agent) handleBroadcast(msg *BroadcastMessage) {
 	case "workload_update":
 		var wl Workload
 		if err := json.Unmarshal(msg.Payload, &wl); err != nil {
-			log.Printf("Memberlist: failed to unmarshal workload update: %v", err)
+			logErrorf("Memberlist: failed to unmarshal workload update: %v", err)
 			return
 		}
 		a.handleWorkloadUpdate(&wl)
@@ -391,7 +407,7 @@ func (a *Agent) handleBroadcast(msg *BroadcastMessage) {
 	case "workload_delete":
 		var dw DeletedWorkload
 		if err := json.Unmarshal(msg.Payload, &dw); err != nil {
-			log.Printf("Memberlist: failed to unmarshal workload delete: %v", err)
+			logErrorf("Memberlist: failed to unmarshal workload delete: %v", err)
 			return
 		}
 		a.handleWorkloadDelete(&dw)
@@ -403,7 +419,7 @@ func (a *Agent) handleBroadcast(msg *BroadcastMessage) {
 			Version int64  `json:"version,omitempty"`
 		}
 		if err := json.Unmarshal(msg.Payload, &update); err != nil {
-			log.Printf("Memberlist: failed to unmarshal env update: %v", err)
+			logErrorf("Memberlist: failed to unmarshal env update: %v", err)
 			return
 		}
 		a.handleEnvUpdate(update.Key, update.Value, update.Version)
@@ -411,7 +427,7 @@ func (a *Agent) handleBroadcast(msg *BroadcastMessage) {
 	case "env_delete":
 		var dek DeletedEnvKey
 		if err := json.Unmarshal(msg.Payload, &dek); err != nil {
-			log.Printf("Memberlist: failed to unmarshal env delete: %v", err)
+			logErrorf("Memberlist: failed to unmarshal env delete: %v", err)
 			return
 		}
 		a.handleEnvDelete(&dek)
@@ -421,7 +437,7 @@ func (a *Agent) handleBroadcast(msg *BroadcastMessage) {
 			Key string `json:"key"`
 		}
 		if err := json.Unmarshal(msg.Payload, &u); err != nil {
-			log.Printf("Memberlist: failed to unmarshal env undelete: %v", err)
+			logErrorf("Memberlist: failed to unmarshal env undelete: %v", err)
 			return
 		}
 		a.handleEnvUndelete(u.Key)
@@ -431,7 +447,7 @@ func (a *Agent) handleBroadcast(msg *BroadcastMessage) {
 			Key string `json:"key"`
 		}
 		if err := json.Unmarshal(msg.Payload, &ak); err != nil {
-			log.Printf("Memberlist: failed to unmarshal admin-key rotation: %v", err)
+			logErrorf("Memberlist: failed to unmarshal admin-key rotation: %v", err)
 			return
 		}
 		a.handleAdminKeyRotate(ak.Key)
@@ -455,7 +471,7 @@ func (a *Agent) handleAdminKeyRotate(newKey string) {
 	a.state.AdminKey = newKey
 	a.stateMu.Unlock()
 	a.saveState()
-	log.Printf("AdminKey rotated via gossip")
+	logInfof("AdminKey rotated via gossip")
 }
 
 // broadcastAdminKey gossips a new AdminKey to all peers. Called from
@@ -467,7 +483,7 @@ func (a *Agent) broadcastAdminKey(newKey string) {
 	}
 	payload, err := json.Marshal(map[string]string{"key": newKey})
 	if err != nil {
-		log.Printf("Warning: failed to marshal admin-key broadcast: %v", err)
+		logWarnf("failed to marshal admin-key broadcast: %v", err)
 		return
 	}
 	msg := BroadcastMessage{
@@ -476,7 +492,7 @@ func (a *Agent) broadcastAdminKey(newKey string) {
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("Warning: failed to marshal admin-key broadcast: %v", err)
+		logWarnf("failed to marshal admin-key broadcast: %v", err)
 		return
 	}
 	a.mlDelegate.broadcasts.QueueBroadcast(&simpleBroadcast{msg: data})
@@ -502,8 +518,8 @@ func (a *Agent) handleWorkloadUpdate(wl *Workload) {
 	existing := a.state.Workloads[wl.IP]
 	if existing == nil || wl.Version > existing.Version {
 		if existing != nil && existing.Owner == a.hwid && wl.Owner != a.hwid {
-			log.Printf("Broadcast: lost ownership of %s to %s", existing.Name, shortID(wl.Owner, 12))
-			go a.removeWorkload(existing)
+			logInfof("Broadcast: lost ownership of %s to %s", existing.Name, shortID(wl.Owner, 12))
+			goSafe("removeWorkload", func() { a.removeWorkload(existing) })
 		}
 		a.state.Workloads[wl.IP] = wl
 		// Same stale-tombstone retirement as mergeWorkloadState: if
@@ -540,9 +556,9 @@ func (a *Agent) handleWorkloadDelete(dw *DeletedWorkload) {
 		changed = true
 	}
 	if existing := a.state.Workloads[dw.IP]; existing != nil && dw.Version > existing.Version {
-		log.Printf("Broadcast: removing workload %s (deleted)", existing.Name)
+		logInfof("Broadcast: removing workload %s (deleted)", existing.Name)
 		if existing.Owner == a.hwid {
-			go a.removeWorkload(existing)
+			goSafe("removeWorkload", func() { a.removeWorkload(existing) })
 		}
 		delete(a.state.Workloads, dw.IP)
 		changed = true
@@ -710,9 +726,9 @@ func (a *Agent) joinMemberlistPeers() {
 
 	n, err := a.memberlist.Join(addrs)
 	if err != nil {
-		log.Printf("Memberlist: join failed: %v", err)
+		logErrorf("Memberlist: join failed: %v", err)
 	} else {
-		log.Printf("Memberlist: joined %d nodes", n)
+		logInfof("Memberlist: joined %d nodes", n)
 	}
 }
 
@@ -724,7 +740,7 @@ func (a *Agent) broadcastWorkloadUpdate(wl *Workload) {
 
 	payload, err := json.Marshal(wl)
 	if err != nil {
-		log.Printf("Warning: failed to marshal workload for broadcast: %v", err)
+		logWarnf("failed to marshal workload for broadcast: %v", err)
 		return
 	}
 	msg := BroadcastMessage{
@@ -733,7 +749,7 @@ func (a *Agent) broadcastWorkloadUpdate(wl *Workload) {
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("Warning: failed to marshal broadcast message: %v", err)
+		logWarnf("failed to marshal broadcast message: %v", err)
 		return
 	}
 
@@ -748,7 +764,7 @@ func (a *Agent) broadcastWorkloadDelete(dw *DeletedWorkload) {
 
 	payload, err := json.Marshal(dw)
 	if err != nil {
-		log.Printf("Warning: failed to marshal deleted workload for broadcast: %v", err)
+		logWarnf("failed to marshal deleted workload for broadcast: %v", err)
 		return
 	}
 	msg := BroadcastMessage{
@@ -757,7 +773,7 @@ func (a *Agent) broadcastWorkloadDelete(dw *DeletedWorkload) {
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("Warning: failed to marshal broadcast message: %v", err)
+		logWarnf("failed to marshal broadcast message: %v", err)
 		return
 	}
 
@@ -779,7 +795,7 @@ func (a *Agent) broadcastEnvUpdate(key, value string, version int64) {
 		Version int64  `json:"version,omitempty"`
 	}{Key: key, Value: value, Version: version})
 	if err != nil {
-		log.Printf("Warning: failed to marshal env update for broadcast: %v", err)
+		logWarnf("failed to marshal env update for broadcast: %v", err)
 		return
 	}
 	msg := BroadcastMessage{
@@ -788,7 +804,7 @@ func (a *Agent) broadcastEnvUpdate(key, value string, version int64) {
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("Warning: failed to marshal broadcast message: %v", err)
+		logWarnf("failed to marshal broadcast message: %v", err)
 		return
 	}
 
@@ -805,7 +821,7 @@ func (a *Agent) broadcastEnvUndelete(key string) {
 	}
 	payload, err := json.Marshal(map[string]string{"key": key})
 	if err != nil {
-		log.Printf("Warning: failed to marshal env undelete: %v", err)
+		logWarnf("failed to marshal env undelete: %v", err)
 		return
 	}
 	msg := BroadcastMessage{
@@ -814,7 +830,7 @@ func (a *Agent) broadcastEnvUndelete(key string) {
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("Warning: failed to marshal env undelete envelope: %v", err)
+		logWarnf("failed to marshal env undelete envelope: %v", err)
 		return
 	}
 	a.mlDelegate.broadcasts.QueueBroadcast(&simpleBroadcast{msg: data})
@@ -828,7 +844,7 @@ func (a *Agent) broadcastEnvDelete(dek *DeletedEnvKey) {
 
 	payload, err := json.Marshal(dek)
 	if err != nil {
-		log.Printf("Warning: failed to marshal deleted env key for broadcast: %v", err)
+		logWarnf("failed to marshal deleted env key for broadcast: %v", err)
 		return
 	}
 	msg := BroadcastMessage{
@@ -837,7 +853,7 @@ func (a *Agent) broadcastEnvDelete(dek *DeletedEnvKey) {
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("Warning: failed to marshal broadcast message: %v", err)
+		logWarnf("failed to marshal broadcast message: %v", err)
 		return
 	}
 
@@ -961,7 +977,7 @@ func (a *Agent) maybeRejoinMemberlist() {
 	}
 	n, err := a.memberlist.Join(addrs)
 	if err == nil && n > 0 {
-		log.Printf("Memberlist: re-joined %d previously-lost peer(s)", n)
+		logInfof("Memberlist: re-joined %d previously-lost peer(s)", n)
 	}
 	// Errors are common during rejoin (peer briefly unreachable) - log noisy
 	// errors only at debug level by skipping them; the next tick retries.
@@ -1018,7 +1034,7 @@ func (a *Agent) memberlistPeriodicSync() {
 
 	// Stop workloads we lost ownership of
 	for _, wl := range result.LostOwnership {
-		log.Printf("Periodic sync: stopping local workload %s - ownership transferred", wl.Name)
+		logInfof("Periodic sync: stopping local workload %s - ownership transferred", wl.Name)
 		a.removeWorkload(wl)
 	}
 
@@ -1028,7 +1044,7 @@ func (a *Agent) memberlistPeriodicSync() {
 
 	// Update routes for remote workloads (uses existing function from agent.go)
 	a.stateMu.Lock()
-	a.updateWorkloadRoutes()
+	a.triggerRouteReconcile()
 	a.stateMu.Unlock()
 	a.updateHosts()
 }
