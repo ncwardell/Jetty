@@ -465,6 +465,19 @@ main finding: JettyOS mostly needs Jetty to be *finished*, not extended.
       arbitrary node — so `rotate-key`, `leave` and `move`, all of which mutate
       peer-specific state, could land on the wrong node. Validated harder than
       `Version`/`Arch` because it becomes the authority of an authenticated URL.
+
+      **Dormant until an operator sets it.** Jetty provisions no DNS — there is
+      no Cloudflare API call in the agent — so a per-node hostname means
+      manually creating a CNAME per node pointing at that node's
+      `<uuid>.cfargotunnel.com`. And unlike `TunnelDomain`, there is no
+      join-time adoption of `TunnelHost`, so it is empty on every node until
+      set per node. The code path is correct; it does not fire yet.
+- [ ] **Adopt or provision per-node tunnel hostnames.** Follows directly from
+      the above: a config value that must be set by hand on every node, with no
+      error when unset, is a feature that will silently not exist. Either
+      provision the DNS record via the Cloudflare API at bootstrap/join, or at
+      minimum surface "no per-node hostname configured" somewhere an operator
+      will see it.
 - [ ] **WebSocket upgrade in `/api/proxy/`.** Currently `httpClient.Do()` with
       no hijack and no `websocket.Dialer`, so browser upgrade requests fail.
       The single concrete blocker for browser↔container streams.
@@ -522,10 +535,17 @@ delegation-over-agreement principle at the top of this file.
 2. **Control plane and data plane are separate. Only the control plane is
    hub-and-spoke, and even that hub is incidental.**
 
-   *Control:* the worker holds one WebSocket to one node — dialled outbound to
-   that node's *own* `JETTY_TUNNEL_HOST`, which resolves to exactly one node,
-   unlike the cluster-wide domain that Cloudflare points wherever it likes.
+   *Control:* the worker holds one WebSocket to one node, dialled outbound.
    Placements down, status up. That node is its sponsor.
+
+   It can attach via the **cluster-wide** domain and simply take whichever node
+   answers — ambiguous routing is a feature here, because sponsorship is
+   incidental. That matters practically: per-node hostnames are not something
+   Jetty provisions. There is no Cloudflare API call anywhere in the agent;
+   both `JETTY_TUNNEL_DOMAIN` and `JETTY_TUNNEL_HOST` are operator-supplied
+   env vars, and pointing a hostname at one specific node means manually
+   creating a CNAME per node to that node's `<uuid>.cfargotunnel.com`. Making
+   attach depend on that would put a manual DNS step in front of "rent a box".
 
    *Data:* the worker opens **direct** tunnels to whichever nodes it actually
    needs to exchange traffic with, dialled outbound, on demand. Workload
@@ -665,14 +685,35 @@ transcode, scrapes. The UI should say so at placement time, not bury it in docs.
       here, while the tunnel is new — retrofitting enforcement onto an
       already-trusted path is how it ends up never happening.
 
-      On connection count: a worker holds one control socket plus one data
-      tunnel per node it actually exchanges traffic with — so 1+0 for a batch
-      job that talks to nothing, converging on 1+N for a workload wired into
-      the cluster. That is *less* than a peer already costs: `applyRoutes`
-      refreshes a tunnel to every known peer, healthy or not, which is the
-      eager O(n²) mesh listed under scaling limits. Each node holds only one
-      tunnel per worker; the worker bears the whole fan-out, which is the right
-      place for it. Worth backporting lazy dialling to peers eventually.
+      **Connection count — a worker costs more than a peer, not less.** An
+      earlier draft claimed the opposite by miscounting what a peer's tunnels
+      are. `ensurePeerTunnel` runs `ip tunnel add ... mode ipip`: a *stateless
+      encapsulation interface*, no socket, no handshake, no keepalive. So a
+      peer holds exactly **one** real connection — WARP WireGuard to the
+      Cloudflare edge — plus N cheap encaps, and node-to-node packets go
+      node → edge → node. The edge is the rendezvous, which is what makes that
+      one connection independent of cluster size.
+
+      A worker has no edge to rendezvous through, so every path is its own real
+      socket: 1 control + N data. That is the price of being off-mesh, and it
+      is the *same* property that makes filtering possible — we terminate the
+      tunnel, so we can inspect it.
+
+      Which makes the connector-token question a genuine trade, not a settled
+      one. On WARP: one connection, but the worker can address the whole mesh
+      and enforcement is Cloudflare's, at Cloudflare's granularity. Off WARP: N
+      connections, but per-placement filtering is ours to enforce. For a small
+      cluster N is trivial and off-WARP wins. At many workers × many nodes,
+      N×W real sockets is a real cost and this should be revisited rather than
+      assumed.
+
+      **NAT is the open problem here, and it is not hypothetical.** The worker
+      dials node B directly, which requires B to be reachable. The Radxa is
+      behind home NAT with no public address and cannot be dialled at all. So:
+      direct where the node is reachable, relay via a reachable node where it
+      is not. Much narrower than relaying everything through the sponsor, but
+      not nothing — and it means the reachability list the sponsor supplies has
+      to say *how* to reach each node, not merely which ones exist.
 - [ ] **F. Placement gating and worker-loss policy.** Two directions, and the
       inbound one is a trap verified in the current code, not a hypothetical.
 
