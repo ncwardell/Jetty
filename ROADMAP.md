@@ -510,7 +510,7 @@ Naming: **worker**, not "unprivileged". The distinction is role, not permission
 level — a worker is a node that executes but does not decide, which is the same
 delegation-over-agreement principle at the top of this file.
 
-**The five decisions that shape everything else:**
+**The six decisions that shape everything else:**
 
 1. **A worker is not a gossip peer.** It does not run memberlist. Filtering an
    untrusted peer's merges is the hard, easy-to-get-wrong version of this
@@ -575,7 +575,41 @@ delegation-over-agreement principle at the top of this file.
    later cannot leak, because `State` is never sent. That is a much stronger
    property than an allowlist somebody has to remember to maintain.
 
-5. **Worker state is memory-only.** Cluster state never gets written to a rented
+5. **Workers live in `state.Workers`, a separate gossiped map — not in
+   `state.Peers` with a role flag.** Same argument as the ephemeral-workload
+   map above: `state.Peers` is iterated unconditionally by failover, route
+   reconciliation, `/etc/hosts`, health checks, tunnel-mesh building, the
+   dashboard and memberlist sync. A flag means auditing every one of those and
+   guarding it, and makes every *future* iteration site a latent bug where an
+   untrusted rented box is silently treated as a full peer. A separate map is
+   opt-in by construction. The lifecycles differ anyway: shorter tombstone TTL,
+   different health semantics, no `APIKey`.
+
+   The worker's *workloads* need nothing new — they are ordinary
+   `state.Workloads` entries with `Owner` set to the worker ID, and they gossip
+   as they always have.
+
+   **What the worker record is for is setup, not routing.** Routing does not
+   need it: each node has its own direct tunnel and sends the worker's workload
+   IPs down that. But because the worker only ever dials *out*, a node with no
+   tunnel yet cannot initiate one — it has to ask whoever holds the control
+   socket to push a "dial me" down it. So the record carries `SponsorID`: not a
+   path, but who to ask. The sponsor is a bottleneck for connection setup only,
+   which is rare, small, and off the data path.
+
+   **The worker is authoritative about its own attachment.** It picks a
+   sponsor and the receiving node publishes the fact; the cluster never assigns
+   one, because only the worker knows whether a socket is actually up. During a
+   partition two nodes can both truthfully believe they sponsor the same
+   worker — that is an *observation*, not a decision, so do not make the nodes
+   agree. The worker increments an **attach epoch** on each attach, the record
+   carries it, highest epoch wins.
+
+   Falls out of this: **re-attachment never disturbs traffic.** Existing direct
+   tunnels stay up while the control socket moves, so the control plane can
+   flap without touching the data plane.
+
+6. **Worker state is memory-only.** Cluster state never gets written to a rented
    disk, so there is nothing to wipe and nothing left behind if the box is
    imaged after you release it.
 
