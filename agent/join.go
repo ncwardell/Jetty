@@ -82,7 +82,7 @@ func (a *Agent) joinCluster() error {
 		"join_token": a.joinToken,
 		"id":         a.hwid,
 		"name":       a.hostname,
-		"ip":         a.ip,
+		"ip":         a.warpIP(),
 		"version":    Version,
 		"arch":       runtime.GOARCH,
 		"api_key":    selfKey,
@@ -181,7 +181,7 @@ func (a *Agent) joinCluster() error {
 	// Configure WARP at runtime if we have a token and WARP isn't
 	// connected yet. ownWarpToken prefers this node's per-node token
 	// over the cluster-shared one from the join response.
-	if ownWarpToken != "" && a.ip == "" {
+	if ownWarpToken != "" && a.warpIP() == "" {
 		if err := a.configureWarpRuntime(ownWarpToken); err != nil {
 			logWarnf("failed to configure WARP at runtime: %v", err)
 		}
@@ -255,7 +255,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	// Check for mesh IP collision before creating peer
 	a.stateMu.RLock()
 	// Check against our own IP
-	if req.IP == a.ip {
+	if req.IP == a.warpIP() {
 		a.stateMu.RUnlock()
 		writeError(w, http.StatusConflict, "mesh_ip collision with existing node")
 		return
@@ -314,7 +314,7 @@ func (a *Agent) apiJoin(w http.ResponseWriter, r *http.Request) {
 	allPeers := []peerWire{{
 		ID:      a.hwid,
 		Name:    a.hostname,
-		IP:      a.ip,
+		IP:      a.warpIP(),
 		Healthy: true,
 		Version: Version,
 		Arch:    runtime.GOARCH,

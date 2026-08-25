@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -64,10 +65,18 @@ func (a *Agent) reconcileWorkloads() {
 		if len(strings.TrimSpace(string(out))) > 0 {
 			continue // at least one container running - liveness handled by heal pass below
 		}
-		logInfof("Reconcile: %s has no running containers, retrying deploy", wl.Name)
 		if err := a.deployWorkload(wl); err != nil {
+			if errors.Is(err, errDeployInProgress) {
+				// Someone else is already deploying it - a move, a failover
+				// claim, or an operator. Not a problem, and not worth a line
+				// on every tick.
+				logDebugf("Reconcile: %s is already being deployed, leaving it alone", wl.Name)
+				continue
+			}
 			logErrorf("Reconcile: deploy of %s failed: %v", wl.Name, err)
+			continue
 		}
+		logInfof("Reconcile: %s had no running containers, redeployed", wl.Name)
 	}
 
 	// Built-in container autoheal: restart running-but-unhealthy containers.
@@ -208,7 +217,28 @@ func (wl *Workload) canRunOnArch(arch string) bool {
 	return false
 }
 
+// errDeployInProgress reports that a deploy of this workload is already
+// running. Callers that can simply try again later (the reconcile loop)
+// should treat it as success rather than as a failure to log.
+var errDeployInProgress = errors.New("a deploy of this workload is already in progress")
+
 func (a *Agent) deployWorkload(wl *Workload) error {
+	// Guard against concurrent deploys of the same workload.
+	//
+	// Observed in production during a move: the reconcile loop ran while the
+	// move's deploy was still creating containers, saw `docker ps -q` return
+	// nothing (created, not yet running), concluded the workload was down and
+	// launched a second `compose up` on top of the first. Docker then failed
+	// both with `Container "jetty_vaultwarden-init-1" is already in use`.
+	//
+	// The guard lives here rather than in the reconcile loop so every path -
+	// move, failover, create, reconcile, autostart - is covered by one rule.
+	// failoverInProgress already does exactly this for claims.
+	if _, busy := a.deployInProgress.LoadOrStore(wl.Name, time.Now()); busy {
+		return errDeployInProgress
+	}
+	defer a.deployInProgress.Delete(wl.Name)
+
 	dir := filepath.Join(a.composeDir, wl.Name)
 	os.MkdirAll(dir, 0755)
 

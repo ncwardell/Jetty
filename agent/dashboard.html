@@ -2296,6 +2296,17 @@
                     </select>
                 </div>
                 <div class="form-group">
+                    <label class="form-label">Join URL</label>
+                    <input type="text" class="form-input" id="createTokenJoinURL" placeholder="https://cluster.example.com" oninput="syncJoinURLWarning()">
+                    <p style="color: var(--text-secondary); font-size: 12px; margin-top: 4px;">
+                        The address the <em>new</em> node will reach this cluster on. Prefilled with the cluster tunnel domain when one is configured, otherwise with the address this dashboard is open on &mdash; which is only correct if the new node can reach that same address. Sets <code>JETTY_JOIN</code>.
+                    </p>
+                    <p id="createTokenJoinURLWarning" class="hidden" style="color: var(--accent-amber, #d97706); font-size: 12px; margin-top: 6px;">
+                        <strong>This looks like a private address.</strong>
+                        A node outside this network cannot reach it, and the join will fail with a connection error rather than anything more helpful.
+                    </p>
+                </div>
+                <div class="form-group">
                     <label class="form-label">Per-node Cloudflare Mesh token</label>
                     <input type="text" class="form-input" id="createTokenWarpToken" placeholder="paste the token for THIS machine's mesh node">
                     <p style="color: var(--text-secondary); font-size: 12px; margin-top: 4px;">
@@ -3095,7 +3106,12 @@
             if (state.tunnel?.running) {
                 tunnelStatusDot.classList.add('active');
                 tunnelStatusDot.classList.remove('inactive');
-                tunnelDomain.textContent = state.node?.tunnelHost || state.node?.tunnel_host || 'Running';
+                // Per-node host first (JETTY_TUNNEL_HOST, often unset), then the
+                // cluster-wide domain. "Running" is the last resort - it was
+                // the usual case before the domain was exposed, which made this
+                // panel say nothing useful on every cluster that had one.
+                tunnelDomain.textContent = state.node?.tunnelHost || state.node?.tunnel_host
+                    || (state.tunnel && state.tunnel.domain) || 'Running';
             } else if (state.tunnel?.configured) {
                 tunnelStatusDot.classList.remove('active');
                 tunnelStatusDot.classList.add('warning');
@@ -5711,11 +5727,56 @@
             return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
         }
 
+        // Best guess at the address a *joining* node should use.
+        //
+        // The cluster tunnel domain is the right answer whenever there is one:
+        // it is reachable from anywhere, which is the entire requirement. The
+        // dashboard's own URL is only a fallback, and a poor one - open the
+        // dashboard on a LAN address and it yields a join command that works
+        // from precisely one network. That was the default before this field
+        // existed, which is why the URL had to be hand-edited every time.
+        function defaultJoinURL() {
+            const domain = state.tunnel && state.tunnel.domain;
+            if (domain) {
+                return /^https?:\/\//i.test(domain) ? domain : `https://${domain}`;
+            }
+            if (state.connection && state.connection.url) {
+                return state.connection.url;
+            }
+            return '';
+        }
+
+        // Private/loopback addresses are the failure this field exists to
+        // prevent: the join fails at connect time on the far machine, where
+        // the error is a bare connection refused with nothing pointing back
+        // at the URL being wrong. Warn, don't block - a LAN join is a
+        // legitimate thing to want.
+        function joinURLLooksPrivate(url) {
+            const host = (url || '').replace(/^[a-z]+:\/\//i, '').split(/[/:?#]/)[0];
+            if (!host) return false;
+            if (host === 'localhost' || host.endsWith('.local')) return true;
+            const octets = host.split('.');
+            if (octets.length !== 4 || octets.some(o => !/^\d+$/.test(o))) return false;
+            const [a, b] = octets.map(Number);
+            return a === 10 || a === 127 ||
+                (a === 192 && b === 168) ||
+                (a === 172 && b >= 16 && b <= 31) ||
+                (a === 169 && b === 254);
+        }
+
+        function syncJoinURLWarning() {
+            const url = document.getElementById('createTokenJoinURL').value.trim();
+            document.getElementById('createTokenJoinURLWarning')
+                .classList.toggle('hidden', !joinURLLooksPrivate(url));
+        }
+
         function openCreateTokenModal() {
             document.getElementById('createTokenNote').value = '';
             document.getElementById('createTokenTTL').value = '3600';
             document.getElementById('createTokenHostShell').checked = false;
             document.getElementById('createTokenImageTag').value = 'ghcr.io/ncwardell/jetty:latest';
+            document.getElementById('createTokenJoinURL').value = defaultJoinURL();
+            syncJoinURLWarning();
             document.getElementById('createTokenModal').classList.remove('hidden');
         }
 
@@ -5776,13 +5837,20 @@
             const hostShell = document.getElementById('createTokenHostShell').checked;
             const imageTag = document.getElementById('createTokenImageTag').value.trim() || 'ghcr.io/ncwardell/jetty:latest';
             const warpToken = document.getElementById('createTokenWarpToken').value.trim();
+            const joinURL = document.getElementById('createTokenJoinURL').value.trim();
+            // Generating a token is not free - it is stored, it is listed, and
+            // it counts against the operator's mental model of what is
+            // outstanding. Fail before creating one rather than after.
+            if (!joinURL) {
+                showToast('Join URL is required - the new node needs an address to reach this cluster on', 'error');
+                return;
+            }
             try {
                 const result = await apiCall('/tokens', 'POST', { ttl_seconds: ttl, note });
                 closeCreateTokenModal();
                 lastGeneratedToken = result.token;
                 document.getElementById('tokenResultValue').textContent = result.token;
                 document.getElementById('tokenResultExpires').textContent = formatRelative(result.expires_at);
-                const joinURL = state.connection && state.connection.url ? state.connection.url : 'https://your-cluster';
                 lastGeneratedDockerRun = buildJoinDockerRun({
                     joinURL, token: result.token, hostShell, imageTag, warpToken,
                 });

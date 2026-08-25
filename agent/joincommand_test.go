@@ -89,3 +89,37 @@ func firstToken(s string) string {
 	}
 	return s
 }
+
+// TestWarpTokenDoesNotSuppressTheJoin covers a collision between two correct
+// fixes. The generated join command must carry a per-node Cloudflare Mesh
+// token, or the new node registers as a passive replica and drops all traffic.
+// But JETTY_WARP_CONNECTOR_TOKEN populated state.WarpToken, and WarpToken was
+// treated as evidence of existing cluster state - so supplying it suppressed
+// the join entirely. The node bootstrapped itself as a new single-node
+// cluster, came up unauthenticated, and logged no error, because from its own
+// point of view nothing had failed.
+//
+// A connector token is node identity, not cluster membership.
+func TestWarpTokenDoesNotSuppressTheJoin(t *testing.T) {
+	src := readAgentSource(t, "agent.go")
+
+	idx := strings.Index(src, "hasClusterState :=")
+	if idx == -1 {
+		t.Fatal("hasClusterState not found in agent.go")
+	}
+	end := strings.Index(src[idx:], "\n")
+	line := src[idx : idx+end]
+
+	if strings.Contains(line, "WarpToken") {
+		t.Errorf("hasClusterState treats a WARP connector token as cluster "+
+			"membership, which silently suppresses joining:\n  %s", line)
+	}
+	// The evidence that a join actually completed.
+	for _, want := range []string{"Peers", "AdminKey"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("hasClusterState should consider %s - it is what stops a "+
+				"restart from trying to redeem an already-burned join token:\n  %s",
+				want, line)
+		}
+	}
+}

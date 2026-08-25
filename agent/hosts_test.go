@@ -19,7 +19,7 @@ func hostsTestAgent(t *testing.T) *Agent {
 	a := newTestAgentWithDir(t)
 	a.hwid = "us"
 	a.hostname = "node-a"
-	a.ip = "100.96.0.1"
+	a.setWarpIP("100.96.0.1")
 	a.hostsFile = filepath.Join(t.TempDir(), "hosts")
 	a.workloadRoutes = make(map[string]string)
 	os.WriteFile(a.hostsFile, []byte("127.0.0.1\tlocalhost\n"), 0644)

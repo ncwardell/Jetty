@@ -74,7 +74,7 @@ import (
 // until the agent is bounced.
 func (a *Agent) initNetwork() error {
 	// Verify we have a WARP IP (should be detected in Start())
-	if a.ip == "" {
+	if a.warpIP() == "" {
 		return fmt.Errorf("WARP IP not detected - ensure WARP is connected")
 	}
 
@@ -152,7 +152,7 @@ func (a *Agent) initNetwork() error {
 	// no-op when rules already exist.
 	goSupervised("iptablesMaintenanceLoop", a.iptablesMaintenanceLoop)
 
-	logInfof("Network ready: %s (WARP), workload interface: jetty0", a.ip)
+	logInfof("Network ready: %s (WARP), workload interface: jetty0", a.warpIP())
 	return nil
 }
 
@@ -326,7 +326,7 @@ func (a *Agent) cleanupWarpRules() {
 // tunnel mode). Returns the underlying `ip tunnel` error if creation
 // fails - callers log and continue.
 func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
-	if a.ip == "" || peerIP == "" {
+	if a.warpIP() == "" || peerIP == "" {
 		return nil // Can't create tunnel without IPs
 	}
 
@@ -349,7 +349,7 @@ func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
 
 	// Create tunnel using detected mode (ipip or gre): local=our WARP IP, remote=peer's WARP IP
 	if out, err := runBoundedOutput(routeCommandTimeout, "ip", "tunnel", "add", tunName,
-		"mode", a.tunnelMode, "local", a.ip, "remote", peerIP); err != nil {
+		"mode", a.tunnelMode, "local", a.warpIP(), "remote", peerIP); err != nil {
 		return fmt.Errorf("create %s tunnel to %s: %s", a.tunnelMode, peerIP, strings.TrimSpace(string(out)))
 	}
 
@@ -430,7 +430,7 @@ func (a *Agent) isIPInCIDR(ipStr string) bool {
 // Caller must hold stateMu lock (read or write).
 func (a *Agent) isIPTaken(ipStr string) bool {
 	// Check if it's our own mesh IP
-	if ipStr == a.ip {
+	if ipStr == a.warpIP() {
 		return true
 	}
 

@@ -123,7 +123,7 @@ func (a *Agent) tunReadLoop() {
 			continue
 		}
 
-		logInfof("WS tunnel send: %s -> %s via %s (%d bytes)", srcIP, dstIP, peerIP, n)
+		logDebugf("WS tunnel send: %s -> %s via %s (%d bytes)", srcIP, dstIP, peerIP, n)
 
 		// Send packet as binary WebSocket message
 		if err := conn.WriteMessage(websocket.BinaryMessage, packet); err != nil {
@@ -211,7 +211,7 @@ func (a *Agent) tunWsRecvLoop(peerID string, conn *websocket.Conn) {
 		dstIP := net.IP(packet[16:20])
 		srcIP := net.IP(packet[12:16])
 
-		logInfof("WS tunnel recv: from %s, packet %s -> %s (%d bytes)", shortID(peerID, 8), srcIP, dstIP, len(packet))
+		logDebugf("WS tunnel recv: from %s, packet %s -> %s (%d bytes)", shortID(peerID, 8), srcIP, dstIP, len(packet))
 
 		// Inject packet into TUN device for local delivery
 		if a.tunDevice != nil {
@@ -501,7 +501,7 @@ func (a *Agent) proxyICMP(tc *tunnelConn, origPacket []byte, origSrc, dstIP net.
 		return
 	}
 
-	logInfof("WS tunnel proxy: got ICMP reply from %s (id=%d seq=%d)", dstIP, icmpID, icmpSeq)
+	logDebugf("WS tunnel proxy: got ICMP reply from %s (id=%d seq=%d)", dstIP, icmpID, icmpSeq)
 
 	// Build response packet with original src/dst swapped
 	respPacket := buildIPPacket(dstIP, origSrc, 1, replyICMP)
@@ -537,7 +537,7 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 
 	// Handle SYN - new connection
 	if isSYN && !isACK {
-		logInfof("WS tunnel proxy TCP SYN: %s", flowKey)
+		logDebugf("WS tunnel proxy TCP SYN: %s", flowKey)
 
 		// Create pending proxy connection BEFORE establishing backend connection
 		// This prevents race conditions with ACK packets arriving early
@@ -578,7 +578,7 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 					dialPort = containerPort
 				}
 				targetAddr = net.JoinHostPort(containerIP, strconv.Itoa(int(dialPort)))
-				logInfof("WS tunnel proxy: translated %s:%d -> %s:%d", dstIP, dstPort, containerIP, dialPort)
+				logDebugf("WS tunnel proxy: translated %s:%d -> %s:%d", dstIP, dstPort, containerIP, dialPort)
 			}
 		}
 
@@ -665,7 +665,7 @@ func (a *Agent) proxyTCP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 
 	// Handle FIN
 	if isFIN {
-		logInfof("WS tunnel proxy TCP FIN: %s", flowKey)
+		logDebugf("WS tunnel proxy TCP FIN: %s", flowKey)
 		proxyConn.mu.Lock()
 		proxyConn.remoteSeq = seqNum + 1
 		proxyConn.mu.Unlock()
@@ -1006,7 +1006,7 @@ func (a *Agent) proxyUDP(tc *tunnelConn, packet []byte, srcIP, dstIP net.IP, ihl
 
 	payload := udpHeader[8:udpLen]
 
-	logInfof("WS tunnel proxy UDP: %s:%d -> %s:%d (%d bytes)", srcIP, srcPort, dstIP, dstPort, len(payload))
+	logDebugf("WS tunnel proxy UDP: %s:%d -> %s:%d (%d bytes)", srcIP, srcPort, dstIP, dstPort, len(payload))
 
 	// Send UDP and get response
 	addr := net.JoinHostPort(dstIP.String(), strconv.Itoa(int(dstPort)))

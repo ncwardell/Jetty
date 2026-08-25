@@ -55,7 +55,7 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 	peerIDToInfo[a.hwid] = map[string]string{
 		"id":   a.hwid,
 		"name": a.hostname,
-		"ip":   a.ip,
+		"ip":   a.warpIP(),
 	}
 
 	// Build enriched workloads with owner info and status
@@ -184,7 +184,7 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 		"node": map[string]interface{}{
 			"id":        a.hwid,
 			"name":      a.hostname,
-			"ip":        a.ip,
+			"ip":        a.warpIP(),
 			"arch":      runtime.GOARCH,
 			"version":   Version,
 			"healthy":   true, // Self is always healthy if we're responding
@@ -197,14 +197,21 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 		"tunnel": map[string]interface{}{
 			"configured": hasTunnel,
 			"running":    a.isTunnelRunning(),
+			// The cluster-wide hostname, exposed so the dashboard can
+			// prefill the join URL in a generated docker run. Without it
+			// the UI can only offer whatever address the browser happens
+			// to be using - a LAN IP when you are on the LAN, which
+			// produces a join command that cannot work from anywhere else.
+			// Not a secret: it is the public name of the cluster.
+			"domain": a.tunnelDomain,
 		},
-		// a.ip is non-empty whenever the CloudflareWARP interface has
+		// a.warpIP() is non-empty whenever the CloudflareWARP interface has
 		// an IPv4 lease (see detectWarpIP). That's the only state that
 		// matters for the dashboard's "WARP Mesh" indicator - if we
 		// have a WARP IP, the mesh is up.
 		"warp": map[string]interface{}{
-			"enabled": a.ip != "",
-			"ip":      a.ip,
+			"enabled": a.warpIP() != "",
+			"ip":      a.warpIP(),
 		},
 	}
 

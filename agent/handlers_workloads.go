@@ -64,7 +64,7 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 	peerIDToInfo[a.hwid] = map[string]string{
 		"id":   a.hwid,
 		"name": a.hostname,
-		"ip":   a.ip,
+		"ip":   a.warpIP(),
 	}
 
 	type WorkloadResponse struct {
@@ -409,7 +409,7 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		"owner": map[string]string{
 			"id":   a.hwid,
 			"name": a.hostname,
-			"ip":   a.ip,
+			"ip":   a.warpIP(),
 		},
 		"version": wl.Version,
 	}
@@ -524,7 +524,7 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build enriched response with Docker info for local workload
-	ownerInfo := buildOwnerInfo(a.hwid, a.hostname, a.ip)
+	ownerInfo := buildOwnerInfo(a.hwid, a.hostname, a.warpIP())
 	response := map[string]interface{}{
 		"name":          found.Name,
 		"ip":            found.IP,
@@ -785,7 +785,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		"owner": map[string]string{
 			"id":   a.hwid,
 			"name": a.hostname,
-			"ip":   a.ip,
+			"ip":   a.warpIP(),
 		},
 		"version":    found.Version,
 		"redeployed": needsRedeploy,
@@ -1171,7 +1171,7 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 		target = &Peer{
 			ID:      a.hwid,
 			Name:    a.hostname,
-			IP:      a.ip,
+			IP:      a.warpIP(),
 			Healthy: true,
 			Arch:    runtime.GOARCH,
 		}
@@ -1261,37 +1261,67 @@ func (a *Agent) apiMoveWorkload(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		// Moving to remote peer - deploy via API
+		// Moving to remote peer - deploy via API.
+		//
+		// moveClient, not httpClient. A move relocates a workload, and a
+		// stateful one restores its data on arrival - a vaultwarden move
+		// observed in production spent 17 minutes pulling ~5.5MB over CIFS
+		// from cluster-storage across a 120ms link. Against httpClient's 30s
+		// that move was guaranteed to report failure while succeeding: the
+		// caller got "context deadline exceeded", the deploy carried on, and
+		// the workload came up fine on the target.
 		data, _ := json.Marshal(found)
 		url := a.getPeerAPIURL(target, "/api/workloads?move=true")
 		deployReq, _ := a.peerRequest("POST", url, strings.NewReader(string(data)))
-		resp, err := httpClient.Do(deployReq)
+		resp, err := moveClient.Do(deployReq)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to deploy on target: %v", err))
-			return
+			// A timeout tells us the request did not come back - NOT that the
+			// deploy failed. Removing the source now would be wrong, and so
+			// would reporting failure: the target may be mid-restore. Ask it.
+			if running, checkErr := a.workloadRunningOn(target, name); running {
+				logWarnf("move: deploy call to %s did not return (%v), but the workload is "+
+					"running there - completing the move", target.Name, err)
+			} else {
+				writeError(w, http.StatusBadGateway, fmt.Sprintf(
+					"failed to deploy on target: %v (checked afterwards: workload is not running on %s: %v; "+
+						"the source has been left untouched)", err, target.Name, checkErr))
+				return
+			}
+		} else {
+			defer resp.Body.Close()
 		}
-		defer resp.Body.Close()
 
-		if resp.StatusCode != 200 {
-			body, _ := io.ReadAll(resp.Body)
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("target rejected deployment (status %d): %s", resp.StatusCode, body))
-			return
-		}
+		// resp is nil when the call timed out but the workload was confirmed
+		// running on the target above; there is simply no body to read.
+		if resp != nil {
+			if resp.StatusCode != 200 {
+				body, _ := io.ReadAll(resp.Body)
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("target rejected deployment (status %d): %s", resp.StatusCode, body))
+				return
+			}
 
-		// Parse response to get updated workload info (new owner, version)
-		var deployResult struct {
-			Name    string `json:"name"`
-			IP      string `json:"ip"`
-			Version int64  `json:"version"`
-			Owner   struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
-			} `json:"owner"`
+			// Parse response to get updated workload info (new owner, version)
+			var deployResult struct {
+				Name    string `json:"name"`
+				IP      string `json:"ip"`
+				Version int64  `json:"version"`
+				Owner   struct {
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"owner"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&deployResult); err != nil {
+				logWarnf("could not parse deploy response: %v", err)
+			}
+			newVersion = deployResult.Version
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&deployResult); err != nil {
-			logWarnf("could not parse deploy response: %v", err)
+		if newVersion == 0 {
+			// No usable version from the target (no response, or an
+			// unparseable one). Stamp our own so the ownership change still
+			// wins the highest-version-wins merge - without this the move
+			// would be undone on the next sync round.
+			newVersion = time.Now().UnixNano()
 		}
-		newVersion = deployResult.Version
 
 		// Target is now running - remove from source
 		// If we own it, remove locally (but don't delete from state yet - we'll update it)
@@ -1764,4 +1794,45 @@ func (a *Agent) apiWorkloadProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Copy response body
 	io.Copy(w, resp.Body)
+}
+
+// workloadRunningOn asks a peer whether it is actually running a workload.
+//
+// Used after a move's deploy call fails to return. A timeout means the request
+// did not come back - it does not mean the deploy failed, and the difference
+// matters: reporting failure while the target is happily serving is how an
+// operator ends up with two nodes they believe own the same thing. Ask the
+// target rather than inferring from our own timeout.
+func (a *Agent) workloadRunningOn(peer *Peer, name string) (bool, error) {
+	url := a.getPeerAPIURL(peer, "/api/workloads/"+name)
+	if url == "" {
+		return false, fmt.Errorf("no route to %s", peer.Name)
+	}
+	req, err := a.peerRequest("GET", url, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("peer returned HTTP %d", resp.StatusCode)
+	}
+
+	var body struct {
+		Containers []struct {
+			Running bool `json:"running"`
+		} `json:"containers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return false, err
+	}
+	for _, c := range body.Containers {
+		if c.Running {
+			return true, nil
+		}
+	}
+	return false, fmt.Errorf("no running containers reported")
 }

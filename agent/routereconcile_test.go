@@ -77,7 +77,7 @@ func TestTriggerRouteReconcileIsSafeBeforeStart(t *testing.T) {
 
 func TestSnapshotRoutesReleasesTheStateLock(t *testing.T) {
 	a := newTestAgentWithDir(t)
-	a.ip = "100.96.0.1"
+	a.setWarpIP("100.96.0.1")
 	a.hwid = "us"
 
 	if _, ok := a.snapshotRoutes(); !ok {
@@ -100,7 +100,7 @@ func TestSnapshotRoutesReleasesTheStateLock(t *testing.T) {
 
 func TestSnapshotRoutesSkipsWhenWarpIsDown(t *testing.T) {
 	a := newTestAgentWithDir(t)
-	a.ip = ""
+	a.setWarpIP("")
 	if _, ok := a.snapshotRoutes(); ok {
 		t.Error("snapshot succeeded with no WARP IP; there is nothing to route through")
 	}
@@ -256,7 +256,7 @@ func TestSnapshotRoutesSkipsLocalWorkloads(t *testing.T) {
 	// one would be wrong, not merely redundant.
 	a := newTestAgentWithDir(t)
 	a.hwid = "us"
-	a.ip = "100.96.0.1"
+	a.setWarpIP("100.96.0.1")
 
 	a.stateMu.Lock()
 	a.state.Peers["peer"] = &Peer{ID: "peer", Name: "peer", IP: "100.96.0.2", Healthy: true}
@@ -279,7 +279,7 @@ func TestSnapshotRoutesSkipsLocalWorkloads(t *testing.T) {
 func TestSnapshotRoutesSkipsUnhealthyPeers(t *testing.T) {
 	a := newTestAgentWithDir(t)
 	a.hwid = "us"
-	a.ip = "100.96.0.1"
+	a.setWarpIP("100.96.0.1")
 
 	a.stateMu.Lock()
 	a.state.Peers["dead"] = &Peer{ID: "dead", Name: "dead", IP: "100.96.0.3", Healthy: false}
@@ -297,7 +297,7 @@ func TestConcurrentTriggersAndSnapshotsDoNotRace(t *testing.T) {
 	// while the reconciler snapshots.
 	a := newTestAgentWithDir(t)
 	a.hwid = "us"
-	a.ip = "100.96.0.1"
+	a.setWarpIP("100.96.0.1")
 	a.routeReconcileCh = make(chan struct{}, 1)
 
 	var wg sync.WaitGroup

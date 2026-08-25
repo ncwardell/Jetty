@@ -266,7 +266,7 @@ func (p *netstackProxy) handleTCP(r *tcp.ForwarderRequest) {
 	r.Complete(false)
 
 	client := gonet.NewTCPConn(&wq, gep)
-	logInfof("netstack: TCP %s:%d -> %s", dstIP, dstPort, target)
+	logDebugf("netstack: TCP %s:%d -> %s", dstIP, dstPort, target)
 	spliceTCP(client, upstream)
 }
 
@@ -319,7 +319,7 @@ func (p *netstackProxy) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	logInfof("netstack: UDP %s:%d -> %s", dstIP, dstPort, target)
+	logDebugf("netstack: UDP %s:%d -> %s", dstIP, dstPort, target)
 	goSafe("netstackUDPRelay", func() {
 		defer client.Close()
 		defer upstream.Close()

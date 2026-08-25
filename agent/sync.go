@@ -81,6 +81,10 @@ func validIngestedPeer(p *Peer) bool {
 	// Version/arch are peer-supplied and rendered by the dashboard -
 	// blank them if unsafe rather than rejecting the whole peer.
 	sanitizePeerMeta(p.ID, &p.Version, &p.Arch)
+	// TunnelHost becomes the authority of an https:// URL we send
+	// authenticated requests to, so it gets a stricter charset than the
+	// display-only fields above.
+	sanitizeTunnelHost(p.ID, &p.TunnelHost)
 	return true
 }
 

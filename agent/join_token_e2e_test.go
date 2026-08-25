@@ -19,9 +19,9 @@ import (
 func e2eAgent(t *testing.T) *Agent {
 	t.Helper()
 	a := &Agent{
-		hwid:        "host-aaaaaaaaaaaa",
-		hostname:    "host-self",
-		ip:          "100.96.0.1",
+		hwid:     "host-aaaaaaaaaaaa",
+		hostname: "host-self",
+		// WARP IP set via setWarpIP below
 		apiPort:     6880,
 		serviceCIDR: "10.100.0.0/16",
 		state:       NewState(),
@@ -30,6 +30,7 @@ func e2eAgent(t *testing.T) *Agent {
 		composeDir:  t.TempDir(),
 		hostsFile:   t.TempDir() + "/hosts",
 	}
+	a.setWarpIP("100.96.0.1")
 	a.state.AdminKey = "admin-secret"
 	a.state.SelfAPIKey = "self-secret"
 	if err := a.ensureEncryptionKey(); err != nil {

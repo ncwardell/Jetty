@@ -118,7 +118,7 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 		localHealth := NodeHealth{
 			ID:        a.hwid,
 			Name:      a.hostname,
-			IP:        a.ip,
+			IP:        a.warpIP(),
 			PublicIP:  a.publicIP,
 			Healthy:   true,
 			Status:    getHealthStatus(),

@@ -39,7 +39,7 @@ func (a *Agent) apiListNodes(w http.ResponseWriter, r *http.Request) {
 		{
 			"id":        a.hwid,
 			"name":      a.hostname,
-			"ip":        a.ip,
+			"ip":        a.warpIP(),
 			"healthy":   true,
 			"last_seen": time.Now(),
 			"is_self":   true,

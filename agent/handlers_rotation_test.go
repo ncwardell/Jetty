@@ -15,7 +15,7 @@ func e2eAgentForRotation(t *testing.T) *Agent {
 	a := newTestAgentWithDir(t)
 	a.hwid = "self-hwid"
 	a.hostname = "self"
-	a.ip = "100.96.0.1"
+	a.setWarpIP("100.96.0.1")
 	a.composeDir = t.TempDir()
 	a.hostsFile = t.TempDir() + "/hosts"
 	a.state.AdminKey = "admin-secret"
@@ -97,7 +97,7 @@ func TestRotateAdminKey_RejectsShortKey(t *testing.T) {
 // and updates our own peer entry if present.
 func TestRotateSelfAPIKey(t *testing.T) {
 	a := e2eAgentForRotation(t)
-	a.state.Peers[a.hwid] = &Peer{ID: a.hwid, Name: a.hostname, IP: a.ip, Healthy: true, APIKey: a.state.SelfAPIKey}
+	a.state.Peers[a.hwid] = &Peer{ID: a.hwid, Name: a.hostname, IP: a.warpIP(), Healthy: true, APIKey: a.state.SelfAPIKey}
 
 	old := a.state.SelfAPIKey
 	newKey, err := a.rotateSelfAPIKeyLocal()

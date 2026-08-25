@@ -34,6 +34,11 @@ type NodeMeta struct {
 	// Without this, only the apiJoin-receiving node knows a new peer's
 	// APIKey and the rest of the cluster rejects calls from it.
 	APIKey string `json:"api_key,omitempty"`
+	// TunnelHost is this node's OWN tunnel hostname (JETTY_TUNNEL_HOST),
+	// distinct from the cluster-wide domain. The shared domain resolves to
+	// whichever node Cloudflare picks, so it cannot address a specific peer -
+	// see getPeerAPIURL.
+	TunnelHost string `json:"tunnel_host,omitempty"`
 }
 
 // BroadcastMessage represents a message broadcast to all nodes
@@ -60,15 +65,64 @@ type jettyEventDelegate struct {
 // =============================================================================
 
 // NodeMeta returns metadata about this node (called by memberlist)
+// NodeMeta returns metadata about this node (called by memberlist).
+//
+// memberlist caps node metadata (512 bytes by default) and this used to
+// handle overflow with `return d.meta[:limit]` - slicing JSON mid-string and
+// publishing a payload every peer fails to parse, with only a log line to say
+// so. Truncating a serialized structure produces corruption, not degradation:
+// the node effectively disappears from gossip while appearing to participate.
+//
+// So: shed optional fields until it fits, and if even the minimum does not
+// fit, publish nothing. A node with no metadata is visibly absent, which an
+// operator can diagnose; a node publishing unparseable metadata is not.
 func (d *jettyDelegate) NodeMeta(limit int) []byte {
 	defer recoverPanic("memberlist.NodeMeta")
 	d.metaMu.RLock()
-	defer d.metaMu.RUnlock()
-	if len(d.meta) > limit {
-		logWarnf("node meta exceeds limit (%d > %d)", len(d.meta), limit)
-		return d.meta[:limit]
+	full := d.meta
+	d.metaMu.RUnlock()
+
+	if len(full) <= limit {
+		return full
 	}
-	return d.meta
+
+	logWarnf("node meta is %d bytes, over memberlist's %d-byte limit - shedding optional fields",
+		len(full), limit)
+
+	var meta NodeMeta
+	if err := json.Unmarshal(full, &meta); err != nil {
+		logErrorf("node meta is oversized AND unparseable; publishing none: %v", err)
+		return nil
+	}
+
+	// Least essential first. Version is purely informational. Name is only
+	// cosmetic to peers - they key on ID, and /etc/hosts falls back to it.
+	// TunnelHost is shed last of the optional fields because dropping it costs
+	// correctness, not just cosmetics: getPeerAPIURL then falls back to the
+	// cluster-wide domain, which resolves to an arbitrary node. It is still
+	// shed before the rest, because that fallback at least reaches *a* node.
+	// ID, IP, Arch, APIPort and APIKey all change behaviour outright: identity,
+	// reachability, arch-gated placement, and peer authentication.
+	for _, shed := range []func(*NodeMeta){
+		func(m *NodeMeta) { m.Version = "" },
+		func(m *NodeMeta) { m.Name = "" },
+		func(m *NodeMeta) { m.TunnelHost = "" },
+	} {
+		shed(&meta)
+		data, err := json.Marshal(meta)
+		if err != nil {
+			logErrorf("node meta re-marshal failed; publishing none: %v", err)
+			return nil
+		}
+		if len(data) <= limit {
+			return data
+		}
+	}
+
+	logErrorf("node meta still exceeds %d bytes after shedding optional fields; "+
+		"publishing none rather than a truncated payload no peer can parse. "+
+		"Something oversized was added to NodeMeta.", limit)
+	return nil
 }
 
 // NotifyMsg is called when a broadcast message is received
@@ -208,6 +262,7 @@ func (e *jettyEventDelegate) NotifyJoin(node *memberlist.Node) {
 	peer.IP = meta.IP
 	peer.Version = meta.Version
 	peer.Arch = meta.Arch
+	peer.TunnelHost = meta.TunnelHost
 	peer.Healthy = true
 	peer.LastSeen = time.Now()
 	// Adopt APIKey from gossip whenever it differs - the broadcasting
@@ -295,6 +350,7 @@ func (e *jettyEventDelegate) NotifyUpdate(node *memberlist.Node) {
 		peer.IP = meta.IP
 		peer.Version = meta.Version
 		peer.Arch = meta.Arch
+		peer.TunnelHost = meta.TunnelHost
 		peer.Healthy = true
 		peer.LastSeen = time.Now()
 		// Adopt APIKey from the broadcasting peer's NodeMeta. With
@@ -358,6 +414,10 @@ func validIngestedNodeMeta(meta *NodeMeta) bool {
 	// Version/arch flow into peer records the dashboard renders -
 	// blank unsafe values rather than rejecting the node.
 	sanitizePeerMeta(meta.ID, &meta.Version, &meta.Arch)
+	// TunnelHost is stricter than the others: it becomes the authority of a
+	// URL we send authenticated requests to, so a malformed one is not a
+	// cosmetic problem.
+	sanitizeTunnelHost(meta.ID, &meta.TunnelHost)
 	return true
 }
 
@@ -369,13 +429,14 @@ func (d *jettyDelegate) updateNodeMeta(ip string) {
 	d.agent.stateMu.RUnlock()
 
 	meta := NodeMeta{
-		ID:      d.agent.hwid,
-		Name:    d.agent.hostname,
-		IP:      ip,
-		Version: Version,
-		Arch:    getArch(),
-		APIPort: d.agent.apiPort,
-		APIKey:  apiKey,
+		ID:         d.agent.hwid,
+		Name:       d.agent.hostname,
+		IP:         ip,
+		Version:    Version,
+		Arch:       getArch(),
+		APIPort:    d.agent.apiPort,
+		APIKey:     apiKey,
+		TunnelHost: d.agent.tunnelHost,
 	}
 
 	data, err := json.Marshal(meta)
@@ -670,9 +731,9 @@ func (a *Agent) initMemberlist() (*memberlist.Memberlist, error) {
 	config.AdvertisePort = MemberlistPort
 
 	// Bind to WARP IP if available, otherwise all interfaces
-	if a.ip != "" {
-		config.BindAddr = a.ip
-		config.AdvertiseAddr = a.ip
+	if a.warpIP() != "" {
+		config.BindAddr = a.warpIP()
+		config.AdvertiseAddr = a.warpIP()
 	}
 
 	// Create delegate
@@ -689,7 +750,7 @@ func (a *Agent) initMemberlist() (*memberlist.Memberlist, error) {
 	}
 
 	// Set initial node metadata
-	delegate.updateNodeMeta(a.ip)
+	delegate.updateNodeMeta(a.warpIP())
 
 	config.Delegate = delegate
 	config.Events = &jettyEventDelegate{agent: a}

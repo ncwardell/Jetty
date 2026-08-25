@@ -167,7 +167,7 @@ func (a *Agent) snapshotHosts() hostsSnapshot {
 	defer a.stateMu.RUnlock()
 
 	snap := hostsSnapshot{tunnelDomain: a.tunnelDomain}
-	snap.entries = append(snap.entries, hostsEntry{ip: a.ip, name: a.hostname, note: "this node"})
+	snap.entries = append(snap.entries, hostsEntry{ip: a.warpIP(), name: a.hostname, note: "this node"})
 
 	peers := make([]hostsEntry, 0, len(a.state.Peers))
 	for _, p := range a.state.Peers {

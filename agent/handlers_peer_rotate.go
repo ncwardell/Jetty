@@ -135,7 +135,7 @@ func (a *Agent) rotateSelfAPIKeyLocal() (string, error) {
 	// Push the rotation through memberlist so other peers update
 	// their stored Peer.APIKey for us.
 	if a.mlDelegate != nil {
-		a.mlDelegate.updateNodeMeta(a.ip)
+		a.mlDelegate.updateNodeMeta(a.warpIP())
 		if a.memberlist != nil {
 			a.memberlist.UpdateNode(0)
 		}

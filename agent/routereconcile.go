@@ -164,12 +164,12 @@ func (a *Agent) snapshotRoutes() (routeSnapshot, bool) {
 	a.stateMu.RLock()
 	defer a.stateMu.RUnlock()
 
-	if a.ip == "" {
+	if a.warpIP() == "" {
 		return routeSnapshot{}, false // WARP not connected
 	}
 
 	snap := routeSnapshot{
-		warpIP:     a.ip,
+		warpIP:     a.warpIP(),
 		tunnelMode: a.tunnelMode,
 		hasTun:     a.tunDevice != nil,
 		desired:    make(map[string]routeTarget),
