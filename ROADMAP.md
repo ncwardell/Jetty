@@ -635,11 +635,16 @@ delegation-over-agreement principle at the top of this file.
      mesh". This promotes Stage A from worthwhile hardening to **mandatory**,
      and adds an explicit requirement to refuse gossip sourced from worker
      mesh IPs.
-   - Revocation is slower: closing a socket is instant and local, revoking a
-     connector token is an API call with propagation. Application-level
-     revocation stays instant, so this is bounded rather than fatal.
-   - It needs the agent's **first Cloudflare API integration** — there is none
-     today — to mint and revoke a connector token per worker.
+   - Mesh-level revocation is not instant. It does not need to be: the
+     controls that matter are all local and immediate — the worker's Jetty
+     token stops working, it is tombstoned so no node routes to it, and its
+     filter rules are dropped. A worker still nominally on the mesh with no
+     credential and no permitted destinations can send packets that go
+     nowhere. Mesh membership without authorisation is inert, which is exactly
+     what stage A and the filter rules have to guarantee.
+   - It does **not** need a Cloudflare API integration — see the token pool in
+     stage E. Requiring API credentials to spin up capacity would be a far
+     larger blast radius than a set of pre-generated connector tokens.
 
    Revisit the bespoke-tunnel design if workers ever run alongside genuinely
    sensitive workloads, where default-closed is worth its cost.
@@ -768,10 +773,28 @@ transcode, scrapes. The UI should say so at placement time, not bury it in docs.
       filtering rather than from absence, and iptables provides that either
       way, it pays a bottleneck for isolation it does not uniquely provide.
 
-- [ ] **E. Mesh membership + per-worker packet filtering.** Mint a scoped
-      Cloudflare connector token per worker, hand it over at attach, revoke it
-      on detach. This is the agent's first Cloudflare API integration, so the
-      credential handling for it is new surface worth reviewing on its own.
+- [ ] **E. Mesh membership + per-worker packet filtering.** The worker needs a
+      WARP identity of its own, and **a shared token will not do** — `join.go`
+      already documents why: Cloudflare Mesh registers shared-token machines as
+      active-passive replicas of one identity, and passive replicas drop all
+      traffic. A worker on a shared token would join, gossip, run workloads and
+      report healthy while silently blackholing everything.
+
+      **Use a pre-provisioned token pool rather than the Cloudflare API.** An
+      operator generates N worker tokens by hand once (Zero Trust > Networking
+      > Mesh) and stores them in the env store, which is already encrypted; the
+      agent *leases* one on attach and returns it on detach. Renting capacity
+      stays fully algorithmic, with the Cloudflare work done once by a human,
+      and the agent needs no API credentials — which matters, because API
+      access is a much larger blast radius than a set of connector tokens.
+
+      Trade-offs, all mild: concurrency caps at pool size (fine for burst
+      capacity, topped up manually when more headroom is wanted); tokens recur
+      sequentially, so a later worker may inherit an earlier one's identity and
+      likely its mesh IP — no active-passive conflict since they do not
+      overlap, but a stale route could briefly point at the wrong box, which
+      the grace window and tombstone already cover; and a worker that vanishes
+      without detaching holds its token until that window expires.
 
       The worker then gets a mesh IP and everything existing works unchanged —
       routes, `/etc/hosts`, tunnel setup, owner-is-next-hop. No new data plane.
