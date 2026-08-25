@@ -424,6 +424,14 @@ manual dispatch defaulting to version `dev`. Meanwhile `agent.go` hardcodes
       SNI/Host, looks up the gossiped route table, and dials the workload over
       the mesh — the workload need not be local. Reachability must be *probed*
       by a peer, not inferred from having a public IP (CGNAT lies).
+
+      Bigger than it looks: this is the piece that replaces Cloudflare Tunnel,
+      and the same publicly-reachable node is also the rendezvous a self-hosted
+      WireGuard mesh needs for hole punching. Entry node and lighthouse are one
+      machine playing two roles — see "What leaving Cloudflare actually
+      requires" below. It is also the first asymmetry between nodes in a
+      design that has none: a role, not a hierarchy, since entry nodes
+      terminate ingress without deciding anything.
 - [ ] DNS resolver per node, served from gossiped state, replacing
       `/etc/hosts` + `extra_hosts`. Today adding a workload anywhere requires
       container recreation elsewhere to make it resolvable. Split-horizon also
@@ -790,6 +798,55 @@ Gossip itself is not the bottleneck; SWIM handles 10k-node pools comfortably.
 ---
 
 ## Deliberately not doing (yet)
+
+### What leaving Cloudflare actually requires
+
+Cloudflare plays **two separate roles**, and they can be dropped independently
+— worth stating plainly, because conflating them makes the exit look like one
+big rewrite instead of two tractable pieces:
+
+1. **WARP** — the mesh underlay and NAT rendezvous for node↔node traffic.
+   Replaced by WireGuard in the agent (see below).
+2. **Cloudflare Tunnel** — public ingress, outbound-only, so no node exposes a
+   port. Replaced by the entry-node role already listed in Phase 5.
+
+**WireGuard in the agent is cheaper than it looks.** `wireguard-go` is pure Go,
+and the standard pairing for userspace WireGuard is `wireguard-go` + gVisor
+netstack — which is how Tailscale's `tsnet` works, and **netstack is already in
+our binary** from the tunnel migration. The pattern is established too: the
+agent supervises `warp-svc` as a subprocess today; it would stop managing the
+underlay and start being it. Note what this does *not* buy: the send path still
+captures kernel-routed packets off a TUN, so `NET_ADMIN` stays.
+
+**Nodes are identically configured but not identically reachable.** That
+asymmetry is the whole design constraint. The Radxa is behind home NAT and no
+config makes it a WireGuard endpoint — reachability is a property of where a
+node sits. Hence a role, though a role and not a hierarchy: entry nodes
+terminate ingress, they do not decide anything. See the Phase 5 entry, including
+the trap that reachability must be *probed* rather than inferred from a public
+IP, because CGNAT lies.
+
+**Entry node and lighthouse are the same machine.** WireGuard alone does not
+hole-punch, so a NAT'd pair needs a publicly reachable rendezvous — which is
+the box already required for ingress. Self-hosting is therefore *one* piece of
+infrastructure serving two roles, not two. This is the piece that makes the
+picture close.
+
+**What Cloudflare is actually buying**, stated honestly so the trade is
+explicit rather than sentimental. Not "it saves us a box" — these four:
+
+- **DDoS absorption.** Cloudflare eats attacks; a Hetzner box does not.
+- **Zero inbound exposure.** `cloudflared` is outbound-only. An entry node
+  means a permanent public listener, the exact surface Tunnel removes.
+- **Anycast.** A distributed edge versus one box in one datacenter — the
+  geolocated-routing problem, and the one thing self-hosting cannot fix at
+  two nodes.
+- **Cert automation and in-network failover.** Otherwise ACME to run, and DNS
+  TTLs mean minutes of outage when an entry node dies.
+
+The goal stays what the guiding principles say: Cloudflare fully supported and
+genuinely excellent, but *selectable* rather than load-bearing. The above is
+what "selectable" cashes out to.
 
 - **Replacing WARP by hand.** Rolling our own means STUN + UDP hole punching
   (~85–90% of NAT pairs; symmetric-to-symmetric essentially never) plus a relay
