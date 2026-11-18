@@ -376,6 +376,8 @@ Set on the `docker run`/compose of the **agent** container itself (not workloads
 | `JETTY_TUNNEL_DOMAIN` | — | Cluster's Cloudflare tunnel domain. |
 | `JETTY_TUNNEL_HOST` | — | This node's tunnel subdomain. |
 | `JETTY_CF_TOKEN` | — | Cloudflare tunnel token (usually delivered via join). |
+| `JETTY_CF_READY_RESTART_AFTER` | `3m` | Kill + respawn cloudflared when it has had zero edge connections this long. `0` = report only. |
+| `JETTY_CF_METRICS_ADDR` | `127.0.0.1:46880` | Where cloudflared serves `/ready` for the watchdog. |
 | `JETTY_WARP_CONNECTOR_TOKEN` | — | Per-node Cloudflare Mesh node token. One per machine — a shared token makes Cloudflare register nodes as active-passive replicas of one identity (mesh breaks). Env overrides state; join-delivered shared token is only a fallback. |
 | `JETTY_IMAGE_PRUNE` | `true` | Daily prune of stranded Docker images; `false` disables. `JETTY_IMAGE_PRUNE_UNTIL` (default `168h`) sets the age cutoff for unused tagged images. |
 | `JETTY_HOST_SHELL` | `false` | Enables `/api/host/exec` + `/api/host/shell`. Dangerous (host RCE for any AdminKey holder); requires `--pid=host`. |

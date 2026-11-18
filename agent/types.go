@@ -54,6 +54,20 @@ const (
 	CloudflaredMaxFailures    = 10
 	CloudflaredSuccessReset   = 30 * time.Second
 
+	// Cloudflared readiness watchdog (cloudflared_watchdog.go). A connector
+	// can stay alive with zero edge connections indefinitely - one did for
+	// 19 days - and the exit-based monitor above never notices. These bound
+	// how long "running but connected to nothing" is tolerated.
+	//
+	// The metrics address is deliberately NOT cloudflared's default
+	// (localhost:20241-20245): Jetty runs with host networking, and a host
+	// that also runs its own cloudflared would answer our probe with ITS
+	// readiness. Override with JETTY_CF_METRICS_ADDR.
+	CloudflaredMetricsAddrDefault = "127.0.0.1:46880"
+	CloudflaredReadyPollInterval  = 30 * time.Second
+	CloudflaredReadyProbeTimeout  = 5 * time.Second
+	CloudflaredNotReadyRestart    = 3 * time.Minute // Not ready continuously this long -> kill so the monitor respawns
+
 	// MoveDeployTimeout bounds a workload move. Generous because the deploy on
 	// the far side may restore gigabytes; still bounded so a wedged target
 	// cannot hang the caller forever.
@@ -405,6 +419,20 @@ type Agent struct {
 	cfCmd    *exec.Cmd
 	cfMu     sync.Mutex
 	cfStopCh chan struct{}
+	// Guarded by cfMu. cfAlive is true from a successful Start until the
+	// monitor's Wait returns, so the readiness watchdog never signals a
+	// process that has already exited (cfCmd keeps pointing at it through
+	// the restart backoff). cfStartedAt starts each process's not-ready
+	// clock. cfKilledByWatchdog tells the monitor the next exit was ours,
+	// not a crash.
+	cfAlive            bool
+	cfStartedAt        time.Time
+	cfKilledByWatchdog bool
+	cfMetricsAddr      string // where the current process serves /ready (may differ from the configured one on a port clash)
+	// cfReady is what the watchdog last observed. Its own mutex, never held
+	// across I/O, so /api/livez can read it on a wedged agent.
+	cfReady   cloudflaredReadiness
+	cfReadyMu sync.Mutex
 
 	// Runtime
 	startTime           time.Time // When Jetty started (for uptime tracking)

@@ -63,6 +63,11 @@ func (a *Agent) apiLivez(w http.ResponseWriter, r *http.Request) {
 		"state_lock_acquirable": acquirable,
 		"log_level":             CurrentLogLevel(),
 		"tunnel_stack":          a.activeTunnelStack(),
+		// Lock-free (cfReadyMu is never held across I/O), so it is safe
+		// here. "running but not ready" is the state a 19-day public
+		// ingress outage hid in; it belongs next to the other "is this
+		// node actually working" signals.
+		"cloudflared": a.cloudflaredReadinessReport(),
 	}
 
 	// Say what it means, so an operator does not have to know the internals

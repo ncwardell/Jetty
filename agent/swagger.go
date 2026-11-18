@@ -32,6 +32,11 @@ type NodeInfo struct {
 type TunnelStatus struct {
 	Configured bool `json:"configured" example:"true"`
 	Running    bool `json:"running" example:"true"`
+	// Readiness is what cloudflared's own /ready endpoint last reported:
+	// running, ready, ready_connections, last_ready, last_probe,
+	// watchdog_restarts. running=true with ready=false means the process is
+	// up but holds no edge connections.
+	Readiness map[string]interface{} `json:"readiness"`
 }
 
 // OwnerInfo represents workload owner details

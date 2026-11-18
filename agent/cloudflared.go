@@ -2,7 +2,6 @@ package agent
 
 import (
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -70,17 +69,7 @@ func (a *Agent) startCloudflared() error {
 
 	a.cfStopCh = make(chan struct{})
 
-	// Start cloudflared tunnel with --no-autoupdate to prevent background updates
-	// Note: --no-autoupdate is a global flag and must come before 'tunnel'
-	// Pass token via --token flag (more reliable than TUNNEL_TOKEN env var)
-	a.cfCmd = exec.Command("cloudflared", "--no-autoupdate", "tunnel", "run", "--token", token)
-
-	// Use filtered log writer to capture important messages while suppressing verbose output
-	logFilter := &cloudflaredLogFilter{prefix: "cloudflared"}
-	a.cfCmd.Stdout = logFilter
-	a.cfCmd.Stderr = logFilter
-
-	if err := a.cfCmd.Start(); err != nil {
+	if err := a.spawnCloudflaredLocked(token); err != nil {
 		return err
 	}
 
@@ -119,13 +108,35 @@ func (a *Agent) stopCloudflared() {
 		logInfof("Cloudflare tunnel stopped")
 	}
 	a.cfCmd = nil
+	a.cfAlive = false
+	a.cfKilledByWatchdog = false
+	a.setCloudflaredNotRunning()
 }
 
 // monitorCloudflared watches the cloudflared process and restarts it if it dies.
 // Uses exponential backoff with a maximum of 10 consecutive failures before giving up.
+//
+// Process exit is the only thing this loop can see. A cloudflared that is
+// alive but holding zero edge connections never exits, so the readiness
+// watchdog started below covers that case by killing it - which turns
+// "silently disconnected" into an exit this loop already knows how to handle.
 func (a *Agent) monitorCloudflared() {
 	backoff := CloudflaredInitialBackoff
 	failures := 0
+
+	// The watchdog lives exactly as long as this monitor: it stops on a
+	// deliberate stop (stopCh) and when the monitor gives up (done), so it can
+	// never kill a process nobody is going to respawn.
+	a.cfMu.Lock()
+	sessionStopCh := a.cfStopCh
+	a.cfMu.Unlock()
+	monitorDone := make(chan struct{})
+	defer close(monitorDone)
+	if sessionStopCh != nil {
+		goSafe("cloudflaredReadyWatchdog", func() {
+			a.cloudflaredReadyWatchdog(sessionStopCh, monitorDone)
+		})
+	}
 
 	for {
 		a.cfMu.Lock()
@@ -142,6 +153,17 @@ func (a *Agent) monitorCloudflared() {
 		// Wait for process to exit
 		err := cmd.Wait()
 
+		// Record the exit before anything else, so the watchdog stops
+		// judging (and cannot try to kill) a process that is already gone.
+		a.cfMu.Lock()
+		killedByWatchdog := a.cfKilledByWatchdog && a.cfCmd == cmd
+		a.cfKilledByWatchdog = false
+		if a.cfCmd == cmd {
+			a.cfAlive = false
+		}
+		a.cfMu.Unlock()
+		a.setCloudflaredNotRunning()
+
 		// Check if we were asked to stop
 		select {
 		case <-stopCh:
@@ -149,11 +171,20 @@ func (a *Agent) monitorCloudflared() {
 		default:
 		}
 
-		// If process ran for a while, reset the failure counter and backoff
-		if time.Since(startTime) >= CloudflaredSuccessReset {
+		switch {
+		case killedByWatchdog:
+			// A watchdog kill is not a crash and must not count toward
+			// giving up: the incident it exists for (19 days connected to
+			// nothing) is exactly the kind of long outage where abandoning
+			// the tunnel would be worst. It still pays the backoff, and the
+			// backoff keeps growing, so a connector that can never reach
+			// the edge costs one restart per (threshold + backoff) rather
+			// than a tight loop.
+		case time.Since(startTime) >= CloudflaredSuccessReset:
+			// If process ran for a while, reset the failure counter and backoff
 			failures = 0
 			backoff = CloudflaredInitialBackoff
-		} else {
+		default:
 			failures++
 		}
 
@@ -163,9 +194,12 @@ func (a *Agent) monitorCloudflared() {
 			return
 		}
 
-		if err != nil {
+		switch {
+		case killedByWatchdog:
+			logWarnf("Cloudflare tunnel killed by readiness watchdog (no edge connections), restarting in %v...", backoff)
+		case err != nil:
 			logInfof("Cloudflare tunnel exited: %v (attempt %d/%d), restarting in %v...", err, failures, CloudflaredMaxFailures, backoff)
-		} else {
+		default:
 			logInfof("Cloudflare tunnel exited (attempt %d/%d), restarting in %v...", failures, CloudflaredMaxFailures, backoff)
 		}
 
@@ -196,16 +230,7 @@ func (a *Agent) monitorCloudflared() {
 			return
 		}
 
-		// Note: --no-autoupdate is a global flag and must come before 'tunnel'
-		// Pass token via --token flag (more reliable than TUNNEL_TOKEN env var)
-		a.cfCmd = exec.Command("cloudflared", "--no-autoupdate", "tunnel", "run", "--token", token)
-
-		// Use filtered log writer to capture important messages while suppressing verbose output
-		logFilter := &cloudflaredLogFilter{prefix: "cloudflared"}
-		a.cfCmd.Stdout = logFilter
-		a.cfCmd.Stderr = logFilter
-
-		if err := a.cfCmd.Start(); err != nil {
+		if err := a.spawnCloudflaredLocked(token); err != nil {
 			logErrorf("Cloudflare tunnel restart failed: %v", err)
 			a.cfMu.Unlock()
 			return

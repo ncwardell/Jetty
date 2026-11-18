@@ -640,6 +640,14 @@ definitions:
       configured:
         example: true
         type: boolean
+      readiness:
+        additionalProperties: true
+        description: |-
+          Readiness is what cloudflared's own /ready endpoint last reported:
+          running, ready, ready_connections, last_ready, last_probe,
+          watchdog_restarts. running=true with ready=false means the process is
+          up but holds no edge connections.
+        type: object
       running:
         example: true
         type: boolean

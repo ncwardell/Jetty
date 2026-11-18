@@ -241,6 +241,34 @@ func getEnvInt(key string, defaultValue int) int {
 	return defaultValue
 }
 
+// getEnvDuration returns environment variable as a duration or default.
+//
+// Accepts Go duration syntax ("90s", "3m", "1h30m") and, because operators
+// reach for it first in a compose file, a bare integer meaning seconds. "0"
+// is a valid value - the watchdog tunables use it to mean "disabled" - so it
+// is returned as zero rather than falling back to the default. Negative or
+// unparseable values fall back to the default with a warning; silently
+// accepting a typo would mean silently running without a safety net.
+func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return defaultValue
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		if n < 0 {
+			logWarnf("invalid duration for %s: %q (negative), using default %v", key, v, defaultValue)
+			return defaultValue
+		}
+		return time.Duration(n) * time.Second
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		logWarnf("invalid duration for %s: %q, using default %v", key, v, defaultValue)
+		return defaultValue
+	}
+	return d
+}
+
 // getHostname returns the system hostname or "node" as fallback
 func getHostname() string {
 	h, _ := os.Hostname()

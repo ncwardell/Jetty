@@ -2745,6 +2745,11 @@ const docTemplate = `{
                     "type": "boolean",
                     "example": true
                 },
+                "readiness": {
+                    "description": "Readiness is what cloudflared's own /ready endpoint last reported:\nrunning, ready, ready_connections, last_ready, last_probe,\nwatchdog_restarts. running=true with ready=false means the process is\nup but holds no edge connections.",
+                    "type": "object",
+                    "additionalProperties": true
+                },
                 "running": {
                     "type": "boolean",
                     "example": true

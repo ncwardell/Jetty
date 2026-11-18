@@ -197,6 +197,9 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 		"tunnel": map[string]interface{}{
 			"configured": hasTunnel,
 			"running":    a.isTunnelRunning(),
+			// Process up is not the same as connected; see
+			// cloudflared_watchdog.go.
+			"readiness": a.cloudflaredReadinessReport(),
 			// The cluster-wide hostname, exposed so the dashboard can
 			// prefill the join URL in a generated docker run. Without it
 			// the UI can only offer whatever address the browser happens

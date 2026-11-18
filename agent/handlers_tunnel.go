@@ -68,7 +68,11 @@ func (a *Agent) apiGetTunnel(w http.ResponseWriter, r *http.Request) {
 		"configured": hasToken,
 		"enabled":    !disabled,
 		"running":    a.isTunnelRunning(),
-		"node":       a.hostname,
+		// "running" only means the process exists. readiness says whether
+		// it holds any edge connections - the difference is the 19-day
+		// silent outage of 2026-11-18.
+		"readiness": a.cloudflaredReadinessReport(),
+		"node":      a.hostname,
 	})
 }
 
