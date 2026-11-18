@@ -199,7 +199,7 @@ func (a *Agent) containerForExec(workloadName, service string) (string, error) {
 	if service != "" {
 		args = append(args, "-f", "label=com.docker.compose.service="+service)
 	}
-	out, err := exec.Command("docker", args...).Output()
+	out, err := runCmdOutput(dockerQueryTimeout, "docker", args...)
 	if err != nil {
 		return "", fmt.Errorf("docker ps: %w", err)
 	}

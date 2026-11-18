@@ -201,7 +201,7 @@ func (d *jettyDelegate) MergeRemoteState(buf []byte, join bool) {
 	// Stop workloads we lost ownership of
 	for _, wl := range result.LostOwnership {
 		logInfof("Memberlist sync: stopping local workload %s - ownership transferred", wl.Name)
-		d.agent.removeWorkload(wl)
+		d.agent.releaseLostWorkload(wl)
 	}
 
 	if result.Changed {
@@ -343,6 +343,7 @@ func (e *jettyEventDelegate) NotifyUpdate(node *memberlist.Node) {
 		return
 	}
 
+	ipChanged := false
 	e.agent.stateMu.Lock()
 	if peer := e.agent.state.Peers[meta.ID]; peer != nil {
 		oldIP := peer.IP
@@ -363,14 +364,31 @@ func (e *jettyEventDelegate) NotifyUpdate(node *memberlist.Node) {
 			}
 		}
 
-		// If IP changed, update tunnel
 		if oldIP != meta.IP {
 			logInfof("Memberlist: node %s IP changed from %s to %s", meta.Name, oldIP, meta.IP)
+			ipChanged = true
+			// A sync.Map store - no I/O, fine under the lock, and doing it
+			// here keeps it ordered with the state write it mirrors.
 			e.agent.updateTunPeerAddr(meta.ID, meta.IP)
-			e.agent.ensurePeerTunnel(meta.ID, meta.IP)
+			// Workload routes name the tunnel, not the address, but the
+			// reconciler re-ensures every peer's tunnel - and a level
+			// trigger is safe to fire under the lock.
+			e.agent.triggerRouteReconcile()
 		}
 	}
 	e.agent.stateMu.Unlock()
+
+	// Rebuild the transport toward the new address with stateMu released.
+	// This used to run under the write lock: ensurePeerTunnel execs `ip` up
+	// to four times, and a WARP renumber is exactly when the network is
+	// flaky enough for one of them to hang - which froze every API request
+	// behind the queued writer. ensurePeerTunnel re-reads the peer's address
+	// itself, so a newer update landing in between is not undone here.
+	if ipChanged {
+		if err := e.agent.ensurePeerTunnel(meta.ID, meta.IP); err != nil {
+			logWarnf("Memberlist: failed to rebuild tunnel to %s: %v", meta.Name, err)
+		}
+	}
 }
 
 // =============================================================================
@@ -580,7 +598,7 @@ func (a *Agent) handleWorkloadUpdate(wl *Workload) {
 	if existing == nil || wl.Version > existing.Version {
 		if existing != nil && existing.Owner == a.hwid && wl.Owner != a.hwid {
 			logInfof("Broadcast: lost ownership of %s to %s", existing.Name, shortID(wl.Owner, 12))
-			goSafe("removeWorkload", func() { a.removeWorkload(existing) })
+			goSafe("releaseLostWorkload", func() { a.releaseLostWorkload(existing) })
 		}
 		a.state.Workloads[wl.IP] = wl
 		// Same stale-tombstone retirement as mergeWorkloadState: if
@@ -1096,7 +1114,7 @@ func (a *Agent) memberlistPeriodicSync() {
 	// Stop workloads we lost ownership of
 	for _, wl := range result.LostOwnership {
 		logInfof("Periodic sync: stopping local workload %s - ownership transferred", wl.Name)
-		a.removeWorkload(wl)
+		a.releaseLostWorkload(wl)
 	}
 
 	if result.EnvUpdated {

@@ -391,12 +391,15 @@ func (a *Agent) syncStateOnStartup() {
 		}()
 	}
 
-	// Stop containers we no longer own. removeWorkload runs `docker compose
-	// down -v` and is safe to call without the state lock - we already
-	// updated state inside the merge.
+	// Stop containers we no longer own. Safe to call without the state lock -
+	// we already updated state inside the merge. This is the path a node that
+	// was wedged or partitioned takes on its way back, and for a stateful
+	// workload its local copy may hold the newest data, so releaseLostWorkload
+	// stops it and keeps its volumes rather than `down -v` (it still removes
+	// stateless and deleted workloads as before).
 	for _, wl := range allLostOwnership {
 		logInfof("Startup sync: stopping local workload %s - ownership transferred during downtime", wl.Name)
-		a.removeWorkload(wl)
+		a.releaseLostWorkload(wl)
 	}
 
 	if synced {
@@ -472,7 +475,7 @@ func (a *Agent) syncWorkloads() {
 	// Stop workloads we lost ownership of (outside lock)
 	for _, wl := range allLostOwnership {
 		logInfof("Stopping local workload %s - ownership transferred", wl.Name)
-		a.removeWorkload(wl)
+		a.releaseLostWorkload(wl)
 	}
 
 	// Reflect live reachability into the cached peer state. Without
@@ -531,7 +534,7 @@ func (a *Agent) tunnelModeSyncWorkloads() {
 	// Stop workloads we lost ownership of (outside lock)
 	for _, wl := range result.LostOwnership {
 		logInfof("Stopping local workload %s - ownership transferred", wl.Name)
-		a.removeWorkload(wl)
+		a.releaseLostWorkload(wl)
 	}
 
 	if result.EnvUpdated {

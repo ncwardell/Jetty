@@ -54,6 +54,20 @@ const (
 	CloudflaredMaxFailures    = 10
 	CloudflaredSuccessReset   = 30 * time.Second
 
+	// Cloudflared readiness watchdog (cloudflared_watchdog.go). A connector
+	// can stay alive with zero edge connections indefinitely - one did for
+	// 19 days - and the exit-based monitor above never notices. These bound
+	// how long "running but connected to nothing" is tolerated.
+	//
+	// The metrics address is deliberately NOT cloudflared's default
+	// (localhost:20241-20245): Jetty runs with host networking, and a host
+	// that also runs its own cloudflared would answer our probe with ITS
+	// readiness. Override with JETTY_CF_METRICS_ADDR.
+	CloudflaredMetricsAddrDefault = "127.0.0.1:46880"
+	CloudflaredReadyPollInterval  = 30 * time.Second
+	CloudflaredReadyProbeTimeout  = 5 * time.Second
+	CloudflaredNotReadyRestart    = 3 * time.Minute // Not ready continuously this long -> kill so the monitor respawns
+
 	// MoveDeployTimeout bounds a workload move. Generous because the deploy on
 	// the far side may restore gigabytes; still bounded so a wedged target
 	// cannot hang the caller forever.
@@ -148,8 +162,23 @@ type Workload struct {
 	// credentials (public images, or whatever the host docker config
 	// already provides) - identical to pre-feature behavior.
 	RegistryAuth *RegistryAuth `json:"registry_auth,omitempty"`
-	Owner        string        `json:"owner"`   // Node HWID
-	Version      int64         `json:"version"` // Unix timestamp
+	// Stateful overrides stateful-workload detection (failover_policy.go).
+	// nil = detect from the compose file (named/anonymous volumes or a
+	// writable bind mount mean stateful). Stateful workloads only fail over
+	// after JETTY_STATEFUL_FAILOVER_GRACE, and losing ownership stops them
+	// instead of deleting their volumes.
+	Stateful *bool `json:"stateful,omitempty"`
+	// AutoFailover is the per-workload failover switch, layered under
+	// Revive (revive=false still disables failover entirely):
+	//   nil   - default policy: stateless fails over after FailoverGracePeriod,
+	//           stateful after JETTY_STATEFUL_FAILOVER_GRACE.
+	//   false - never claimed automatically when the owner looks dead; an
+	//           operator moves it.
+	//   true  - fail over on the normal short grace even if stateful (the
+	//           operator accepts starting from the last backup).
+	AutoFailover *bool  `json:"auto_failover,omitempty"`
+	Owner        string `json:"owner"`   // Node HWID
+	Version      int64  `json:"version"` // Unix timestamp
 }
 
 // RegistryAuth tells Jetty how to authenticate an image pull for a workload.
@@ -405,8 +434,30 @@ type Agent struct {
 	cfCmd    *exec.Cmd
 	cfMu     sync.Mutex
 	cfStopCh chan struct{}
+	// Guarded by cfMu. cfAlive is true from a successful Start until the
+	// monitor's Wait returns, so the readiness watchdog never signals a
+	// process that has already exited (cfCmd keeps pointing at it through
+	// the restart backoff). cfStartedAt starts each process's not-ready
+	// clock. cfKilledByWatchdog tells the monitor the next exit was ours,
+	// not a crash.
+	cfAlive            bool
+	cfStartedAt        time.Time
+	cfKilledByWatchdog bool
+	cfMetricsAddr      string // where the current process serves /ready (may differ from the configured one on a port clash)
+	// cfReady is what the watchdog last observed. Its own mutex, never held
+	// across I/O, so /api/livez can read it on a wedged agent.
+	cfReady   cloudflaredReadiness
+	cfReadyMu sync.Mutex
 
 	// Runtime
+	// lockUnacquirableSince is UnixNano of the first failed wedge-watchdog
+	// probe in the current run of failures, 0 while stateMu is healthy.
+	// Atomic so /api/livez reads it without a lock. See wedge.go.
+	lockUnacquirableSince atomic.Int64
+	// wedgeThreshold is the effective JETTY_WEDGE_RESTART_AFTER (as a
+	// time.Duration), published for /api/livez; 0 = self-restart disabled.
+	wedgeThreshold atomic.Int64
+
 	startTime           time.Time // When Jetty started (for uptime tracking)
 	lastHeartbeatErrLog time.Time // Last time we logged a heartbeat error (to reduce spam)
 	publicIP            string    // Cached public IP (set at startup to avoid slow lookups)
@@ -421,6 +472,11 @@ type Agent struct {
 	// Capacity 1 so triggerRouteReconcile never blocks - it is called with
 	// stateMu held.
 	routeReconcileCh chan struct{}
+	// peerTunnelLocks maps peer ID -> *sync.Mutex serializing kernel tunnel
+	// programming for that peer (ensurePeerTunnel / removePeerTunnel). Held
+	// across bounded `ip` execs, which is why it is separate from - and never
+	// held together with - stateMu.
+	peerTunnelLocks sync.Map
 
 	// Container autoheal: last time we restarted each running-but-unhealthy
 	// container, so a container that keeps coming up unhealthy isn't

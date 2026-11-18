@@ -161,52 +161,134 @@ func TestApplyRoutesRunsWithoutHoldingTheStateLock(t *testing.T) {
 	<-applyDone
 }
 
-func TestRunBoundedCommandTimesOut(t *testing.T) {
-	// Unbounded execs are what made a single stuck child unrecoverable.
-	start := time.Now()
-	err := runBoundedCommand(200*time.Millisecond, "sleep", "30")
-	elapsed := time.Since(start)
+func TestApplyRoutesDoesNotHoldRouteMapAcrossExec(t *testing.T) {
+	// The userspace tunnel's send loop takes workloadRoutesMu for every
+	// outbound packet. If applyRoutes holds it across a hung `ip`, all
+	// cross-node workload traffic stops - the data-plane twin of the stateMu
+	// freeze. And a route installed before the hang must already be usable.
+	release := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	restore := routeCommandRunner
+	routeCommandRunner = func(_ time.Duration, _ string, _ ...string) error {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n > 1 {
+			<-release // every command after the first hangs
+		}
+		return nil
+	}
+	t.Cleanup(func() { routeCommandRunner = restore })
 
-	if err == nil {
-		t.Fatal("a command that outran its timeout returned no error")
+	a := newTestAgentWithDir(t)
+	a.hwid = "us"
+	a.workloadRoutes = map[string]string{"10.100.9.9": "old-owner"} // stale
+	snap := routeSnapshot{
+		warpIP: "100.96.0.1",
+		hasTun: true,
+		desired: map[string]routeTarget{
+			"10.100.9.1": {ownerID: "peer", ownerIP: "100.96.0.2"},
+			"10.100.9.2": {ownerID: "peer", ownerIP: "100.96.0.2"},
+		},
 	}
-	if !strings.Contains(err.Error(), "timed out") {
-		t.Errorf("error = %v, want it to say the command timed out", err)
+
+	applyDone := make(chan struct{})
+	go func() { defer close(applyDone); a.applyRoutes(snap) }()
+
+	// The first command (the stale delete) returns; the next hangs.
+	deadline := time.After(3 * time.Second)
+	for {
+		mu.Lock()
+		n := calls
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			close(release)
+			<-applyDone
+			t.Fatal("applyRoutes never reached its second command")
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
-	if elapsed > 5*time.Second {
-		t.Errorf("took %s to give up on a 200ms timeout", elapsed)
+
+	got := make(chan map[string]string, 1)
+	go func() {
+		a.workloadRoutesMu.Lock()
+		cp := make(map[string]string, len(a.workloadRoutes))
+		for k, v := range a.workloadRoutes {
+			cp[k] = v
+		}
+		a.workloadRoutesMu.Unlock()
+		got <- cp
+	}()
+	select {
+	case m := <-got:
+		if _, ok := m["10.100.9.9"]; ok {
+			t.Error("stale route still published to the packet path")
+		}
+	case <-time.After(3 * time.Second):
+		close(release)
+		<-applyDone
+		t.Fatal("workloadRoutesMu held across a hung route command - the " +
+			"userspace tunnel send loop would stall all cross-node traffic")
+	}
+
+	close(release)
+	<-applyDone
+	a.workloadRoutesMu.Lock()
+	defer a.workloadRoutesMu.Unlock()
+	if len(a.workloadRoutes) != 2 {
+		t.Errorf("workloadRoutes = %v, want both desired routes published", a.workloadRoutes)
 	}
 }
 
-func TestRunBoundedCommandPassesThroughSuccess(t *testing.T) {
-	if err := runBoundedCommand(5*time.Second, "true"); err != nil {
-		t.Errorf("a successful command returned %v", err)
+// TestNoUnboundedExecCommand is a lint-style guard. Every one-shot command
+// must go through command.go's bounded helpers: an unbounded exec stalls its
+// caller forever when the child hangs, and if that caller holds a lock -
+// as the route path did - it takes the control plane with it.
+//
+// The allowlist is long-running processes that are Start()ed and supervised
+// (a deadline would kill a healthy daemon or an operator's shell) and the
+// self-update's fire-and-forget last resort, which is never waited on.
+func TestNoUnboundedExecCommand(t *testing.T) {
+	allowed := map[string][]string{
+		"cloudflared.go":          {`exec.Command("cloudflared"`},
+		"cloudflared_watchdog.go": {`exec.Command("cloudflared"`},
+		"warp.go":                 {`exec.Command("warp-svc"`},
+		"handlers_terminal.go":    {`exec.Command("docker", "exec", "-i", "-t"`, `exec.Command("/usr/bin/nsenter"`, `exec.Command(shell)`},
+		"handlers_nodes.go":       {`exec.Command("docker", "stop", "-t", "5"`, `exec.Command("docker", "start"`},
 	}
-	if err := runBoundedCommand(5*time.Second, "false"); err == nil {
-		t.Error("a failing command returned no error")
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
 	}
-}
-
-// TestRoutePathUsesBoundedCommands is a lint-style guard. The route path is
-// the one that used to run under stateMu; an unbounded exec reintroduced here
-// would stall reconciliation indefinitely even now that the lock is released.
-func TestRoutePathUsesBoundedCommands(t *testing.T) {
-	for _, name := range []string{"routereconcile.go", "routes.go"} {
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
 		src, err := os.ReadFile(filepath.Clean(name))
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
+	lines:
 		for i, line := range strings.Split(string(src), "\n") {
 			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "//") {
+			if strings.HasPrefix(trimmed, "//") || !strings.Contains(line, "exec.Command(") {
 				continue
 			}
-			// exec.CommandContext inside runBoundedCommand is the sanctioned form.
-			if strings.Contains(line, "exec.Command(") {
-				t.Errorf("%s:%d uses an unbounded exec.Command on the route path; "+
-					"use runBoundedCommand so a stuck child cannot stall reconciliation:\n  %s",
-					name, i+1, trimmed)
+			for _, ok := range allowed[name] {
+				if strings.Contains(line, ok) {
+					continue lines
+				}
 			}
+			t.Errorf("%s:%d uses an unbounded exec.Command; use runCmd / "+
+				"runCmdOutput / runCmdCombined / boundedCommand (command.go) so a "+
+				"stuck child cannot stall its caller:\n  %s", name, i+1, trimmed)
 		}
 	}
 }

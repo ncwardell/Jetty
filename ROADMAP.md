@@ -221,6 +221,16 @@ mount hangs and 10–15s stalls on ~21% of public requests.
       alongside a high goroutine count means wedged rather than busy, and it
       says so in a `diagnosis` field.
 
+      **Revised 2026-11-18: there is now one watchdog goroutine.** Radxa wedged
+      (stateMu write-held by an `ip` exec with no timeout), `/api/livez` said
+      200 the whole time, and nothing acted - being diagnosable is not enough
+      when nobody is looking. `wedge.go` polls `TryRLock` every 10s (bounded
+      2s, no goroutine per probe); after `JETTY_WEDGE_RESTART_AFTER` (3m) of
+      continuous failure it dumps all goroutine stacks and exits so Docker
+      restarts the agent. It skips `Stop()` on purpose: that would block on the
+      same lock and its graceful drain would hand our workloads to peers.
+      `/api/livez` now returns 503 once wedged.
+
 - [x] **`updateHosts` no longer holds a lock across file I/O.** Same shape as
       the route deadlock, one hop further round: it held `stateMu.RLock()`
       across `os.ReadFile`/`os.WriteFile` from 16 call sites. A read lock does

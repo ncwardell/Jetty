@@ -640,6 +640,14 @@ definitions:
       configured:
         example: true
         type: boolean
+      readiness:
+        additionalProperties: true
+        description: |-
+          Readiness is what cloudflared's own /ready endpoint last reported:
+          running, ready, ready_connections, last_ready, last_probe,
+          watchdog_restarts. running=true with ready=false means the process is
+          up but holds no edge connections.
+        type: object
       running:
         example: true
         type: boolean
@@ -660,6 +668,17 @@ definitions:
         items:
           type: string
         type: array
+      auto_failover:
+        description: |-
+          AutoFailover is the per-workload failover switch, layered under
+          Revive (revive=false still disables failover entirely):
+            nil   - default policy: stateless fails over after FailoverGracePeriod,
+                    stateful after JETTY_STATEFUL_FAILOVER_GRACE.
+            false - never claimed automatically when the owner looks dead; an
+                    operator moves it.
+            true  - fail over on the normal short grace even if stateful (the
+                    operator accepts starting from the last backup).
+        type: boolean
       autostart:
         description: Auto-start when Jetty starts up
         type: boolean
@@ -694,6 +713,14 @@ definitions:
       revive:
         description: Auto-failover to another node if owner dies
         type: boolean
+      stateful:
+        description: |-
+          Stateful overrides stateful-workload detection (failover_policy.go).
+          nil = detect from the compose file (named/anonymous volumes or a
+          writable bind mount mean stateful). Stateful workloads only fail over
+          after JETTY_STATEFUL_FAILOVER_GRACE, and losing ownership stops them
+          instead of deleting their volumes.
+        type: boolean
       tags:
         description: |-
           Tags group workloads for filtering and bulk operations (start
@@ -716,6 +743,12 @@ definitions:
         items:
           type: string
         type: array
+      auto_failover:
+        description: |-
+          AutoFailover: omit for the default policy; false = never fail over
+          automatically; true = fail over on the short grace even if stateful.
+        example: false
+        type: boolean
       autostart:
         example: true
         type: boolean
@@ -746,6 +779,13 @@ definitions:
       registry_auth:
         $ref: '#/definitions/agent.RegistryAuth'
       revive:
+        example: true
+        type: boolean
+      stateful:
+        description: |-
+          Stateful overrides detection from the compose file (volumes or
+          writable bind mounts = stateful). Stateful workloads fail over only
+          after JETTY_STATEFUL_FAILOVER_GRACE (default 1h).
         example: true
         type: boolean
     type: object
@@ -1129,17 +1169,24 @@ paths:
       - internal
   /livez:
     get:
-      description: 'Answers without taking any lock, so it still responds when the
-        agent''s state mutex is held by a stuck writer - the one failure mode /api/health
+      description: Answers without taking any lock, so it still responds when the
+        agent's state mutex is held by a stuck writer - the one failure mode /api/health
         cannot report, because it takes that lock itself. `state_lock_acquirable`
-        false alongside a high `goroutines` count means the control plane is wedged
-        rather than merely busy. Unauthenticated and free: no background work, nothing
-        runs until this is called.'
+        false alongside a high `goroutines` count, or `state_lock_unacquirable_seconds`
+        past a minute, means the control plane is wedged rather than merely busy;
+        the response is then HTTP 503 (same body, alive=false) so external health
+        checks can act on it. The agent restarts itself after `wedge_restart_after_seconds`
+        of that. Unauthenticated; the handler takes no lock.
       produces:
       - application/json
       responses:
         "200":
           description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: Control plane WEDGED (same body, alive=false)
           schema:
             additionalProperties: true
             type: object

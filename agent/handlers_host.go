@@ -3,7 +3,6 @@ package agent
 import (
 	"io"
 	"net/http"
-	"os/exec"
 	"sort"
 	"strings"
 )
@@ -119,7 +118,7 @@ const hostContainersFormat = `{{.ID}}` + "\t" +
 // Excludes the Jetty agent's own container (we don't need to surface
 // ourselves in a list that's meant for showing "what else is running").
 func (a *Agent) listHostContainers() ([]HostContainer, error) {
-	out, err := exec.Command("docker", "ps", "-a", "--no-trunc", "--format", hostContainersFormat).Output()
+	out, err := runCmdOutput(dockerQueryTimeout, "docker", "ps", "-a", "--no-trunc", "--format", hostContainersFormat)
 	if err != nil {
 		return nil, err
 	}
