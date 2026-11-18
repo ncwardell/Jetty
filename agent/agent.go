@@ -193,6 +193,11 @@ func (a *Agent) Start() error {
 	// Record start time for uptime tracking
 	a.startTime = time.Now()
 
+	// First goroutine up, so a wedge anywhere in startup is covered too. It
+	// restarts the agent (exit, Docker's restart policy brings it back) if
+	// stateMu stays unacquirable for JETTY_WEDGE_RESTART_AFTER. See wedge.go.
+	goSupervised("wedgeWatchdogLoop", a.wedgeWatchdogLoop)
+
 	// Warn if the node has no admin key configured AND no peers (i.e.
 	// fresh first-ever node and JETTY_SECRET wasn't set). On a joiner
 	// the admin key arrives in the join response, so JETTY_SECRET on

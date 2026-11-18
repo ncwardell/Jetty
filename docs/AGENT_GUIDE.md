@@ -376,6 +376,7 @@ Set on the `docker run`/compose of the **agent** container itself (not workloads
 | `JETTY_TUNNEL_DOMAIN` | — | Cluster's Cloudflare tunnel domain. |
 | `JETTY_TUNNEL_HOST` | — | This node's tunnel subdomain. |
 | `JETTY_CF_TOKEN` | — | Cloudflare tunnel token (usually delivered via join). |
+| `JETTY_WEDGE_RESTART_AFTER` | `3m` | Exit (code 3, after a goroutine dump to `<data>/wedge-dumps/`) when stateMu stays unacquirable this long, so Docker restarts the agent. Workloads keep running. `0` = report only (`/api/livez` → 503). |
 | `JETTY_CF_READY_RESTART_AFTER` | `3m` | Kill + respawn cloudflared when it has had zero edge connections this long. `0` = report only. |
 | `JETTY_CF_METRICS_ADDR` | `127.0.0.1:46880` | Where cloudflared serves `/ready` for the watchdog. |
 | `JETTY_WARP_CONNECTOR_TOKEN` | — | Per-node Cloudflare Mesh node token. One per machine — a shared token makes Cloudflare register nodes as active-passive replicas of one identity (mesh breaks). Env overrides state; join-delivered shared token is only a fallback. |

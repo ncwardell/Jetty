@@ -1137,17 +1137,24 @@ paths:
       - internal
   /livez:
     get:
-      description: 'Answers without taking any lock, so it still responds when the
-        agent''s state mutex is held by a stuck writer - the one failure mode /api/health
+      description: Answers without taking any lock, so it still responds when the
+        agent's state mutex is held by a stuck writer - the one failure mode /api/health
         cannot report, because it takes that lock itself. `state_lock_acquirable`
-        false alongside a high `goroutines` count means the control plane is wedged
-        rather than merely busy. Unauthenticated and free: no background work, nothing
-        runs until this is called.'
+        false alongside a high `goroutines` count, or `state_lock_unacquirable_seconds`
+        past a minute, means the control plane is wedged rather than merely busy;
+        the response is then HTTP 503 (same body, alive=false) so external health
+        checks can act on it. The agent restarts itself after `wedge_restart_after_seconds`
+        of that. Unauthenticated; the handler takes no lock.
       produces:
       - application/json
       responses:
         "200":
           description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: Control plane WEDGED (same body, alive=false)
           schema:
             additionalProperties: true
             type: object

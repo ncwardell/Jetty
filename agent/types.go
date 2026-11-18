@@ -435,6 +435,14 @@ type Agent struct {
 	cfReadyMu sync.Mutex
 
 	// Runtime
+	// lockUnacquirableSince is UnixNano of the first failed wedge-watchdog
+	// probe in the current run of failures, 0 while stateMu is healthy.
+	// Atomic so /api/livez reads it without a lock. See wedge.go.
+	lockUnacquirableSince atomic.Int64
+	// wedgeThreshold is the effective JETTY_WEDGE_RESTART_AFTER (as a
+	// time.Duration), published for /api/livez; 0 = self-restart disabled.
+	wedgeThreshold atomic.Int64
+
 	startTime           time.Time // When Jetty started (for uptime tracking)
 	lastHeartbeatErrLog time.Time // Last time we logged a heartbeat error (to reduce spam)
 	publicIP            string    // Cached public IP (set at startup to avoid slow lookups)
