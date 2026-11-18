@@ -256,10 +256,11 @@ func TestApplyRoutesDoesNotHoldRouteMapAcrossExec(t *testing.T) {
 // self-update's fire-and-forget last resort, which is never waited on.
 func TestNoUnboundedExecCommand(t *testing.T) {
 	allowed := map[string][]string{
-		"cloudflared.go":       {`exec.Command("cloudflared"`},
-		"warp.go":              {`exec.Command("warp-svc"`},
-		"handlers_terminal.go": {`exec.Command("docker", "exec", "-i", "-t"`, `exec.Command("/usr/bin/nsenter"`, `exec.Command(shell)`},
-		"handlers_nodes.go":    {`exec.Command("docker", "stop", "-t", "5"`, `exec.Command("docker", "start"`},
+		"cloudflared.go":          {`exec.Command("cloudflared"`},
+		"cloudflared_watchdog.go": {`exec.Command("cloudflared"`},
+		"warp.go":                 {`exec.Command("warp-svc"`},
+		"handlers_terminal.go":    {`exec.Command("docker", "exec", "-i", "-t"`, `exec.Command("/usr/bin/nsenter"`, `exec.Command(shell)`},
+		"handlers_nodes.go":       {`exec.Command("docker", "stop", "-t", "5"`, `exec.Command("docker", "start"`},
 	}
 	entries, err := os.ReadDir(".")
 	if err != nil {
