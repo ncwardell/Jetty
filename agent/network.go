@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -81,11 +81,11 @@ func (a *Agent) initNetwork() error {
 	// Create dummy interface for workload IPs
 	// Workloads get IPs from serviceCIDR (10.100.x.x) that are routed via WARP
 	// This interface is where those IPs are bound so traffic can be DNATed to containers
-	exec.Command("ip", "link", "del", "jetty0").Run() // Clean up any existing
-	if err := exec.Command("ip", "link", "add", "dev", "jetty0", "type", "dummy").Run(); err != nil {
+	runCmd(hostCommandTimeout, "ip", "link", "del", "jetty0") // Clean up any existing
+	if err := runCmd(hostCommandTimeout, "ip", "link", "add", "dev", "jetty0", "type", "dummy"); err != nil {
 		return fmt.Errorf("create dummy interface for workload IPs: %w", err)
 	}
-	exec.Command("ip", "link", "set", "up", "dev", "jetty0").Run()
+	runCmd(hostCommandTimeout, "ip", "link", "set", "up", "dev", "jetty0")
 
 	// Enable IP forwarding so the host can route between Docker bridges,
 	// the jetty0 dummy interface, and the IPIP/GRE/userspace tunnels.
@@ -164,8 +164,8 @@ func (a *Agent) initNetwork() error {
 // every 60s with verbose=false.
 func (a *Agent) applyMeshIptablesRules(verbose bool) {
 	// FORWARD: -d serviceCIDR ACCEPT  (rule slot 1)
-	if err := exec.Command("iptables", "-C", "FORWARD", "-d", a.serviceCIDR, "-j", "ACCEPT").Run(); err != nil {
-		if err := exec.Command("iptables", "-I", "FORWARD", "1", "-d", a.serviceCIDR, "-j", "ACCEPT").Run(); err != nil {
+	if err := runCmd(hostCommandTimeout, "iptables", "-C", "FORWARD", "-d", a.serviceCIDR, "-j", "ACCEPT"); err != nil {
+		if err := runCmd(hostCommandTimeout, "iptables", "-I", "FORWARD", "1", "-d", a.serviceCIDR, "-j", "ACCEPT"); err != nil {
 			if verbose {
 				logWarnf("failed to add FORWARD ACCEPT (dst=%s): %v", a.serviceCIDR, err)
 			}
@@ -175,8 +175,8 @@ func (a *Agent) applyMeshIptablesRules(verbose bool) {
 	}
 
 	// FORWARD: -s serviceCIDR ACCEPT  (rule slot 2)
-	if err := exec.Command("iptables", "-C", "FORWARD", "-s", a.serviceCIDR, "-j", "ACCEPT").Run(); err != nil {
-		if err := exec.Command("iptables", "-I", "FORWARD", "2", "-s", a.serviceCIDR, "-j", "ACCEPT").Run(); err != nil {
+	if err := runCmd(hostCommandTimeout, "iptables", "-C", "FORWARD", "-s", a.serviceCIDR, "-j", "ACCEPT"); err != nil {
+		if err := runCmd(hostCommandTimeout, "iptables", "-I", "FORWARD", "2", "-s", a.serviceCIDR, "-j", "ACCEPT"); err != nil {
 			if verbose {
 				logWarnf("failed to add FORWARD ACCEPT (src=%s): %v", a.serviceCIDR, err)
 			}
@@ -186,8 +186,8 @@ func (a *Agent) applyMeshIptablesRules(verbose bool) {
 	}
 
 	// nat POSTROUTING: -d serviceCIDR MASQUERADE
-	if err := exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING", "-d", a.serviceCIDR, "-j", "MASQUERADE").Run(); err != nil {
-		if err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-d", a.serviceCIDR, "-j", "MASQUERADE").Run(); err != nil {
+	if err := runCmd(hostCommandTimeout, "iptables", "-t", "nat", "-C", "POSTROUTING", "-d", a.serviceCIDR, "-j", "MASQUERADE"); err != nil {
+		if err := runCmd(hostCommandTimeout, "iptables", "-t", "nat", "-A", "POSTROUTING", "-d", a.serviceCIDR, "-j", "MASQUERADE"); err != nil {
 			if verbose {
 				logWarnf("failed to add MASQUERADE for container-to-mesh traffic: %v", err)
 			}
@@ -220,25 +220,25 @@ func (a *Agent) iptablesMaintenanceLoop() {
 func (a *Agent) detectTunnelMode() string {
 	// Try to load kernel modules (requires CAP_SYS_MODULE or running as root)
 	// This is often needed in containers where modules aren't auto-loaded
-	exec.Command("modprobe", "ipip").Run()
-	exec.Command("modprobe", "ip_gre").Run()
+	runCmd(hostCommandTimeout, "modprobe", "ipip")
+	runCmd(hostCommandTimeout, "modprobe", "ip_gre")
 
 	testName := "jetty_tun_test"
-	exec.Command("ip", "tunnel", "del", testName).Run() // Clean up any existing
+	runCmd(hostCommandTimeout, "ip", "tunnel", "del", testName) // Clean up any existing
 
 	// Try IPIP first (most efficient)
-	err := exec.Command("ip", "tunnel", "add", testName, "mode", "ipip",
-		"local", "127.0.0.1", "remote", "127.0.0.2").Run()
+	err := runCmd(hostCommandTimeout, "ip", "tunnel", "add", testName, "mode", "ipip",
+		"local", "127.0.0.1", "remote", "127.0.0.2")
 	if err == nil {
-		exec.Command("ip", "tunnel", "del", testName).Run()
+		runCmd(hostCommandTimeout, "ip", "tunnel", "del", testName)
 		return "ipip"
 	}
 
 	// Try GRE as fallback (uses different kernel module)
-	err = exec.Command("ip", "tunnel", "add", testName, "mode", "gre",
-		"local", "127.0.0.1", "remote", "127.0.0.2").Run()
+	err = runCmd(hostCommandTimeout, "ip", "tunnel", "add", testName, "mode", "gre",
+		"local", "127.0.0.1", "remote", "127.0.0.2")
 	if err == nil {
-		exec.Command("ip", "tunnel", "del", testName).Run()
+		runCmd(hostCommandTimeout, "ip", "tunnel", "del", testName)
 		logInfof("Using GRE tunnels for cross-node routing (IPIP unavailable)")
 		return "gre"
 	}
@@ -257,20 +257,20 @@ func (a *Agent) initWarpRules() error {
 	a.cleanupWarpRules()
 
 	// Create Jetty's own nft table for our rules (easier to clean up)
-	exec.Command("nft", "add", "table", "ip", "jetty").Run()
-	exec.Command("nft", "add", "chain", "ip", "jetty", "postrouting",
-		"{ type nat hook postrouting priority srcnat; }").Run()
+	runCmd(hostCommandTimeout, "nft", "add", "table", "ip", "jetty")
+	runCmd(hostCommandTimeout, "nft", "add", "chain", "ip", "jetty", "postrouting",
+		"{ type nat hook postrouting priority srcnat; }")
 
 	// Add masquerade rule for traffic going out through CloudflareWARP
 	// This ensures responses from our mesh IPs route back through WARP
-	if err := exec.Command("nft", "add", "rule", "ip", "jetty", "postrouting",
-		"oifname", "CloudflareWARP", "masquerade").Run(); err != nil {
+	if err := runCmd(hostCommandTimeout, "nft", "add", "rule", "ip", "jetty", "postrouting",
+		"oifname", "CloudflareWARP", "masquerade"); err != nil {
 		logWarnf("failed to add WARP masquerade rule: %v", err)
 	}
 
 	// Add route for WARP client IP range to CloudflareWARP interface
 	// This ensures we can reach other WARP clients
-	exec.Command("ip", "route", "add", "100.96.0.0/12", "dev", "CloudflareWARP").Run()
+	runCmd(hostCommandTimeout, "ip", "route", "add", "100.96.0.0/12", "dev", "CloudflareWARP")
 
 	// WARP installs a default-DROP firewall that breaks SSH, git, cloudflared,
 	// etc. We only need WARP for routing to the mesh CIDR, not for firewalling,
@@ -280,9 +280,9 @@ func (a *Agent) initWarpRules() error {
 	// operator owns it. Don't touch their firewall - they may depend on it.
 	if a.warpPreexisting {
 		logInfof("Leaving WARP firewall table alone (WARP was pre-existing)")
-	} else if _, err := exec.Command("nft", "list", "table", "inet", "cloudflare-warp").Output(); err == nil {
+	} else if _, err := runCmdOutput(hostCommandTimeout, "nft", "list", "table", "inet", "cloudflare-warp"); err == nil {
 		logInfof("Removing WARP firewall table (routing still works without it)...")
-		if err := exec.Command("nft", "delete", "table", "inet", "cloudflare-warp").Run(); err != nil {
+		if err := runCmd(hostCommandTimeout, "nft", "delete", "table", "inet", "cloudflare-warp"); err != nil {
 			logWarnf("failed to delete cloudflare-warp table: %v", err)
 		} else {
 			logInfof("WARP firewall table removed")
@@ -296,7 +296,7 @@ func (a *Agent) initWarpRules() error {
 // cleanupWarpRules removes all Jetty nftables rules
 func (a *Agent) cleanupWarpRules() {
 	// Delete our entire table - this removes all our rules cleanly
-	exec.Command("nft", "delete", "table", "ip", "jetty").Run()
+	runCmd(hostCommandTimeout, "nft", "delete", "table", "ip", "jetty")
 }
 
 // =============================================================================
@@ -320,52 +320,124 @@ func (a *Agent) cleanupWarpRules() {
 // workloads we route to.
 
 // ensurePeerTunnel creates a kernel tunnel to a peer if one doesn't already
-// exist with the right remote. Idempotent: cheap to call repeatedly.
+// exist with the right endpoints. Idempotent: cheap to call repeatedly.
 //
-// Returns nil if there's no work to do (peer has no IP, or we have no
-// tunnel mode). Returns the underlying `ip tunnel` error if creation
+// Locking contract: must be called with stateMu NOT held - it takes
+// stateMu.RLock itself to re-read the peer, and it execs `ip` up to four
+// times. Holding stateMu across those execs is what froze the control plane
+// (see command.go); calling this under stateMu.Lock would now also
+// self-deadlock, which is deliberate - it fails loudly in tests instead of
+// intermittently in production.
+//
+// Callers pass the address they saw, but by the time we run it may be stale:
+// the caller snapshotted state and released the lock, and gossip may have
+// moved the peer (WARP renumbering) or removed it meanwhile. So under the
+// per-peer tunnel lock we re-read the peer and program its *current*
+// address, or do nothing if it is gone. Without the per-peer serialization
+// two ensures racing with different addresses could interleave show/del/add
+// and leave the tunnel pointing at whichever address lost the race.
+//
+// Returns nil if there's no work to do (peer has no IP, was removed, or we
+// have no tunnel mode). Returns the underlying `ip tunnel` error if creation
 // fails - callers log and continue.
 func (a *Agent) ensurePeerTunnel(peerID, peerIP string) error {
-	if a.warpIP() == "" || peerIP == "" {
+	// tunnelMode is fixed by setupNetwork before any caller can run.
+	if a.tunnelMode == "" {
+		return nil // no kernel tunnel mode (modules not loaded)
+	}
+
+	mu := a.peerTunnelLock(peerID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	a.stateMu.RLock()
+	peer, known := a.state.Peers[peerID]
+	if known && peer.IP != "" {
+		peerIP = peer.IP // latest wins over the caller's snapshot
+	}
+	a.stateMu.RUnlock()
+	if !known {
+		return nil // removed since the caller looked; removePeerTunnel owns teardown
+	}
+
+	localIP := a.warpIP()
+	if localIP == "" || peerIP == "" {
 		return nil // Can't create tunnel without IPs
 	}
 
-	// Skip if no tunnel mode available (kernel modules not loaded)
-	if a.tunnelMode == "" {
-		return nil
-	}
-
 	// Tunnel name based on peer ID (truncated for interface name limit)
-	tunName := "tun_" + shortID(peerID, 8)
+	tunName := a.getTunnelName(peerID)
 
-	// Check if tunnel already exists with correct config
-	out, _ := runBoundedOutput(routeCommandTimeout, "ip", "tunnel", "show", tunName)
-	if strings.Contains(string(out), peerIP) {
-		return nil // Tunnel exists with correct remote
+	// Check if tunnel already exists with correct config. Both endpoints
+	// matter: the local address is baked into the encapsulation header, so a
+	// tunnel built before a WARP renumber has the right remote and still
+	// sends packets the peer will not accept.
+	out, _ := routeCommandOutput(routeCommandTimeout, "ip", "tunnel", "show", tunName)
+	if tunnelEndpointsMatch(string(out), localIP, peerIP) {
+		return nil
 	}
 
 	// Delete existing tunnel if it has wrong config
 	routeCommandRunner(routeCommandTimeout, "ip", "tunnel", "del", tunName)
 
 	// Create tunnel using detected mode (ipip or gre): local=our WARP IP, remote=peer's WARP IP
-	if out, err := runBoundedOutput(routeCommandTimeout, "ip", "tunnel", "add", tunName,
-		"mode", a.tunnelMode, "local", a.warpIP(), "remote", peerIP); err != nil {
-		return fmt.Errorf("create %s tunnel to %s: %s", a.tunnelMode, peerIP, strings.TrimSpace(string(out)))
+	if out, err := routeCommandOutput(routeCommandTimeout, "ip", "tunnel", "add", tunName,
+		"mode", a.tunnelMode, "local", localIP, "remote", peerIP); err != nil {
+		return fmt.Errorf("create %s tunnel to %s: %s (%v)", a.tunnelMode, peerIP, strings.TrimSpace(string(out)), err)
 	}
 
 	// Bring up the tunnel interface
-	if out, err := runBoundedOutput(routeCommandTimeout, "ip", "link", "set", "up", "dev", tunName); err != nil {
+	if out, err := routeCommandOutput(routeCommandTimeout, "ip", "link", "set", "up", "dev", tunName); err != nil {
 		routeCommandRunner(routeCommandTimeout, "ip", "tunnel", "del", tunName)
-		return fmt.Errorf("bring up tunnel %s: %s", tunName, strings.TrimSpace(string(out)))
+		return fmt.Errorf("bring up tunnel %s: %s (%v)", tunName, strings.TrimSpace(string(out)), err)
 	}
 
 	logInfof("Created %s tunnel %s to peer %s (%s)", strings.ToUpper(a.tunnelMode), tunName, shortID(peerID, 8), peerIP)
 	return nil
 }
 
-// removePeerTunnel removes the IPIP tunnel to a peer.
+// tunnelEndpointsMatch reports whether `ip tunnel show <name>` output
+// describes a tunnel with exactly these endpoints, e.g.
+//
+//	tun_ab12cd34: ip/ip remote 100.96.0.2 local 100.96.0.1 ttl inherit
+//
+// Parsed by field rather than substring: "100.96.0.2" is a substring of
+// "100.96.0.21", so the old strings.Contains check could accept a tunnel to
+// the wrong peer, and it ignored the local end entirely, so a WARP renumber
+// never rebuilt anything.
+func tunnelEndpointsMatch(show, localIP, remoteIP string) bool {
+	f := strings.Fields(show)
+	var gotLocal, gotRemote string
+	for i := 0; i+1 < len(f); i++ {
+		switch f[i] {
+		case "local":
+			gotLocal = f[i+1]
+		case "remote":
+			gotRemote = f[i+1]
+		}
+	}
+	return gotRemote == remoteIP && gotLocal == localIP
+}
+
+// peerTunnelLock returns the mutex serializing tunnel programming for one
+// peer. Per peer rather than global so a peer whose `ip` calls are timing
+// out does not hold up tunnels to everyone else. Never held together with
+// stateMu across an exec.
+func (a *Agent) peerTunnelLock(peerID string) *sync.Mutex {
+	mu, _ := a.peerTunnelLocks.LoadOrStore(peerID, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
+
+// removePeerTunnel removes the kernel tunnel to a peer. Must be called with
+// stateMu NOT held, after the peer has been deleted from state: taking the
+// per-peer lock orders it after any in-flight ensurePeerTunnel, and that
+// function's re-read of state stops a later one resurrecting the tunnel.
 func (a *Agent) removePeerTunnel(peerID string) {
-	tunName := "tun_" + shortID(peerID, 8)
+	mu := a.peerTunnelLock(peerID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	tunName := a.getTunnelName(peerID)
 	if err := routeCommandRunner(routeCommandTimeout, "ip", "tunnel", "del", tunName); err == nil {
 		logInfof("Removed tunnel %s", tunName)
 	}

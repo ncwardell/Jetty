@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
@@ -836,7 +835,7 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 // Only inspects the workload's own compose project (label=jetty_<name>).
 // Cheap-ish: one `docker ps` plus one `docker inspect` per container.
 func (a *Agent) computeWorkloadStatus(workloadName string) string {
-	out, err := exec.Command("docker", "ps", "-a", "-q", "-f", "label=com.docker.compose.project=jetty_"+workloadName).Output()
+	out, err := runCmdOutput(dockerQueryTimeout, "docker", "ps", "-a", "-q", "-f", "label=com.docker.compose.project=jetty_"+workloadName)
 	if err != nil {
 		return "unknown"
 	}
@@ -860,8 +859,8 @@ func (a *Agent) computeWorkloadStatus(workloadName string) string {
 		// workloads that use the init/main/sync pattern always show
 		// "unhealthy" because init exits 0 and the dashboard counts it
 		// as a stopped service.
-		inspectOut, err := exec.Command("docker", "inspect", "--format",
-			`{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.HostConfig.RestartPolicy.Name}}|{{.State.ExitCode}}`, id).Output()
+		inspectOut, err := runCmdOutput(dockerQueryTimeout, "docker", "inspect", "--format",
+			`{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.HostConfig.RestartPolicy.Name}}|{{.State.ExitCode}}`, id)
 		if err != nil {
 			anyStopped = true
 			continue
@@ -932,7 +931,7 @@ func (a *Agent) getContainerInfo(workloadName string) []map[string]interface{} {
 	var containers []map[string]interface{}
 
 	// Get container IDs for this project
-	out, err := exec.Command("docker", "ps", "-a", "-q", "-f", "label=com.docker.compose.project=jetty_"+workloadName).Output()
+	out, err := runCmdOutput(dockerQueryTimeout, "docker", "ps", "-a", "-q", "-f", "label=com.docker.compose.project=jetty_"+workloadName)
 	if err != nil || len(out) == 0 {
 		return containers
 	}
@@ -944,7 +943,7 @@ func (a *Agent) getContainerInfo(workloadName string) []map[string]interface{} {
 		}
 
 		// Get detailed container info using docker inspect
-		inspectOut, err := exec.Command("docker", "inspect", "--format", `{{json .}}`, containerID).Output()
+		inspectOut, err := runCmdOutput(dockerQueryTimeout, "docker", "inspect", "--format", `{{json .}}`, containerID)
 		if err != nil {
 			continue
 		}
@@ -1013,7 +1012,7 @@ func (a *Agent) getContainerInfo(workloadName string) []map[string]interface{} {
 		}
 
 		// Get resource usage using docker stats (quick snapshot)
-		statsOut, _ := exec.Command("docker", "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}", containerID).Output()
+		statsOut, _ := runCmdOutput(dockerQueryTimeout, "docker", "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}", containerID)
 		if len(statsOut) > 0 {
 			parts := strings.Split(strings.TrimSpace(string(statsOut)), "|")
 			if len(parts) == 3 {

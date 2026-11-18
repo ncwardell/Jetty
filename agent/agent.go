@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -87,12 +86,12 @@ func New() (*Agent, error) {
 func (a *Agent) cleanupOrphanedState() {
 	// Clean up old Jetty container from previous update
 	// The update process renames the old container to {name}-old before stopping it
-	output, err := exec.Command("docker", "ps", "-a", "--filter", "name=-old$", "--format", "{{.Names}}").CombinedOutput()
+	output, err := runCmdCombined(dockerQueryTimeout, "docker", "ps", "-a", "--filter", "name=-old$", "--format", "{{.Names}}")
 	if err == nil {
 		for _, name := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 			if name != "" && strings.HasSuffix(name, "-old") {
 				logInfof("Removing old container from previous update: %s", name)
-				if err := exec.Command("docker", "rm", "-f", name).Run(); err != nil {
+				if err := runCmd(dockerQueryTimeout, "docker", "rm", "-f", name); err != nil {
 					logWarnf("failed to remove old container %s: %v", name, err)
 				}
 			}
@@ -100,21 +99,21 @@ func (a *Agent) cleanupOrphanedState() {
 	}
 
 	// Check if there's orphaned jetty0 interface from previous run
-	if err := exec.Command("ip", "link", "show", "jetty0").Run(); err == nil {
+	if err := runCmd(hostCommandTimeout, "ip", "link", "show", "jetty0"); err == nil {
 		logInfof("Found orphaned jetty0 interface from previous run, cleaning up...")
-		if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
+		if err := runCmd(hostCommandTimeout, "ip", "link", "del", "jetty0"); err != nil {
 			logWarnf("failed to delete orphaned jetty0 interface: %v", err)
 		}
 	}
 
 	// Clean up any orphaned IPIP tunnels (named tun_*)
-	output, _ = exec.Command("ip", "tunnel", "show").CombinedOutput()
+	output, _ = runCmdCombined(hostCommandTimeout, "ip", "tunnel", "show")
 	for _, line := range strings.Split(string(output), "\n") {
 		if strings.HasPrefix(line, "tun_") {
 			parts := strings.Fields(line)
 			if len(parts) > 0 {
 				tunName := strings.TrimSuffix(parts[0], ":")
-				if err := exec.Command("ip", "tunnel", "del", tunName).Run(); err != nil {
+				if err := runCmd(hostCommandTimeout, "ip", "tunnel", "del", tunName); err != nil {
 					logWarnf("failed to delete orphaned tunnel %s: %v", tunName, err)
 				} else {
 					logInfof("Cleaned up orphaned tunnel: %s", tunName)
@@ -130,7 +129,7 @@ func (a *Agent) cleanupOrphanedState() {
 	if err != nil {
 		logWarnf("invalid service CIDR %q, skipping orphaned route cleanup: %v", a.serviceCIDR, err)
 	} else {
-		output, _ = exec.Command("ip", "route", "show").CombinedOutput()
+		output, _ = runCmdCombined(hostCommandTimeout, "ip", "route", "show")
 		for _, line := range strings.Split(string(output), "\n") {
 			line = strings.TrimSpace(line)
 			if !strings.Contains(line, "/32") {
@@ -144,7 +143,7 @@ func (a *Agent) cleanupOrphanedState() {
 			if err != nil || ipStr == nil || !svcNet.Contains(ipStr) {
 				continue
 			}
-			if err := exec.Command("ip", "route", "del", parts[0]).Run(); err != nil {
+			if err := runCmd(hostCommandTimeout, "ip", "route", "del", parts[0]); err != nil {
 				logWarnf("failed to delete orphaned route %s: %v", parts[0], err)
 			} else {
 				logInfof("Cleaned up orphaned route: %s", parts[0])
@@ -155,7 +154,7 @@ func (a *Agent) cleanupOrphanedState() {
 	// Clean up any orphaned nftables rules from previous runs
 	// Delete our jetty table if it exists (will be recreated in initWarpRules)
 	// Ignore error as table may not exist
-	_ = exec.Command("nft", "delete", "table", "ip", "jetty").Run()
+	_ = runCmd(hostCommandTimeout, "nft", "delete", "table", "ip", "jetty")
 
 	// Also clean up any old-style masquerade rules left in the main nat table
 	// These were added before we moved to using our own table
@@ -165,7 +164,7 @@ func (a *Agent) cleanupOrphanedState() {
 // cleanupLegacyNftRules removes old masquerade rules that were added directly to nat POSTROUTING
 func (a *Agent) cleanupLegacyNftRules() {
 	// Get all rules in nat POSTROUTING chain and remove CloudflareWARP masquerade rules
-	output, err := exec.Command("nft", "-a", "list", "chain", "ip", "nat", "POSTROUTING").CombinedOutput()
+	output, err := runCmdCombined(hostCommandTimeout, "nft", "-a", "list", "chain", "ip", "nat", "POSTROUTING")
 	if err != nil {
 		return // Chain might not exist
 	}
@@ -178,7 +177,7 @@ func (a *Agent) cleanupLegacyNftRules() {
 			if len(parts) == 2 {
 				handle := strings.TrimSpace(parts[1])
 				if handle != "" {
-					if err := exec.Command("nft", "delete", "rule", "ip", "nat", "POSTROUTING", "handle", handle).Run(); err != nil {
+					if err := runCmd(hostCommandTimeout, "nft", "delete", "rule", "ip", "nat", "POSTROUTING", "handle", handle); err != nil {
 						logWarnf("failed to delete legacy nft rule handle %s: %v", handle, err)
 					} else {
 						logInfof("Cleaned up legacy nft rule handle %s", handle)
@@ -491,44 +490,63 @@ func (a *Agent) gracefulDrain() {
 func (a *Agent) cleanupNetwork() {
 	logInfof("Cleaning up network resources...")
 
-	// Clean up workload routes first
+	// Clean up workload routes first. Swap the map out under the lock and
+	// exec with it released, same as everywhere else.
 	a.workloadRoutesMu.Lock()
-	for wlIP := range a.workloadRoutes {
-		exec.Command("ip", "route", "del", wlIP+"/32").Run()
-		logInfof("Removed route for %s", wlIP)
-	}
+	staleRoutes := a.workloadRoutes
 	a.workloadRoutes = make(map[string]string)
 	a.workloadRoutesMu.Unlock()
+	for wlIP := range staleRoutes {
+		runCmd(hostCommandTimeout, "ip", "route", "del", wlIP+"/32")
+		logInfof("Removed route for %s", wlIP)
+	}
+
+	// Snapshot what teardown needs, then release stateMu before any exec.
+	// This used to hold the read lock across a tunnel delete per peer plus
+	// two docker calls and two iptables calls per local workload - minutes of
+	// stateMu if docker is slow, and a queued writer (gossip, a late API
+	// request during shutdown) would then block every reader behind it.
+	type localWorkload struct{ name, ip string }
+	a.stateMu.RLock()
+	peerIDs := make([]string, 0, len(a.state.Peers))
+	for _, peer := range a.state.Peers {
+		peerIDs = append(peerIDs, peer.ID)
+	}
+	var localWls []localWorkload
+	for _, wl := range a.state.Workloads {
+		if wl.Owner == a.hwid {
+			localWls = append(localWls, localWorkload{name: wl.Name, ip: wl.IP})
+		}
+	}
+	a.stateMu.RUnlock()
 
 	// Clean up IPIP tunnels to peers
-	a.stateMu.RLock()
-	for _, peer := range a.state.Peers {
-		tunName := a.getTunnelName(peer.ID)
-		if err := exec.Command("ip", "tunnel", "del", tunName).Run(); err == nil {
+	for _, peerID := range peerIDs {
+		tunName := a.getTunnelName(peerID)
+		if err := runCmd(hostCommandTimeout, "ip", "tunnel", "del", tunName); err == nil {
 			logInfof("Removed tunnel %s", tunName)
 		}
 	}
 
-	// Clean up iptables rules for all workloads
-	for _, wl := range a.state.Workloads {
-		if wl.Owner == a.hwid {
-			// Find container IP and remove DNAT rules
-			out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
-			if len(out) > 0 {
-				containerID := strings.Split(strings.TrimSpace(string(out)), "\n")[0]
-				if containerID != "" {
-					out, _ = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID).Output()
-					containerIP := strings.TrimSpace(string(out))
-					if containerIP != "" {
-						exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run()
-						exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run()
-						logInfof("Removed iptables rules for %s (%s -> %s)", wl.Name, wl.IP, containerIP)
-					}
-				}
-			}
+	// Clean up iptables rules for all local workloads
+	for _, wl := range localWls {
+		// Find container IP and remove DNAT rules
+		out, _ := runCmdOutput(dockerQueryTimeout, "docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.name)
+		if len(out) == 0 {
+			continue
+		}
+		containerID := strings.Split(strings.TrimSpace(string(out)), "\n")[0]
+		if containerID == "" {
+			continue
+		}
+		out, _ = runCmdOutput(dockerQueryTimeout, "docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID)
+		containerIP := strings.TrimSpace(string(out))
+		if containerIP != "" {
+			runCmd(hostCommandTimeout, "iptables", "-t", "nat", "-D", "PREROUTING", "-d", wl.ip, "-j", "DNAT", "--to", containerIP)
+			runCmd(hostCommandTimeout, "iptables", "-t", "nat", "-D", "OUTPUT", "-d", wl.ip, "-j", "DNAT", "--to", containerIP)
+			logInfof("Removed iptables rules for %s (%s -> %s)", wl.name, wl.ip, containerIP)
 		}
 	}
-	a.stateMu.RUnlock()
 
 	// Clean up userspace tunnel if active
 	a.cleanupUserspaceTunnel()
@@ -537,7 +555,7 @@ func (a *Agent) cleanupNetwork() {
 	a.cleanupWarpRules()
 
 	// Remove jetty0 interface (this also removes all IPs bound to it)
-	if err := exec.Command("ip", "link", "del", "jetty0").Run(); err != nil {
+	if err := runCmd(hostCommandTimeout, "ip", "link", "del", "jetty0"); err != nil {
 		logWarnf("could not remove jetty0 interface: %v", err)
 	} else {
 		logInfof("Removed jetty0 interface")
@@ -552,7 +570,7 @@ func (a *Agent) cleanupNetwork() {
 
 	// Disconnect WARP (don't delete registration - state is persisted in /data/warp and reused on restart)
 	logInfof("Disconnecting WARP...")
-	if output, err := exec.Command("warp-cli", "--accept-tos", "disconnect").CombinedOutput(); err != nil {
+	if output, err := runCmdCombined(warpCLITimeout, "warp-cli", "--accept-tos", "disconnect"); err != nil {
 		logInfof("WARP disconnect: %v (%s)", err, strings.TrimSpace(string(output)))
 	} else {
 		logInfof("WARP disconnected")
@@ -561,9 +579,9 @@ func (a *Agent) cleanupNetwork() {
 
 	// Clean up WARP network modifications (important for --net host mode)
 	// These persist on the host after container stops, breaking SSH/git
-	exec.Command("ip", "link", "delete", "CloudflareWARP").Run()
-	exec.Command("nft", "delete", "table", "inet", "cloudflare-warp").Run()
-	exec.Command("ip", "route", "del", "100.96.0.0/12").Run()
+	runCmd(hostCommandTimeout, "ip", "link", "delete", "CloudflareWARP")
+	runCmd(hostCommandTimeout, "nft", "delete", "table", "inet", "cloudflare-warp")
+	runCmd(hostCommandTimeout, "ip", "route", "del", "100.96.0.0/12")
 	logInfof("Removed WARP network modifications")
 }
 
