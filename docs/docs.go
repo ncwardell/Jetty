@@ -2786,6 +2786,10 @@ const docTemplate = `{
                         "type": "string"
                     }
                 },
+                "auto_failover": {
+                    "description": "AutoFailover is the per-workload failover switch, layered under\nRevive (revive=false still disables failover entirely):\n  nil   - default policy: stateless fails over after FailoverGracePeriod,\n          stateful after JETTY_STATEFUL_FAILOVER_GRACE.\n  false - never claimed automatically when the owner looks dead; an\n          operator moves it.\n  true  - fail over on the normal short grace even if stateful (the\n          operator accepts starting from the last backup).",
+                    "type": "boolean"
+                },
                 "autostart": {
                     "description": "Auto-start when Jetty starts up",
                     "type": "boolean"
@@ -2826,6 +2830,10 @@ const docTemplate = `{
                     "description": "Auto-failover to another node if owner dies",
                     "type": "boolean"
                 },
+                "stateful": {
+                    "description": "Stateful overrides stateful-workload detection (failover_policy.go).\nnil = detect from the compose file (named/anonymous volumes or a\nwritable bind mount mean stateful). Stateful workloads only fail over\nafter JETTY_STATEFUL_FAILOVER_GRACE, and losing ownership stops them\ninstead of deleting their volumes.",
+                    "type": "boolean"
+                },
                 "tags": {
                     "description": "Tags group workloads for filtering and bulk operations (start\nall tagged \"media\", export all tagged \"prod\", etc.). Free-form\nstrings; validated with validTagPattern. Sorted+deduped on\ningest so the wire form is canonical.",
                     "type": "array",
@@ -2851,6 +2859,11 @@ const docTemplate = `{
                         "node1",
                         "node2"
                     ]
+                },
+                "auto_failover": {
+                    "description": "AutoFailover: omit for the default policy; false = never fail over\nautomatically; true = fail over on the short grace even if stateful.",
+                    "type": "boolean",
+                    "example": false
                 },
                 "autostart": {
                     "type": "boolean",
@@ -2880,6 +2893,11 @@ const docTemplate = `{
                     "$ref": "#/definitions/agent.RegistryAuth"
                 },
                 "revive": {
+                    "type": "boolean",
+                    "example": true
+                },
+                "stateful": {
+                    "description": "Stateful overrides detection from the compose file (volumes or\nwritable bind mounts = stateful). Stateful workloads fail over only\nafter JETTY_STATEFUL_FAILOVER_GRACE (default 1h).",
                     "type": "boolean",
                     "example": true
                 }

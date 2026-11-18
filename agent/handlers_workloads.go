@@ -75,6 +75,8 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 		Autostart    bool                     `json:"autostart"`
 		AllowedNodes []string                 `json:"allowed_nodes,omitempty"`
 		Tags         []string                 `json:"tags,omitempty"`
+		Stateful     bool                     `json:"stateful"` // effective (explicit or detected)
+		AutoFailover *bool                    `json:"auto_failover,omitempty"`
 		Owner        map[string]string        `json:"owner"`
 		Version      int64                    `json:"version"`
 		Status       string                   `json:"status"`
@@ -224,6 +226,8 @@ func (a *Agent) apiListWorkloads(w http.ResponseWriter, r *http.Request) {
 			Autostart:    info.wl.Autostart,
 			AllowedNodes: info.wl.AllowedNodes,
 			Tags:         info.wl.Tags,
+			Stateful:     workloadIsStateful(info.wl),
+			AutoFailover: info.wl.AutoFailover,
 			Owner:        info.ownerInfo,
 			Version:      info.wl.Version,
 			Status:       statuses[info.wl.Name],
@@ -403,6 +407,8 @@ func (a *Agent) apiCreateWorkload(w http.ResponseWriter, r *http.Request) {
 		"ip":            wl.IP,
 		"compose":       wl.Compose,
 		"revive":        wl.Revive,
+		"stateful":      workloadIsStateful(&wl),
+		"auto_failover": wl.AutoFailover,
 		"autostart":     wl.Autostart,
 		"allowed_nodes": wl.AllowedNodes,
 		"tags":          wl.Tags,
@@ -476,6 +482,8 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 				"autostart":     found.Autostart,
 				"allowed_nodes": found.AllowedNodes,
 				"tags":          found.Tags,
+				"stateful":      workloadIsStateful(found),
+				"auto_failover": found.AutoFailover,
 				"owner":         ownerInfo,
 				"version":       found.Version,
 				"is_local":      false,
@@ -499,6 +507,8 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 				"autostart":     found.Autostart,
 				"allowed_nodes": found.AllowedNodes,
 				"tags":          found.Tags,
+				"stateful":      workloadIsStateful(found),
+				"auto_failover": found.AutoFailover,
 				"owner":         ownerInfo,
 				"version":       found.Version,
 				"is_local":      false,
@@ -533,6 +543,8 @@ func (a *Agent) apiGetWorkload(w http.ResponseWriter, r *http.Request) {
 		"autostart":     found.Autostart,
 		"allowed_nodes": found.AllowedNodes,
 		"tags":          found.Tags,
+		"stateful":      workloadIsStateful(found),
+		"auto_failover": found.AutoFailover,
 		"owner":         ownerInfo,
 		"version":       found.Version,
 		"is_local":      true,
@@ -571,6 +583,9 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		Autostart    *bool     `json:"autostart,omitempty"`
 		AllowedNodes *[]string `json:"allowed_nodes,omitempty"`
 		Tags         *[]string `json:"tags,omitempty"`
+		// Failover policy (failover_policy.go). Metadata only, no redeploy.
+		Stateful     *bool `json:"stateful,omitempty"`
+		AutoFailover *bool `json:"auto_failover,omitempty"`
 		// RegistryAuth is a double pointer so the handler can distinguish
 		// "field omitted" (nil) from "field explicitly set to null" (non-nil
 		// pointer to a nil *RegistryAuth), which clears the credential.
@@ -710,6 +725,12 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 	if update.Tags != nil {
 		found.Tags = *update.Tags
 	}
+	if update.Stateful != nil {
+		found.Stateful = update.Stateful
+	}
+	if update.AutoFailover != nil {
+		found.AutoFailover = update.AutoFailover
+	}
 	// registry_auth: explicit null clears it; an object replaces it. Redeploy
 	// so the next pull uses (or stops using) the credential.
 	if update.RegistryAuth != nil {
@@ -782,6 +803,8 @@ func (a *Agent) apiUpdateWorkload(w http.ResponseWriter, r *http.Request) {
 		"autostart":     found.Autostart,
 		"allowed_nodes": found.AllowedNodes,
 		"tags":          found.Tags,
+		"stateful":      workloadIsStateful(found),
+		"auto_failover": found.AutoFailover,
 		"owner": map[string]string{
 			"id":   a.hwid,
 			"name": a.hostname,

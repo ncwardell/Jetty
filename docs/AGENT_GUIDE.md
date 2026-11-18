@@ -106,6 +106,8 @@ What happens, in order (`agent/deploy.go` `deployWorkload`):
 | `compose_arm64` | string | ✅* | Optional arm64-specific compose; wins on arm64 nodes. |
 | `ip` | string | ❌ | Mesh IP. **Auto-allocated from the service CIDR if omitted** (recommended: omit it). Must be inside the CIDR and free. |
 | `revive` | bool | ❌ | `true` → fail over to another allowed node if the owner dies. |
+| `stateful` | bool | ❌ | Override detection (volumes / writable binds = stateful). Stateful → failover only after `JETTY_STATEFUL_FAILOVER_GRACE` (1h); losing ownership stops it and keeps volumes. |
+| `auto_failover` | bool | ❌ | Omit = default policy. `false` = never automatic. `true` = short 30s grace even if stateful. |
 | `autostart` | bool | ❌ | `true` → (re)deploy on agent startup; reconciled continuously. |
 | `allowed_nodes` | []string | ❌ | Whitelist of node IDs **or** names. Empty or `["*"]` = any node. Pin GPU/region work here. |
 | `tags` | []string | ❌ | Lowercase `[a-z0-9][a-z0-9_:-]{0,62}`, e.g. `env:prod`. For bulk ops. Sorted/deduped on ingest. |
@@ -376,6 +378,7 @@ Set on the `docker run`/compose of the **agent** container itself (not workloads
 | `JETTY_TUNNEL_DOMAIN` | — | Cluster's Cloudflare tunnel domain. |
 | `JETTY_TUNNEL_HOST` | — | This node's tunnel subdomain. |
 | `JETTY_CF_TOKEN` | — | Cloudflare tunnel token (usually delivered via join). |
+| `JETTY_STATEFUL_FAILOVER_GRACE` | `1h` | Owner-unreachable time before a stateful workload fails over (stateless: 30s). `0` = never automatically. |
 | `JETTY_WEDGE_RESTART_AFTER` | `3m` | Exit (code 3, after a goroutine dump to `<data>/wedge-dumps/`) when stateMu stays unacquirable this long, so Docker restarts the agent. Workloads keep running. `0` = report only (`/api/livez` → 503). |
 | `JETTY_CF_READY_RESTART_AFTER` | `3m` | Kill + respawn cloudflared when it has had zero edge connections this long. `0` = report only. |
 | `JETTY_CF_METRICS_ADDR` | `127.0.0.1:46880` | Where cloudflared serves `/ready` for the watchdog. |

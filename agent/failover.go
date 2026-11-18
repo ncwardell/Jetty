@@ -161,6 +161,21 @@ func (a *Agent) checkFailover() {
 			continue
 		}
 
+		// Stateful guard (failover_policy.go). The short grace above is
+		// enough to know the owner's AGENT is unreachable; for a workload
+		// with local data that is not enough to know its containers have
+		// stopped serving. 2026-11-18: a wedged agent made Radxa look dead,
+		// vaultwarden was restarted on Hetzner from a six-day-old backup,
+		// and both copies took writes. Stateful workloads wait much longer
+		// (or forever, with auto_failover=false), and since peerUnhealthySince
+		// is cleared the moment the owner looks healthy again, the wait is
+		// for CONTINUOUS unreachability - a flapping link never accumulates.
+		policy := failoverPolicyFor(wl)
+		if !policy.auto || elapsed < policy.grace {
+			a.warnFailoverHeld(wl, elapsed, policy)
+			continue
+		}
+
 		// Witness check: if we couldn't reach the public internet at
 		// the start of this scan, refuse to claim. With only two nodes
 		// there's no quorum, so this is our only defense against
@@ -185,6 +200,12 @@ func (a *Agent) checkFailover() {
 
 		// Owner is dead - should we claim?
 		if a.shouldClaim(wl) {
+			if policy.stateful {
+				logWarnf("Claiming orphaned STATEFUL workload %s: owner %s unreachable for %v (grace %v, %s). "+
+					"It will start from whatever its own restore logic finds (usually the last backup); "+
+					"if the old owner is in fact still running it, the copies will diverge.",
+					wl.Name, shortID(wl.Owner, 12), elapsed.Round(time.Second), policy.grace, policy.reason)
+			}
 			logInfof("Claiming orphaned workload: %s", wl.Name)
 
 			// Mark failover in progress before releasing state lock

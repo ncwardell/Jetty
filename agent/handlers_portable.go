@@ -63,6 +63,11 @@ type portableWorkload struct {
 	Autostart    bool     `json:"autostart"`
 	AllowedNodes []string `json:"allowed_nodes,omitempty"`
 	Tags         []string `json:"tags,omitempty"`
+	// Failover policy travels with the workload: dropping it on export would
+	// silently turn a deliberately pinned stateful workload back into one
+	// that the policy defaults decide for.
+	Stateful     *bool `json:"stateful,omitempty"`
+	AutoFailover *bool `json:"auto_failover,omitempty"`
 }
 
 // envRefRe captures ${VAR_NAME} style references in compose YAML.
@@ -125,6 +130,8 @@ func (a *Agent) apiExportWorkloads(w http.ResponseWriter, r *http.Request) {
 			Autostart:    wl.Autostart,
 			AllowedNodes: append([]string(nil), wl.AllowedNodes...),
 			Tags:         append([]string(nil), wl.Tags...),
+			Stateful:     wl.Stateful,
+			AutoFailover: wl.AutoFailover,
 		})
 		for _, src := range []string{wl.Compose, wl.ComposeAmd64, wl.ComposeArm64} {
 			for _, m := range envRefRe.FindAllStringSubmatch(src, -1) {
@@ -384,6 +391,8 @@ func (a *Agent) importOne(src portableWorkload, mode string, reassignIPs bool) i
 		Autostart:    src.Autostart,
 		AllowedNodes: append([]string(nil), src.AllowedNodes...),
 		Tags:         append([]string(nil), src.Tags...),
+		Stateful:     src.Stateful,
+		AutoFailover: src.AutoFailover,
 		Owner:        a.hwid,
 		Version:      time.Now().UnixNano(),
 	}

@@ -162,8 +162,23 @@ type Workload struct {
 	// credentials (public images, or whatever the host docker config
 	// already provides) - identical to pre-feature behavior.
 	RegistryAuth *RegistryAuth `json:"registry_auth,omitempty"`
-	Owner        string        `json:"owner"`   // Node HWID
-	Version      int64         `json:"version"` // Unix timestamp
+	// Stateful overrides stateful-workload detection (failover_policy.go).
+	// nil = detect from the compose file (named/anonymous volumes or a
+	// writable bind mount mean stateful). Stateful workloads only fail over
+	// after JETTY_STATEFUL_FAILOVER_GRACE, and losing ownership stops them
+	// instead of deleting their volumes.
+	Stateful *bool `json:"stateful,omitempty"`
+	// AutoFailover is the per-workload failover switch, layered under
+	// Revive (revive=false still disables failover entirely):
+	//   nil   - default policy: stateless fails over after FailoverGracePeriod,
+	//           stateful after JETTY_STATEFUL_FAILOVER_GRACE.
+	//   false - never claimed automatically when the owner looks dead; an
+	//           operator moves it.
+	//   true  - fail over on the normal short grace even if stateful (the
+	//           operator accepts starting from the last backup).
+	AutoFailover *bool  `json:"auto_failover,omitempty"`
+	Owner        string `json:"owner"`   // Node HWID
+	Version      int64  `json:"version"` // Unix timestamp
 }
 
 // RegistryAuth tells Jetty how to authenticate an image pull for a workload.

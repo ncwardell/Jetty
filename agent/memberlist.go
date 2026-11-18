@@ -201,7 +201,7 @@ func (d *jettyDelegate) MergeRemoteState(buf []byte, join bool) {
 	// Stop workloads we lost ownership of
 	for _, wl := range result.LostOwnership {
 		logInfof("Memberlist sync: stopping local workload %s - ownership transferred", wl.Name)
-		d.agent.removeWorkload(wl)
+		d.agent.releaseLostWorkload(wl)
 	}
 
 	if result.Changed {
@@ -580,7 +580,7 @@ func (a *Agent) handleWorkloadUpdate(wl *Workload) {
 	if existing == nil || wl.Version > existing.Version {
 		if existing != nil && existing.Owner == a.hwid && wl.Owner != a.hwid {
 			logInfof("Broadcast: lost ownership of %s to %s", existing.Name, shortID(wl.Owner, 12))
-			goSafe("removeWorkload", func() { a.removeWorkload(existing) })
+			goSafe("releaseLostWorkload", func() { a.releaseLostWorkload(existing) })
 		}
 		a.state.Workloads[wl.IP] = wl
 		// Same stale-tombstone retirement as mergeWorkloadState: if
@@ -1096,7 +1096,7 @@ func (a *Agent) memberlistPeriodicSync() {
 	// Stop workloads we lost ownership of
 	for _, wl := range result.LostOwnership {
 		logInfof("Periodic sync: stopping local workload %s - ownership transferred", wl.Name)
-		a.removeWorkload(wl)
+		a.releaseLostWorkload(wl)
 	}
 
 	if result.EnvUpdated {

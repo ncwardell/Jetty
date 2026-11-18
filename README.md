@@ -461,6 +461,8 @@ No split-brain. No consensus. Just math.
 | `compose_amd64` | Optional. Compose file for AMD64 nodes. |
 | `compose_arm64` | Optional. Compose file for ARM64 nodes. |
 | `revive` | `true` = failover to another node if owner dies. |
+| `stateful` | Optional override. Omitted = detected from the compose files (named/anonymous volumes or a writable bind mount = stateful). Stateful workloads only fail over after `JETTY_STATEFUL_FAILOVER_GRACE` (default 1h) of *continuous* owner unreachability, and a node that loses ownership of one stops it but **keeps its volumes** instead of `down -v`. |
+| `auto_failover` | Optional. Omitted = default policy above. `false` = never fail over automatically (move it by hand). `true` = fail over on the normal 30s grace even if stateful (you accept it starting from its last backup). `revive: false` still disables failover entirely. |
 | `autostart` | `true` = start when Jetty starts. |
 | `allowed_nodes` | Only these nodes can run this workload. Empty = any node. |
 | `registry_auth` | Optional. Auth for pulling a private image — `{registry, username?, token_ref}`. `token_ref` names an **env-store key** (not the token itself). See below. |
@@ -554,6 +556,7 @@ volumes:
 | `JETTY_HOST_SHELL` | Set to `true` to enable the `/api/host/shell` web terminal endpoint (admin-only, dangerous). For a *real* host shell — one that sees the host's `/home`, `/etc`, processes — also pass `--pid=host` to `docker run`; without it the endpoint works but returns a shell scoped to the container. | `false` |
 | `JETTY_IMAGE_PRUNE` | Auto-prune stranded Docker images daily (dangling images, unused images older than the cutoff, old build cache). Self-updates and moving-tag re-pulls otherwise leak the previous image forever. Set to `false` to disable. | `true` |
 | `JETTY_IMAGE_PRUNE_UNTIL` | Age cutoff for pruning unused *tagged* images and build cache (Go duration). Images newer than this are kept (protects fresh pre-pulls). | `168h` |
+| `JETTY_STATEFUL_FAILOVER_GRACE` | How long a **stateful** workload's owner must be continuously unreachable before a peer fails it over (stateless workloads keep the 30s grace). Long on purpose: an unreachable agent does not mean its containers stopped serving, and a premature failover starts a second copy from backup while the first keeps taking writes. Go duration or seconds; `0` = never fail stateful workloads over automatically. Per-workload `auto_failover` overrides. | `1h` |
 | `JETTY_WEDGE_RESTART_AFTER` | Wedge watchdog: if the agent's state lock stays unacquirable this long (control plane wedged — API calls hang while `/api/livez` still answers), the agent dumps all goroutine stacks to the log and `<data>/wedge-dumps/`, then exits (code 3) so Docker's restart policy restarts it. Workload containers keep running. Go duration or seconds; `0` disables the restart (still reported by `/api/livez`, which returns **503** once wedged). Requires a restart policy such as `unless-stopped`. | `3m` |
 | `JETTY_DATA_DIR` | Where state lives. | `/data` |
 | `JETTY_API_PORT` | API port. | `6880` |

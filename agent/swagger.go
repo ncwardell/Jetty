@@ -57,6 +57,13 @@ type WorkloadRequest struct {
 	Autostart    bool          `json:"autostart" example:"true"`
 	AllowedNodes []string      `json:"allowed_nodes,omitempty" example:"node1,node2"`
 	RegistryAuth *RegistryAuth `json:"registry_auth,omitempty"`
+	// Stateful overrides detection from the compose file (volumes or
+	// writable bind mounts = stateful). Stateful workloads fail over only
+	// after JETTY_STATEFUL_FAILOVER_GRACE (default 1h).
+	Stateful *bool `json:"stateful,omitempty" example:"true"`
+	// AutoFailover: omit for the default policy; false = never fail over
+	// automatically; true = fail over on the short grace even if stateful.
+	AutoFailover *bool `json:"auto_failover,omitempty" example:"false"`
 }
 
 // WorkloadUpdateRequest represents a request to update a workload
@@ -69,6 +76,8 @@ type WorkloadUpdateRequest struct {
 	Autostart    *bool         `json:"autostart,omitempty"`
 	AllowedNodes *[]string     `json:"allowed_nodes,omitempty"`
 	RegistryAuth *RegistryAuth `json:"registry_auth,omitempty"`
+	Stateful     *bool         `json:"stateful,omitempty"`
+	AutoFailover *bool         `json:"auto_failover,omitempty"`
 }
 
 // WorkloadResponse represents a workload with enriched owner info

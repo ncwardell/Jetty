@@ -67,6 +67,8 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 		Autostart    bool              `json:"autostart"`
 		AllowedNodes []string          `json:"allowed_nodes,omitempty"`
 		Tags         []string          `json:"tags,omitempty"`
+		Stateful     bool              `json:"stateful"` // effective: failover waits JETTY_STATEFUL_FAILOVER_GRACE
+		AutoFailover *bool             `json:"auto_failover,omitempty"`
 		Owner        map[string]string `json:"owner"`
 		Version      int64             `json:"version"`
 		Status       string            `json:"status"`
@@ -174,6 +176,8 @@ func (a *Agent) apiStatus(w http.ResponseWriter, r *http.Request) {
 			Autostart:    info.wl.Autostart,
 			AllowedNodes: info.wl.AllowedNodes,
 			Tags:         info.wl.Tags,
+			Stateful:     workloadIsStateful(info.wl),
+			AutoFailover: info.wl.AutoFailover,
 			Owner:        info.ownerInfo,
 			Version:      info.wl.Version,
 			Status:       statuses[info.wl.Name],
