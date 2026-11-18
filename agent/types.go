@@ -421,6 +421,11 @@ type Agent struct {
 	// Capacity 1 so triggerRouteReconcile never blocks - it is called with
 	// stateMu held.
 	routeReconcileCh chan struct{}
+	// peerTunnelLocks maps peer ID -> *sync.Mutex serializing kernel tunnel
+	// programming for that peer (ensurePeerTunnel / removePeerTunnel). Held
+	// across bounded `ip` execs, which is why it is separate from - and never
+	// held together with - stateMu.
+	peerTunnelLocks sync.Map
 
 	// Container autoheal: last time we restarted each running-but-unhealthy
 	// container, so a container that keeps coming up unhealthy isn't

@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -93,7 +92,9 @@ func (a *Agent) pruneImages(age string) {
 // runPrune executes a docker prune command and returns the reclaimed size in
 // MB parsed from its "Total reclaimed space: ..." output (0 on any failure).
 func runPrune(name string, args ...string) float64 {
-	out, err := exec.Command(name, args...).CombinedOutput()
+	// dockerLongTimeout: pruning a large build cache can legitimately take
+	// minutes; the bound only stops a wedged daemon pinning this loop forever.
+	out, err := runCmdCombined(dockerLongTimeout, name, args...)
 	if err != nil {
 		logErrorf("Image prune: %s %s failed: %v", name, strings.Join(args, " "), err)
 		return 0

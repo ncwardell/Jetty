@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os/exec"
 	"strconv"
 	"time"
 
@@ -49,7 +48,7 @@ func (a *Agent) initUserspaceTunnel() error {
 	a.tunDevice = tun
 
 	// Configure TUN device
-	if err := exec.Command("ip", "link", "set", "up", "dev", "jetty_tun").Run(); err != nil {
+	if err := runCmd(hostCommandTimeout, "ip", "link", "set", "up", "dev", "jetty_tun"); err != nil {
 		tun.Close()
 		return fmt.Errorf("bring up TUN device: %w", err)
 	}
@@ -57,7 +56,7 @@ func (a *Agent) initUserspaceTunnel() error {
 	// Set MTU to account for WebSocket/TLS encapsulation overhead.
 	// Without this, large packets get fragmented/dropped and TCP connections hang
 	// after the handshake completes (small packets work, large responses don't).
-	if err := exec.Command("ip", "link", "set", "dev", "jetty_tun", "mtu", "1280").Run(); err != nil {
+	if err := runCmd(hostCommandTimeout, "ip", "link", "set", "dev", "jetty_tun", "mtu", "1280"); err != nil {
 		logWarnf("failed to set TUN MTU: %v", err)
 	}
 
@@ -250,7 +249,7 @@ func (a *Agent) cleanupUserspaceTunnel() {
 
 	if a.tunDevice != nil {
 		a.tunDevice.Close()
-		exec.Command("ip", "link", "del", "jetty_tun").Run()
+		runCmd(hostCommandTimeout, "ip", "link", "del", "jetty_tun")
 	}
 }
 

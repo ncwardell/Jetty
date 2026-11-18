@@ -262,8 +262,9 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	logInfof("Starting self-update to image: %s", req.Image)
 
 	// Step 1: Pull the new image
-	pullCmd := exec.Command("docker", "pull", req.Image)
-	pullOutput, err := pullCmd.CombinedOutput()
+	// dockerLongTimeout: a pull's duration scales with image size and link
+	// speed; the bound only stops a wedged daemon hanging this request.
+	pullOutput, err := runCmdCombined(dockerLongTimeout, "docker", "pull", req.Image)
 	if err != nil {
 		logErrorf("Failed to pull image %s: %v\nOutput: %s", req.Image, err, pullOutput)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to pull image: %v", err))
@@ -281,8 +282,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 	logInfof("Self container ID: %s", containerID)
 
 	// Step 3: Inspect self to get mounts and config
-	inspectCmd := exec.Command("docker", "inspect", containerID)
-	inspectOutput, err := inspectCmd.Output()
+	inspectOutput, err := runCmdOutput(dockerQueryTimeout, "docker", "inspect", containerID)
 	if err != nil {
 		logErrorf("Failed to inspect container: %v", err)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to inspect container: %v", err))
@@ -439,8 +439,7 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	createCmd := exec.Command("docker", newArgs...)
-	createOutput, err := createCmd.CombinedOutput()
+	createOutput, err := runCmdCombined(dockerLifecycleTimeout, "docker", newArgs...)
 	if err != nil {
 		logErrorf("Failed to create new container: %v\nOutput: %s", err, createOutput)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to create new container: %v", err))
@@ -468,15 +467,13 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 
 		// Rename old container first (while it's still running)
 		logInfof("Renaming old container %s to %s-old", containerName, containerName)
-		renameOldCmd := exec.Command("docker", "rename", containerName, containerName+"-old")
-		if out, err := renameOldCmd.CombinedOutput(); err != nil {
+		if out, err := runCmdCombined(dockerQueryTimeout, "docker", "rename", containerName, containerName+"-old"); err != nil {
 			logWarnf("failed to rename old container: %v, output: %s", err, out)
 		}
 
 		// Rename new container to original name (while it's stopped)
 		logInfof("Renaming new container to %s", containerName)
-		renameNewCmd := exec.Command("docker", "rename", containerName+"-update", containerName)
-		if out, err := renameNewCmd.CombinedOutput(); err != nil {
+		if out, err := runCmdCombined(dockerQueryTimeout, "docker", "rename", containerName+"-update", containerName); err != nil {
 			logWarnf("failed to rename new container: %v, output: %s", err, out)
 		}
 
@@ -489,19 +486,18 @@ func (a *Agent) apiUpdateNode(w http.ResponseWriter, r *http.Request) {
 			containerID, newContainerID, containerID)
 
 		logInfof("Spawning helper container to orchestrate restart")
-		helperCmd := exec.Command("docker", "run", "--rm", "-d",
+		// `run -d` returns as soon as the helper starts; the lifecycle bound
+		// mainly covers docker:cli having to be pulled for the fallback.
+		if out, err := runCmdCombined(dockerLifecycleTimeout, "docker", "run", "--rm", "-d",
 			"--entrypoint", "sh",
 			"-v", "/var/run/docker.sock:/var/run/docker.sock",
-			req.Image, "-c", restartScript)
-
-		if out, err := helperCmd.CombinedOutput(); err != nil {
+			req.Image, "-c", restartScript); err != nil {
 			logWarnf("failed to spawn helper container: %v, output: %s", err, out)
 			// Fallback: try docker:cli image (smaller, commonly available)
 			logInfof("Trying docker:cli as fallback helper...")
-			helperCmd = exec.Command("docker", "run", "--rm", "-d",
+			if out, err := runCmdCombined(dockerLifecycleTimeout, "docker", "run", "--rm", "-d",
 				"-v", "/var/run/docker.sock:/var/run/docker.sock",
-				"docker:cli", "sh", "-c", restartScript)
-			if out, err := helperCmd.CombinedOutput(); err != nil {
+				"docker:cli", "sh", "-c", restartScript); err != nil {
 				logWarnf("docker:cli also failed: %v, output: %s", err, out)
 				logInfof("Falling back to direct restart (may fail)")
 
@@ -533,16 +529,14 @@ func (a *Agent) getSelfContainerID() (string, error) {
 	hostname, _ := os.Hostname()
 	if len(hostname) == 12 || len(hostname) == 64 {
 		// Verify it's a valid container ID
-		cmd := exec.Command("docker", "inspect", hostname, "--format", "{{.Id}}")
-		if out, err := cmd.Output(); err == nil {
+		if out, err := runCmdOutput(dockerQueryTimeout, "docker", "inspect", hostname, "--format", "{{.Id}}"); err == nil {
 			return strings.TrimSpace(string(out)), nil
 		}
 	}
 
 	// Method 2: Look for container named exactly "jetty" that's running
 	// Use ^jetty$ to match exactly - prevents matching workload containers like jetty_nginx
-	cmd := exec.Command("docker", "ps", "-q", "--filter", "name=^jetty$", "--filter", "status=running")
-	out, err := cmd.Output()
+	out, err := runCmdOutput(dockerQueryTimeout, "docker", "ps", "-q", "--filter", "name=^jetty$", "--filter", "status=running")
 	if err != nil {
 		return "", fmt.Errorf("docker ps failed: %w", err)
 	}

@@ -199,10 +199,10 @@ func (a *Agent) deregisterWarp() {
 	if _, err := exec.LookPath("warp-cli"); err != nil {
 		return
 	}
-	if out, err := exec.Command("warp-cli", "--accept-tos", "disconnect").CombinedOutput(); err != nil {
+	if out, err := runCmdCombined(warpCLITimeout, "warp-cli", "--accept-tos", "disconnect"); err != nil {
 		logInfof("WARP deregister: disconnect: %v (%s)", err, out)
 	}
-	if out, err := exec.Command("warp-cli", "--accept-tos", "registration", "delete").CombinedOutput(); err != nil {
+	if out, err := runCmdCombined(warpRegisterTimeout, "warp-cli", "--accept-tos", "registration", "delete"); err != nil {
 		logInfof("WARP deregister: registration delete: %v (%s)", err, out)
 		return
 	}
@@ -234,7 +234,7 @@ func (a *Agent) configureWarpRuntime(token string) error {
 	logInfof("Configuring WARP at runtime...")
 
 	// Check if warp-svc is running, start it if not
-	if err := exec.Command("warp-cli", "--accept-tos", "status").Run(); err != nil {
+	if err := runCmd(warpCLITimeout, "warp-cli", "--accept-tos", "status"); err != nil {
 		logInfof("Starting WARP service...")
 
 		// RUST_LOG=error reduces verbose debug output that floods logs on
@@ -249,7 +249,7 @@ func (a *Agent) configureWarpRuntime(token string) error {
 		// Poll until warp-svc accepts CLI commands (typically <2s).
 		for i := 0; i < 10; i++ {
 			time.Sleep(time.Second)
-			if exec.Command("warp-cli", "--accept-tos", "status").Run() == nil {
+			if runCmd(warpCLITimeout, "warp-cli", "--accept-tos", "status") == nil {
 				break
 			}
 		}
@@ -269,14 +269,14 @@ func (a *Agent) configureWarpRuntime(token string) error {
 	//     attached to the old one.
 	expectedConnectorID := parseConnectorTokenID(token) // best-effort; "" if we can't parse
 	stampPath := filepath.Join(a.dataDir, "warp", "registered-connector-id")
-	output, _ := exec.Command("warp-cli", "--accept-tos", "registration", "show").CombinedOutput()
+	output, _ := runCmdCombined(warpCLITimeout, "warp-cli", "--accept-tos", "registration", "show")
 	needsRegister := strings.Contains(string(output), "Missing registration")
 	if !needsRegister && expectedConnectorID != "" {
 		stamped, _ := os.ReadFile(stampPath)
 		if string(stamped) != expectedConnectorID {
 			logInfof("WARP registration is bound to a different Connector (%q) than the env token (%q); re-registering",
 				string(stamped), expectedConnectorID)
-			if out, err := exec.Command("warp-cli", "--accept-tos", "registration", "delete").CombinedOutput(); err != nil {
+			if out, err := runCmdCombined(warpRegisterTimeout, "warp-cli", "--accept-tos", "registration", "delete"); err != nil {
 				logWarnf("warp-cli registration delete: %v (%s)", err, out)
 			}
 			needsRegister = true
@@ -289,9 +289,8 @@ func (a *Agent) configureWarpRuntime(token string) error {
 
 	if needsRegister {
 		logInfof("Registering WARP connector...")
-		cmd := exec.Command("warp-cli", "--accept-tos", "connector", "new", token)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to register WARP connector: %s", output)
+		if output, err := runCmdCombined(warpRegisterTimeout, "warp-cli", "--accept-tos", "connector", "new", token); err != nil {
+			return fmt.Errorf("failed to register WARP connector: %v: %s", err, output)
 		}
 		// Stamp the registration so the next start can detect a token
 		// change without having to call into Cloudflare.
@@ -301,7 +300,7 @@ func (a *Agent) configureWarpRuntime(token string) error {
 	}
 
 	logInfof("Connecting WARP...")
-	if err := exec.Command("warp-cli", "--accept-tos", "connect").Run(); err != nil {
+	if err := runCmd(warpCLITimeout, "warp-cli", "--accept-tos", "connect"); err != nil {
 		return fmt.Errorf("failed to connect WARP: %w", err)
 	}
 
@@ -309,7 +308,7 @@ func (a *Agent) configureWarpRuntime(token string) error {
 	// the tunnel, especially on first registration.
 	for i := 0; i < 30; i++ {
 		time.Sleep(time.Second)
-		output, _ := exec.Command("warp-cli", "--accept-tos", "status").CombinedOutput()
+		output, _ := runCmdCombined(warpCLITimeout, "warp-cli", "--accept-tos", "status")
 		if strings.Contains(strings.ToLower(string(output)), "connected") {
 			a.detectWarpIP()
 			logInfof("WARP connected successfully: %s", a.warpIP())

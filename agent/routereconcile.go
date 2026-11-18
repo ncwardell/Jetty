@@ -1,9 +1,6 @@
 package agent
 
 import (
-	"context"
-	"fmt"
-	"os/exec"
 	"time"
 )
 
@@ -47,7 +44,7 @@ const (
 	// routeCommandTimeout bounds a single `ip` invocation. Route programming
 	// is a local netlink operation - if it has not finished in this long it is
 	// stuck, and waiting longer only delays reconciliation of everything else.
-	routeCommandTimeout = 10 * time.Second
+	routeCommandTimeout = hostCommandTimeout
 
 	// routeReconcileDebounce coalesces bursts. Peer announces and health flaps
 	// arrive together; reconciling once after the burst beats reconciling per
@@ -55,39 +52,18 @@ const (
 	routeReconcileDebounce = 250 * time.Millisecond
 )
 
-// runBoundedCommand runs a command that must not outlive its usefulness.
+// routeCommandRunner and routeCommandOutput are the indirection the route and
+// tunnel paths exec through. Vars so tests can substitute a deliberately slow
+// command and assert that API-path read locks are still served while it runs -
+// the property that failed in production, and which a fast-failing command
+// cannot demonstrate.
 //
-// Every exec on the route path used exec.Command with no deadline. Now that
-// these run off the lock a hung child no longer wedges the API, but it would
-// still stall reconciliation forever, so bound it regardless.
-func runBoundedCommand(timeout time.Duration, name string, args ...string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	err := exec.CommandContext(ctx, name, args...).Run()
-	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("%s %v: timed out after %s", name, args, timeout)
-	}
-	return err
-}
-
-// runBoundedOutput is runBoundedCommand for callers that need the output.
-func runBoundedOutput(timeout time.Duration, name string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		return out, fmt.Errorf("%s %v: timed out after %s", name, args, timeout)
-	}
-	return out, err
-}
-
-// routeCommandRunner is the indirection the route path execs through. A var so
-// tests can substitute a deliberately slow command and assert that API-path
-// read locks are still served while it runs - the property that failed in
-// production, and which a fast-failing command cannot demonstrate.
-var routeCommandRunner = runBoundedCommand
+// Both are bounded (command.go); a hung child costs one routeCommandTimeout,
+// not the reconcile loop.
+var (
+	routeCommandRunner = runCmd
+	routeCommandOutput = runCmdCombined
+)
 
 // routePeer is the subset of a Peer the route path needs.
 type routePeer struct {
@@ -215,18 +191,38 @@ func (a *Agent) applyRoutes(snap routeSnapshot) {
 		}
 	}
 
+	// workloadRoutesMu is not held across any exec below. The userspace
+	// tunnel's send loop takes it on *every outbound packet* to find the
+	// owner of the destination, so holding it across 2N `ip route` calls - as
+	// this function used to - meant one hung `ip` stalled all cross-node
+	// workload traffic for as long as the child lived, on top of stalling
+	// reconciliation. Instead: unpublish stale entries and copy the map under
+	// the lock, exec with it released, publish successes under it again.
+	//
+	// The reconcile loop is the only writer outside shutdown teardown, so the
+	// copy cannot go stale under us except by cleanupNetwork, after which the
+	// agent is exiting anyway.
+	type staleRoute struct{ wlIP, ownerID string }
+	var stale []staleRoute
 	a.workloadRoutesMu.Lock()
-	defer a.workloadRoutesMu.Unlock()
-
-	// Remove stale routes - no longer wanted, or the owner changed.
+	prev := make(map[string]string, len(a.workloadRoutes))
 	for wlIP, ownerID := range a.workloadRoutes {
+		prev[wlIP] = ownerID
+		// Stale: no longer wanted, or the owner changed. Unpublish first
+		// so the packet path stops forwarding to the old owner now, not
+		// after the kernel delete returns.
 		if desired, ok := snap.desired[wlIP]; !ok || desired.ownerID != ownerID {
-			if err := routeCommandRunner(routeCommandTimeout, "ip", "route", "del", wlIP+"/32"); err != nil {
-				logDebugf("route del %s: %v", wlIP, err)
-			}
+			stale = append(stale, staleRoute{wlIP, ownerID})
 			delete(a.workloadRoutes, wlIP)
-			logInfof("Removed route for %s (was via %s)", wlIP, shortID(ownerID, 8))
 		}
+	}
+	a.workloadRoutesMu.Unlock()
+
+	for _, r := range stale {
+		if err := routeCommandRunner(routeCommandTimeout, "ip", "route", "del", r.wlIP+"/32"); err != nil {
+			logDebugf("route del %s: %v", r.wlIP, err)
+		}
+		logInfof("Removed route for %s (was via %s)", r.wlIP, shortID(r.ownerID, 8))
 	}
 
 	// Add or refresh. `ip route replace` rather than `add` so kernel state
@@ -273,9 +269,13 @@ func (a *Agent) applyRoutes(snap routeSnapshot) {
 		}
 		// Steady-state replaces are silent; only owner changes and first
 		// installs are worth a line.
-		if existingOwner, ok := a.workloadRoutes[wlIP]; !ok || existingOwner != info.ownerID {
+		if existingOwner, ok := prev[wlIP]; !ok || existingOwner != info.ownerID {
 			logInfof("Added route for %s via %s", wlIP, routeDesc)
 		}
+		// Publish each route as soon as the kernel has it, so one slow
+		// replace does not delay traffic to every other workload.
+		a.workloadRoutesMu.Lock()
 		a.workloadRoutes[wlIP] = info.ownerID
+		a.workloadRoutesMu.Unlock()
 	}
 }

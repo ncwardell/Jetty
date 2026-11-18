@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
@@ -107,7 +106,7 @@ func (a *Agent) apiHealth(w http.ResponseWriter, r *http.Request) {
 		// Check docker status outside the lock to avoid blocking
 		var localWorkloads []string
 		for _, wl := range localWLInfo {
-			out, _ := exec.Command("docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.name).Output()
+			out, _ := runCmdOutput(dockerQueryTimeout, "docker", "ps", "-q", "-f", "label=com.docker.compose.project=jetty_"+wl.name)
 			status := "stopped"
 			if len(strings.TrimSpace(string(out))) > 0 {
 				status = "running"
@@ -391,7 +390,7 @@ func (a *Agent) getSystemStats() map[string]interface{} {
 	}
 
 	// Get disk usage for /data
-	if out, err := exec.Command("df", "-B1", a.dataDir).Output(); err == nil {
+	if out, err := runCmdOutput(hostCommandTimeout, "df", "-B1", a.dataDir); err == nil {
 		lines := strings.Split(string(out), "\n")
 		if len(lines) >= 2 {
 			fields := strings.Fields(lines[1])

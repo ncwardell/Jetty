@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -60,8 +59,8 @@ func (a *Agent) reconcileWorkloads() {
 	a.stateMu.RUnlock()
 
 	for _, wl := range toCheck {
-		out, _ := exec.Command("docker", "ps", "-q",
-			"-f", "label=com.docker.compose.project=jetty_"+wl.Name).Output()
+		out, _ := runCmdOutput(dockerQueryTimeout, "docker", "ps", "-q",
+			"-f", "label=com.docker.compose.project=jetty_"+wl.Name)
 		if len(strings.TrimSpace(string(out))) > 0 {
 			continue // at least one container running - liveness handled by heal pass below
 		}
@@ -106,10 +105,10 @@ func (a *Agent) healUnhealthyContainers() {
 	a.stateMu.RUnlock()
 
 	for _, name := range owned {
-		out, _ := exec.Command("docker", "ps",
+		out, _ := runCmdOutput(dockerQueryTimeout, "docker", "ps",
 			"-f", "label=com.docker.compose.project=jetty_"+name,
 			"-f", "health=unhealthy",
-			"--format", "{{.ID}} {{.Names}}").Output()
+			"--format", "{{.ID}} {{.Names}}")
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
@@ -125,7 +124,7 @@ func (a *Agent) healUnhealthyContainers() {
 				continue // healed recently; give it time to come back
 			}
 			logInfof("Autoheal: restarting unhealthy container %s (workload %s)", cname, name)
-			if rout, err := exec.Command("docker", "restart", cid).CombinedOutput(); err != nil {
+			if rout, err := runCmdCombined(dockerLifecycleTimeout, "docker", "restart", cid); err != nil {
 				logErrorf("Autoheal: restart of %s failed: %v (%s)", cname, err, strings.TrimSpace(string(rout)))
 			}
 		}
@@ -517,14 +516,14 @@ func (a *Agent) cleanupWorkloadIP(wl *Workload) {
 	a.removeWorkloadDNAT(wl.IP)
 
 	// Remove mesh IP from interface
-	exec.Command("ip", "addr", "del", wl.IP+"/32", "dev", "jetty0").Run()
+	runCmd(hostCommandTimeout, "ip", "addr", "del", wl.IP+"/32", "dev", "jetty0")
 }
 
 // removeWorkloadDNAT deletes every DNAT rule in the nat table that targets
 // the given mesh IP across PREROUTING and OUTPUT.
 func (a *Agent) removeWorkloadDNAT(meshIP string) {
 	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
-		out, err := exec.Command("iptables", "-t", "nat", "-S", chain).Output()
+		out, err := runCmdOutput(hostCommandTimeout, "iptables", "-t", "nat", "-S", chain)
 		if err != nil {
 			continue
 		}
@@ -539,14 +538,14 @@ func (a *Agent) removeWorkloadDNAT(meshIP string) {
 			}
 			args[0] = "-D"
 			cmd := append([]string{"-t", "nat"}, args...)
-			exec.Command("iptables", cmd...).Run()
+			runCmd(hostCommandTimeout, "iptables", cmd...)
 		}
 	}
 }
 
 func (a *Agent) setupWorkloadIP(wl *Workload) {
 	// Add IP to interface
-	if err := exec.Command("ip", "addr", "add", wl.IP+"/32", "dev", "jetty0").Run(); err != nil {
+	if err := runCmd(hostCommandTimeout, "ip", "addr", "add", wl.IP+"/32", "dev", "jetty0"); err != nil {
 		// Ignore "already exists" errors
 		logInfof("Note: adding %s to jetty0: %v (may already exist)", wl.IP, err)
 	}
@@ -585,9 +584,9 @@ func (a *Agent) setupWorkloadIP(wl *Workload) {
 			// our mesh traffic to whichever container claimed that host port.
 			// Inserting at the top ensures our per-port DNAT always wins.
 			for _, chain := range []string{"PREROUTING", "OUTPUT"} {
-				err := exec.Command("iptables", "-t", "nat", "-I", chain, "1",
+				err := runCmd(hostCommandTimeout, "iptables", "-t", "nat", "-I", chain, "1",
 					"-d", wl.IP, "-p", p.proto, "--dport", strconv.Itoa(p.port),
-					"-j", "DNAT", "--to", target).Run()
+					"-j", "DNAT", "--to", target)
 				if err != nil {
 					logErrorf("%s DNAT for %s %s/%d -> %s: %v",
 						chain, wl.IP, p.proto, p.port, target, err)
@@ -607,8 +606,8 @@ func (a *Agent) setupWorkloadIP(wl *Workload) {
 		return
 	}
 	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
-		if err := exec.Command("iptables", "-t", "nat", "-I", chain, "1",
-			"-d", wl.IP, "-j", "DNAT", "--to", containerIP).Run(); err != nil {
+		if err := runCmd(hostCommandTimeout, "iptables", "-t", "nat", "-I", chain, "1",
+			"-d", wl.IP, "-j", "DNAT", "--to", containerIP); err != nil {
 			logErrorf("%s DNAT for %s: %v", chain, wl.IP, err)
 		}
 	}
@@ -627,10 +626,10 @@ type containerPort struct {
 // container's bridge IP. Used to set up per-port DNAT so multi-service
 // workloads can expose more than one port on the same mesh IP.
 func (a *Agent) getWorkloadContainerPorts(name string) []containerPort {
-	out, err := exec.Command("docker", "ps",
+	out, err := runCmdOutput(dockerQueryTimeout, "docker", "ps",
 		"-f", "label=com.docker.compose.project=jetty_"+name,
 		"--format", "{{.ID}}\t{{.Ports}}",
-	).Output()
+	)
 	if err != nil || len(out) == 0 {
 		return nil
 	}
@@ -644,8 +643,8 @@ func (a *Agent) getWorkloadContainerPorts(name string) []containerPort {
 		id := parts[0]
 		ports := parts[1]
 
-		ipOut, ipErr := exec.Command("docker", "inspect", "-f",
-			"{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", id).Output()
+		ipOut, ipErr := runCmdOutput(dockerQueryTimeout, "docker", "inspect", "-f",
+			"{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", id)
 		if ipErr != nil {
 			continue
 		}
@@ -746,10 +745,10 @@ func (a *Agent) getWorkloadContainerIPForPort(name string, port uint16) string {
 // containerPort==0 - callers should dial the original destination port in
 // that case, preserving legacy behaviour.
 func (a *Agent) getWorkloadContainerTargetForPort(name string, port uint16) (string, uint16) {
-	out, err := exec.Command("docker", "ps",
+	out, err := runCmdOutput(dockerQueryTimeout, "docker", "ps",
 		"-f", "label=com.docker.compose.project=jetty_"+name,
 		"--format", "{{.ID}}\t{{.Ports}}",
-	).Output()
+	)
 	if err != nil || len(out) == 0 {
 		return "", 0
 	}
@@ -818,7 +817,7 @@ func (a *Agent) getWorkloadContainerTargetForPort(name string, port uint16) (str
 		return "", 0
 	}
 
-	out, err = exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID).Output()
+	out, err = runCmdOutput(dockerQueryTimeout, "docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containerID)
 	if err != nil {
 		return "", 0
 	}
@@ -840,7 +839,12 @@ func (a *Agent) composeCmd(name string, args ...string) (string, error) {
 
 	cmdArgs = append(cmdArgs, args...)
 
-	cmd := exec.Command("docker", cmdArgs...)
+	// Bounded by dockerLongTimeout, not dockerQueryTimeout: `up` and `pull`
+	// fetch images, and their duration scales with image size and link
+	// speed. The bound exists so a wedged daemon cannot hold a deploy (and
+	// the workload's move lock) forever, not to hurry a slow pull.
+	cmd, ctx, cancel := boundedCommand(dockerLongTimeout, "docker", cmdArgs...)
+	defer cancel()
 	cmd.Dir = dir
 
 	// Inject decrypted environment variables
@@ -873,7 +877,7 @@ func (a *Agent) composeCmd(name string, args ...string) (string, error) {
 	}
 
 	out, err := cmd.CombinedOutput()
-	return string(out), err
+	return string(out), boundedCmdErr(ctx, err, dockerLongTimeout, "docker compose")
 }
 
 // workloadByName returns the workload with the given name, or nil. Workloads
